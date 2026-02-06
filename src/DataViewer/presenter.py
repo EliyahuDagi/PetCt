@@ -1,11 +1,51 @@
+import os
+import sys
+import threading
+
+# Add parent directory to path to allow importing modules from src/
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from utils.config import Config
+try:
+    from utils.gdrive_loader import GoogleDriveLoader
+except ImportError as e:
+    print(f"Could not import GoogleDriveLoader: {e}")
+    GoogleDriveLoader = None
+
 class Presenter:
     def __init__(self, model, view):
         self.model = model
         self.view = view
         self.current_slice = 0
         
+        # Default Window/Level (Abdominal/Soft Tissue)
+        self.wl = 40
+        self.ww = 400
+        
         # Connect View -> Presenter
         self.view.set_presenter(self)
+
+    def change_window_level(self, dx, dy):
+        # Sensitivity factors
+        self.ww += dx * 2
+        self.wl -= dy * 2 # Moving mouse down usually decreases level (darker) or increases? 
+                          # Standard: Down -> Lower Level (Darker usually if W is constant)? 
+                          # Actually usually Drag Right -> Increase Width (Lower Contrast). Drag Down -> Decrease Level (Darker).
+        
+        # Ensure Width > 1
+        if self.ww < 1: self.ww = 1
+        
+        # Redraw
+        self.set_slice(self.current_slice)
+
+    def change_slice(self, delta):
+        total = self.model.get_slice_count()
+        new_idx = self.current_slice + delta
+        new_idx = max(0, min(new_idx, total - 1))
+        
+        # Update View Slider
+        if new_idx != self.current_slice:
+            self.view.slice_scale.set(new_idx)
 
     def load_dataset(self, path):
         try:
@@ -16,6 +56,40 @@ class Presenter:
         except Exception as e:
             print(f"Error loading dataset: {e}")
             self.view.set_current_patient_info(f"Error: {e}")
+
+    def load_from_gdrive(self, folder_id):
+        if GoogleDriveLoader is None:
+            self.view.set_current_patient_info("Google Drive Loader not available.")
+            return
+
+        def _download_and_load():
+            try:
+                # Determine download path
+                download_path = os.path.join(Config.DATA_ROOT, "gdrive_downloads", folder_id)
+                os.makedirs(download_path, exist_ok=True)
+                
+                # Update UI (this might need to be thread-safe depending on TKinter, 
+                # but setting text is usually okay or handled via after())
+                # For safety, we should ideally use view.after, but for simplicity here:
+                print(f"Downloading from GDrive: {folder_id}...")
+                
+                loader = GoogleDriveLoader(
+                     credentials_file=os.path.join(os.path.dirname(__file__), '../../credentials.json'),
+                     token_file=os.path.join(os.path.dirname(__file__), '../../token.json')
+                )
+                loader.download_folder_recursive(folder_id, download_path)
+                
+                # Load the downloaded dataset
+                # We need to call load_dataset on the main thread ideally
+                self.view.after(0, lambda: self.load_dataset(download_path))
+                
+            except Exception as e:
+                print(f"Error loading from GDrive: {e}")
+                self.view.after(0, lambda: self.view.set_current_patient_info(f"GDrive Error: {e}"))
+
+        self.view.set_current_patient_info(f"Downloading {folder_id}... please wait.")
+        thread = threading.Thread(target=_download_and_load, daemon=True)
+        thread.start()
 
     def next_patient(self):
         if self.model.has_next():
@@ -53,5 +127,25 @@ class Presenter:
     def set_slice(self, slice_idx):
         self.current_slice = slice_idx
         ct, pet = self.model.get_images(slice_idx)
-        self.view.update_images(ct, pet, slice_idx)
+        
+        # Gather Metadata for Overlays
+        meta = {
+            'wl': self.wl,
+            'ww': self.ww,
+            'slice': slice_idx + 1 # 1-based index for display
+        }
+        
+        try:
+            if self.model.ct_metadata and slice_idx < len(self.model.ct_metadata):
+                ds = self.model.ct_metadata[slice_idx]
+                meta['name'] = str(getattr(ds, 'PatientName', 'Unknown'))
+                meta['id'] = str(getattr(ds, 'PatientID', 'N/A'))
+                meta['thickness'] = getattr(ds, 'SliceThickness', 0)
+                if hasattr(ds, 'ImagePositionPatient'):
+                    meta['pos'] = ds.ImagePositionPatient[2] 
+        except Exception as e:
+            print(f"Meta error: {e}")
+
+        self.view.update_overlays(meta)
+        self.view.update_images(ct, pet, slice_idx, self.wl, self.ww)
 import os

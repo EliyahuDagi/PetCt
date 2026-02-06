@@ -61,15 +61,29 @@ class DicomModel:
         pet_path = None
         
         for root, dirs, files in os.walk(patient_path):
-            # Check if this folder has DICOM files
-            dicom_files = [f for f in files if f.endswith('.dcm')]
-            if not dicom_files:
+            # Check if this folder has DICOM files (ignore extension)
+            candidates = [f for f in files if f not in ['DICOMDIR', 'README.TXT', 'CONTENT.XML']]
+            if not candidates:
                 continue
             
-            # Read first DICOM to determine modality
+            # Check first few candidates to see if they are valid DICOMs
+            valid_dicom_path = None
+            for cand in candidates[:5]: # Check first 5 to be safe/fast
+                try:
+                    p = os.path.join(root, cand)
+                    pydicom.dcmread(p, stop_before_pixels=True)
+                    valid_dicom_path = p
+                    break
+                except:
+                    continue
+            
+            if not valid_dicom_path:
+                continue
+            
+            # Read DICOM to determine modality
             try:
-                ds = pydicom.dcmread(os.path.join(root, dicom_files[0]))
-                modality = ds.Modality
+                ds = pydicom.dcmread(valid_dicom_path)
+                modality = getattr(ds, 'Modality', '')
                 if modality == 'CT' and not ct_path:
                     ct_path = root
                 elif modality == 'PT' and not pet_path:
@@ -93,8 +107,22 @@ class DicomModel:
         """
         Reads a DICOM series and returns a 3D numpy array + list of datasets.
         """
-        files = [os.path.join(series_path, f) for f in os.listdir(series_path) if f.endswith('.dcm')]
-        slices = [pydicom.dcmread(f) for f in files]
+        files = [os.path.join(series_path, f) for f in os.listdir(series_path) 
+                 if f not in ['DICOMDIR', 'README.TXT', 'CONTENT.XML']]
+        
+        slices = []
+        for f in files:
+            try:
+                ds = pydicom.dcmread(f)
+                # Ensure it has image data
+                if hasattr(ds, 'pixel_array') and hasattr(ds, 'ImagePositionPatient'):
+                    slices.append(ds)
+            except:
+                continue
+                
+        if not slices:
+            return None, None
+
         # Sort by ImagePositionPatient Z coordinate (usually index 2)
         slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
         
