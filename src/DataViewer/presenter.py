@@ -17,6 +17,7 @@ class Presenter:
         self.model = model
         self.view = view
         self.current_slice = 0
+        self.orientation = 'AXIAL'
         
         # Default Window/Level (Abdominal/Soft Tissue)
         self.wl = 40
@@ -24,6 +25,14 @@ class Presenter:
         
         # Connect View -> Presenter
         self.view.set_presenter(self)
+
+    def set_orientation(self, mode):
+        self.orientation = mode
+        # Reset slice to middle of new dimension
+        total = self.model.get_slice_count(self.orientation)
+        self.view.set_max_slice(total)
+        self.current_slice = total // 2
+        self.set_slice(self.current_slice)
 
     def change_window_level(self, dx, dy):
         # Sensitivity factors
@@ -126,7 +135,17 @@ class Presenter:
 
     def set_slice(self, slice_idx):
         self.current_slice = slice_idx
-        ct, pet = self.model.get_images(slice_idx)
+        ct, pet = self.model.get_images(slice_idx, self.orientation)
+        
+        # Calculate Aspect Ratio
+        dz, dy, dx = self.model.get_voxel_spacing()
+        aspect = 1.0
+        if self.orientation == 'AXIAL':
+            aspect = dy / dx 
+        elif self.orientation == 'CORONAL':
+            aspect = dz / dx
+        elif self.orientation == 'SAGITTAL':
+            aspect = dz / dy
         
         # Gather Metadata for Overlays
         meta = {
@@ -136,16 +155,38 @@ class Presenter:
         }
         
         try:
-            if self.model.ct_metadata and slice_idx < len(self.model.ct_metadata):
+            # Metadata fetch is volume-dependent (only accurate for Axial really)
+            # For MPR, we can just show generic info or current slice index
+            if self.orientation == 'AXIAL' and self.model.ct_metadata and slice_idx < len(self.model.ct_metadata):
                 ds = self.model.ct_metadata[slice_idx]
                 meta['name'] = str(getattr(ds, 'PatientName', 'Unknown'))
                 meta['id'] = str(getattr(ds, 'PatientID', 'N/A'))
                 meta['thickness'] = getattr(ds, 'SliceThickness', 0)
                 if hasattr(ds, 'ImagePositionPatient'):
                     meta['pos'] = ds.ImagePositionPatient[2] 
+            else:
+                 # Minimal info for MPR
+                 meta['name'] = "MPR View"
         except Exception as e:
             print(f"Meta error: {e}")
 
         self.view.update_overlays(meta)
-        self.view.update_images(ct, pet, slice_idx, self.wl, self.ww)
+        
+        # Determine Extents for proper alignment
+        ct_extent = self.model.get_bounds(self.orientation)
+        pet_extent = self.model.get_pet_bounds(self.orientation)
+        
+        # If PET extent is None, fallback or handle?
+        # If CT extent is used, and PET extent differs, View handles it.
+        
+        self.view.update_images(ct, pet, slice_idx, self.wl, self.ww, aspect, ct_extent, pet_extent)
+
+    def change_slice(self, delta):
+        total = self.model.get_slice_count(self.orientation)
+        new_idx = self.current_slice + delta
+        new_idx = max(0, min(new_idx, total - 1))
+        
+        # Update View Slider
+        if new_idx != self.current_slice:
+            self.view.slice_scale.set(new_idx)
 import os
