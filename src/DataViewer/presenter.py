@@ -2,12 +2,13 @@ import os
 import sys
 import threading
 
-# Add parent directory to path to allow importing modules from src/
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Path setup handled in main.py usually, but for standalone tests or if main didn't set it:
+# We rely on src being importable. 
+# If main.py sets root, then src.utils works.
 
-from utils.config import Config
+from src.utils.config import Config
 try:
-    from utils.gdrive_loader import GoogleDriveLoader
+    from src.utils.gdrive_loader import GoogleDriveLoader
 except ImportError as e:
     print(f"Could not import GoogleDriveLoader: {e}")
     GoogleDriveLoader = None
@@ -22,6 +23,7 @@ class Presenter:
         # Default Window/Level (Abdominal/Soft Tissue)
         self.wl = 40
         self.ww = 400
+        self.selected_segmentation_label = 'all_classes'
         
         # Connect View -> Presenter
         self.view.set_presenter(self)
@@ -129,13 +131,15 @@ class Presenter:
         
         # Reset to middle slice or 0
         self.current_slice = total_slices // 2
+        self.selected_segmentation_label = 'all_classes'
+        self._configure_segmentation_controls()
         
         # Draw
         self.set_slice(self.current_slice)
 
     def set_slice(self, slice_idx):
         self.current_slice = slice_idx
-        ct, pet = self.model.get_images(slice_idx, self.orientation)
+        ct, pet, seg = self.model.get_images(slice_idx, self.orientation)
         
         # Calculate Aspect Ratio
         dz, dy, dx = self.model.get_voxel_spacing()
@@ -176,10 +180,47 @@ class Presenter:
         ct_extent = self.model.get_bounds(self.orientation)
         pet_extent = self.model.get_pet_bounds(self.orientation)
         
-        # If PET extent is None, fallback or handle?
-        # If CT extent is used, and PET extent differs, View handles it.
-        
-        self.view.update_images(ct, pet, slice_idx, self.wl, self.ww, aspect, ct_extent, pet_extent)
+        self.view.update_images(
+            ct,
+            pet,
+            seg,
+            slice_idx,
+            self.wl,
+            self.ww,
+            aspect,
+            ct_extent,
+            pet_extent,
+            segmentation_label=self.selected_segmentation_label
+        )
+
+    def toggle_segmentation_zoi(self):
+         """ Centers and Zooms the view to the Prostate Segmentation """
+         if self.model.segmentation_mask is None:
+             print("No segmentation available.")
+             return
+
+         # 1. Determine optimal slice (Center Z)
+         center_slice = self.model.get_segmentation_center_slice(self.orientation, self.selected_segmentation_label)
+         self.change_slice(center_slice - self.current_slice)
+         
+         # 2. Get Bounding Box in Physical Coordinates
+         bounds = self.model.get_segmentation_bounds(self.orientation, self.selected_segmentation_label)
+         if bounds:
+              # bounds is [xmin, xmax, ymax, ymin] or similar depending on impl
+              # View expects specific instructions.
+              # Let's pass bounds to view method.
+              self.view.zoom_to_bounds(bounds)
+
+    def set_segmentation_class(self, label_value):
+        """Update which segmentation label should be displayed/used for ZOI."""
+        self.selected_segmentation_label = label_value or 'all_classes'
+        self.set_slice(self.current_slice)
+
+    def _configure_segmentation_controls(self):
+        classes = self.model.get_available_segmentation_classes()
+        label_map = self.model.get_segmentation_label_map()
+        self.view.set_segmentation_classes(classes, label_map, self.selected_segmentation_label)
+
 
     def change_slice(self, delta):
         total = self.model.get_slice_count(self.orientation)

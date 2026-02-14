@@ -49,6 +49,12 @@ class Config:
     NUM_WORKERS = 4
     SEED = 42
 
+    # MONAI Segmentation Bundle
+    # 'prostate_ct_segmentation' does not exist in the Model Zoo. 
+    # Using 'wholeBody_ct_segmentation' which contains prostate labels for CT.
+    SEGMENTATION_BUNDLE_NAME = "wholeBody_ct_segmentation" 
+    SEGMENTATION_DIR_NAME = "Segmentation"
+
     @staticmethod
     def get_organ_id(organ_name):
         return Config.ORGAN_MAP.get(organ_name.upper())

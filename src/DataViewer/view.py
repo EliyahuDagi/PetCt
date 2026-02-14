@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, simpledialog
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
+from matplotlib import colors as mcolors
 import numpy as np
 
 class MainView(tk.Tk):
@@ -11,6 +12,10 @@ class MainView(tk.Tk):
         self.geometry("1200x800")
         
         self.presenter = presenter
+        self.segmentation_value_map = {"All Classes": 'all_classes'}
+        self.segmentation_color_lut = {}
+        self.segmentation_label_map = {}
+        self.current_segmentation_label = 'all_classes'
         
         self._create_toolbar()
         self._create_plot_area()
@@ -37,6 +42,10 @@ class MainView(tk.Tk):
 
         self.patient_lbl = ttk.Label(toolbar_frame, text="No Patient Loaded")
         self.patient_lbl.pack(side=tk.LEFT, padx=20)
+        
+        # ZOI / Segmentation Button
+        zoi_btn = ttk.Button(toolbar_frame, text="ZOI", command=lambda: self.presenter.toggle_segmentation_zoi() if self.presenter else None)
+        zoi_btn.pack(side=tk.LEFT, padx=5)
 
     def _create_plot_area(self):
         # Using Matplotlib Figure
@@ -60,6 +69,10 @@ class MainView(tk.Tk):
         # Placeholder Images
         blank_data = np.zeros((512, 512))
         self.img_ct = self.ax_ct.imshow(blank_data, cmap='gray', vmin=-1000, vmax=1000)
+        
+        # Segmentation Overlay on CT using RGBA image
+        self.img_seg_overlay = self.ax_ct.imshow(np.zeros((512, 512, 4), dtype=float), alpha=0.0)
+
         self.img_pet = self.ax_pet.imshow(blank_data, cmap='hot')
         self.img_fusion = self.ax_fusion.imshow(blank_data, cmap='gray') # Base layer
         # For fusion, we might need complex alpha blending, but for now let's keep it simple
@@ -83,18 +96,8 @@ class MainView(tk.Tk):
         self.last_mouse_y = 0
 
     def _setup_overlays(self, ax, prefix):
-        # Top Left: Patient Info
-        self.overlays[f'{prefix}_tl'] = ax.text(0.02, 0.98, "Patient Name\nID: 12345", 
-                                                transform=ax.transAxes, color='yellow', verticalalignment='top', fontsize=9)
-        # Top Right: Hospital / Study Info
-        self.overlays[f'{prefix}_tr'] = ax.text(0.98, 0.98, "Hospital Name\nStudy Desc", 
-                                                transform=ax.transAxes, color='yellow', verticalalignment='top', horizontalalignment='right', fontsize=9)
-        # Bottom Left: Tech Info (WL/WW, Slice Location)
-        self.overlays[f'{prefix}_bl'] = ax.text(0.02, 0.02, "WL: 40 WW: 400\nSlice: 0", 
-                                                transform=ax.transAxes, color='yellow', verticalalignment='bottom', fontsize=9)
-        # Bottom Right: Orientation / Geometry
-        self.overlays[f'{prefix}_br'] = ax.text(0.98, 0.02, "Thickness: 2.5mm", 
-                                                transform=ax.transAxes, color='yellow', verticalalignment='bottom', horizontalalignment='right', fontsize=9)
+        # Overlays moved to side info panel
+        pass
 
     def _on_scroll(self, event):
         if event.inaxes and self.presenter:
@@ -214,26 +217,6 @@ class MainView(tk.Tk):
                  # self.status_bar_var.set("Error")
                  pass
 
-    def update_overlays(self, metadata_dict):
-        # Update text artists based on dictionary
-        # metadata_dict: { 'name': 'Patient X', 'id': '123', 'wl': 50, 'ww': 400, 'slice': 10, 'pos': -123.5 }
-        if 'name' in metadata_dict and 'id' in metadata_dict:
-             txt = f"{metadata_dict['name']}\nID: {metadata_dict['id']}"
-             self.overlays['ct_tl'].set_text(txt)
-             
-        if 'wl' in metadata_dict and 'ww' in metadata_dict:
-            txt = f"WL: {int(metadata_dict['wl'])} WW: {int(metadata_dict['ww'])}\nSlice: {metadata_dict.get('slice', 0)}"
-            if 'pos' in metadata_dict:
-                txt += f"\nZ: {metadata_dict['pos']:.1f}mm"
-            
-            # Store base text for hover append
-            self.last_wl_text = txt
-            
-            self.overlays['ct_bl'].set_text(txt)
-            
-        if 'thickness' in metadata_dict:
-             self.overlays['ct_br'].set_text(f"Thickness: {metadata_dict['thickness']}mm")
-
     def _create_controls(self):
         control_frame = ttk.Frame(self)
         control_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
@@ -242,6 +225,26 @@ class MainView(tk.Tk):
         self.status_bar_var = tk.StringVar(value="Ready")
         self.status_bar = ttk.Label(self, textvariable=self.status_bar_var, relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Patient Info Panel (Floating Top Right or Integrated)
+        # Using a Frame packed to the right of controls might get hidden.
+        # Let's put it in a separate frame above controls or use place()
+        self.info_label_var = tk.StringVar(value="No Data")
+        
+        # We can pack it into the existing toolbar or create a new frame
+        # Let's try to find the toolbar? No, let's just make a floating label on the canvas?
+        # Or just a LabelFrame in the Control area?
+        info_frame = ttk.LabelFrame(control_frame, text="Patient Info")
+        info_frame.pack(side=tk.RIGHT, padx=10, fill=tk.Y)
+        ttk.Label(info_frame, textvariable=self.info_label_var, justify=tk.LEFT).pack(padx=5, pady=5)
+
+        # Segmentation Selection
+        seg_frame = ttk.LabelFrame(control_frame, text="Segmentation")
+        seg_frame.pack(side=tk.LEFT, padx=10, pady=5)
+        self.segmentation_var = tk.StringVar(value="All Classes")
+        self.segmentation_combo = ttk.Combobox(seg_frame, textvariable=self.segmentation_var, state="disabled", width=28, values=["All Classes"])
+        self.segmentation_combo.pack(padx=5, pady=2)
+        self.segmentation_combo.bind("<<ComboboxSelected>>", self._on_segmentation_class_change)
         
         # Patient Navigation
         prev_pat_btn = ttk.Button(control_frame, text="<< Prev Patient", command=self._on_prev_patient)
@@ -276,94 +279,120 @@ class MainView(tk.Tk):
         if self.presenter:
             self.presenter.set_slice(int(value))
 
-    def update_images(self, ct_img, pet_img, slice_idx, wl=50, ww=400, aspect=1.0, ct_extent=None, pet_extent=None):
+    def _on_segmentation_class_change(self, event=None):
+        selection = self.segmentation_var.get()
+        label_value = self.segmentation_value_map.get(selection, 'all_classes')
+        self.current_segmentation_label = label_value
+        if self.presenter:
+            self.presenter.set_segmentation_class(label_value)
+
+    def update_images(self, ct_img, pet_img, seg_img, slice_idx, wl=50, ww=400, aspect=1.0, ct_extent=None, pet_extent=None, segmentation_label='all_classes'):
         # Update Images with Physical Extents
+        self.current_segmentation_label = segmentation_label or 'all_classes'
         
         # 1. CT
         if ct_img is not None:
-             self.img_ct.set_data(ct_img)
-             if ct_extent:
-                 # extent=[left, right, bottom, top]
-                 self.img_ct.set_extent(ct_extent)
-                 self.ax_ct.set_xlim(ct_extent[0], ct_extent[1])
-                 self.ax_ct.set_ylim(ct_extent[2], ct_extent[3])
-                 # Force equal aspect ratio
-                 self.ax_ct.set_aspect('equal')
-             else:
-                 self.img_ct.set_extent([0, ct_img.shape[1], ct_img.shape[0], 0])
-                 self.ax_ct.set_aspect(aspect)
-             
-             # Apply Window/Level
-             vmin = wl - (ww / 2)
-             vmax = wl + (ww / 2)
-             self.img_ct.set_clim(vmin, vmax)
-             self.ax_ct.set_title(f"CT (Slice {slice_idx})", color='white')
-             
-             # 3. Fusion (Base Layer CT)
-             self.img_fusion.set_data(ct_img) 
-             self.img_fusion.set_clim(vmin, vmax)
-             if ct_extent:
-                 self.img_fusion.set_extent(ct_extent)
-                 self.ax_fusion.set_xlim(ct_extent[0], ct_extent[1])
-                 self.ax_fusion.set_ylim(ct_extent[2], ct_extent[3])
-                 self.ax_fusion.set_aspect('equal')
-             else:
-                 self.img_fusion.set_extent([0, ct_img.shape[1], ct_img.shape[0], 0])
-                 self.ax_fusion.set_aspect(aspect)
+            self.img_ct.set_data(ct_img)
+            if ct_extent:
+                # extent=[left, right, bottom, top]
+                self.img_ct.set_extent(ct_extent)
+                self.ax_ct.set_xlim(ct_extent[0], ct_extent[1])
+                self.ax_ct.set_ylim(ct_extent[2], ct_extent[3])
+                # Force equal aspect ratio
+                self.ax_ct.set_aspect('equal')
+            else:
+                self.img_ct.set_extent([0, ct_img.shape[1], ct_img.shape[0], 0])
+                self.ax_ct.set_aspect(aspect)
+
+            # Apply Window/Level
+            vmin = wl - (ww / 2)
+            vmax = wl + (ww / 2)
+            self.img_ct.set_clim(vmin, vmax)
+            self.ax_ct.set_title(f"CT (Slice {slice_idx})", color='white')
+
+            overlay = self._build_segmentation_overlay(seg_img, self.current_segmentation_label)
+            if overlay is not None:
+                self.img_seg_overlay.set_data(overlay)
+                self.img_seg_overlay.set_alpha(1.0)
+                if ct_extent:
+                    self.img_seg_overlay.set_extent(ct_extent)
+                else:
+                    self.img_seg_overlay.set_extent([0, seg_img.shape[1], seg_img.shape[0], 0])
+            else:
+                # Clear overlay
+                blank = np.zeros((ct_img.shape[0], ct_img.shape[1], 4), dtype=float)
+                self.img_seg_overlay.set_data(blank)
+                self.img_seg_overlay.set_alpha(0.0)
+
+            # 3. Fusion (Base Layer CT)
+            self.img_fusion.set_data(ct_img) 
+            self.img_fusion.set_clim(vmin, vmax)
+            if ct_extent:
+                self.img_fusion.set_extent(ct_extent)
+                self.ax_fusion.set_xlim(ct_extent[0], ct_extent[1])
+                self.ax_fusion.set_ylim(ct_extent[2], ct_extent[3])
+                self.ax_fusion.set_aspect('equal')
+            else:
+                self.img_fusion.set_extent([0, ct_img.shape[1], ct_img.shape[0], 0])
+                self.ax_fusion.set_aspect(aspect)
 
         # 2. PET
         if pet_img is not None:
-             self.img_pet.set_data(pet_img)
-             
-             if pet_extent:
-                 self.img_pet.set_extent(pet_extent)
-                 self.ax_pet.set_xlim(pet_extent[0], pet_extent[1])
-                 self.ax_pet.set_ylim(pet_extent[2], pet_extent[3])
-                 self.ax_pet.set_aspect('equal')
-             else:
-                 self.img_pet.set_extent([0, pet_img.shape[1], pet_img.shape[0], 0])
-                 self.ax_pet.set_aspect(aspect)
-                 
-             self.img_pet.set_clim(0, np.max(pet_img) if np.max(pet_img) > 0 else 1)
-             
-             # Fusion Overlay (PET on CT)
-             # Check if we already have the overlay text artist or image
-             if not hasattr(self, 'img_fusion_overlay'):
-                  blank = np.zeros_like(pet_img)
-                  self.img_fusion_overlay = self.ax_fusion.imshow(blank, cmap='hot', alpha=0.4)
-             
-             self.img_fusion_overlay.set_data(pet_img)
-             if pet_extent:
-                 self.img_fusion_overlay.set_extent(pet_extent)
-             else:
-                 self.img_fusion_overlay.set_extent([0, pet_img.shape[1], pet_img.shape[0], 0])
+            self.img_pet.set_data(pet_img)
+            
+            if pet_extent:
+                self.img_pet.set_extent(pet_extent)
+                self.ax_pet.set_xlim(pet_extent[0], pet_extent[1])
+                self.ax_pet.set_ylim(pet_extent[2], pet_extent[3])
+                self.ax_pet.set_aspect('equal')
+            elif ct_extent:
+                # Fallback to CT extent if PET extent is missing (assumes alignment)
+                self.img_pet.set_extent(ct_extent)
+                self.ax_pet.set_xlim(ct_extent[0], ct_extent[1])
+                self.ax_pet.set_ylim(ct_extent[2], ct_extent[3])
+                self.ax_pet.set_aspect('equal')
+            else:
+                self.img_pet.set_extent([0, pet_img.shape[1], pet_img.shape[0], 0])
+                self.ax_pet.set_aspect(aspect)
+                
+            self.img_pet.set_clim(0, np.max(pet_img) if np.max(pet_img) > 0 else 1)
+            
+            # Fusion Overlay (PET on CT)
+            # Check if we already have the overlay text artist or image
+            if not hasattr(self, 'img_fusion_overlay'):
+                blank = np.zeros_like(pet_img)
+                self.img_fusion_overlay = self.ax_fusion.imshow(blank, cmap='hot', alpha=0.4)
+            
+            self.img_fusion_overlay.set_data(pet_img)
+            if pet_extent:
+                self.img_fusion_overlay.set_extent(pet_extent)
+            elif ct_extent:
+                self.img_fusion_overlay.set_extent(ct_extent)
+            else:
+                self.img_fusion_overlay.set_extent([0, pet_img.shape[1], pet_img.shape[0], 0])
 
-             self.img_fusion_overlay.set_clim(0, np.max(pet_img) if np.max(pet_img) > 0 else 1)
-             
+            self.img_fusion_overlay.set_clim(0, np.max(pet_img) if np.max(pet_img) > 0 else 1)
+            
         else:
-             pass
+            pass
         
         self.canvas.draw_idle()
 
     def update_overlays(self, metadata_dict):
-        # Update text artists based on dictionary
-        # metadata_dict: { 'name': 'Patient X', 'id': '123', 'wl': 50, 'ww': 400, 'slice': 10, 'pos': -123.5 }
-        if 'name' in metadata_dict and 'id' in metadata_dict:
-             txt = f"{metadata_dict['name']}\nID: {metadata_dict['id']}"
-             self.overlays['ct_tl'].set_text(txt)
-             
-        if 'wl' in metadata_dict and 'ww' in metadata_dict:
-            txt = f"WL: {int(metadata_dict['wl'])} WW: {int(metadata_dict['ww'])}\nSlice: {metadata_dict.get('slice', 0)}"
-            if 'pos' in metadata_dict:
-                txt += f"\nZ: {metadata_dict['pos']:.1f}mm"
-            
-            # Store base text for hover append
-            self.last_wl_text = txt
-            
-            self.overlays['ct_bl'].set_text(txt)
-            
-        if 'thickness' in metadata_dict:
-             self.overlays['ct_br'].set_text(f"Thickness: {metadata_dict['thickness']}mm")
+        # Update Side Panel Info
+        info = []
+        if 'name' in metadata_dict: info.append(f"Name: {metadata_dict['name']}")
+        if 'id' in metadata_dict: info.append(f"ID: {metadata_dict['id']}")
+        if 'wl' in metadata_dict: info.append(f"WL/WW: {int(metadata_dict['wl'])}/{int(metadata_dict['ww'])}")
+        if 'slice' in metadata_dict: info.append(f"Slice: {metadata_dict['slice']}")
+        if 'thickness' in metadata_dict: info.append(f"Thick: {metadata_dict['thickness']}mm")
+        if 'pos' in metadata_dict: info.append(f"Z: {metadata_dict.get('pos', 0):.1f}mm")
+        
+        if hasattr(self, 'info_label_var'):
+            self.info_label_var.set(" | ".join(info))
+        elif hasattr(self, 'patient_lbl'):
+             # Fallback
+             pass
 
     def _get_pixel_value_at_location(self, artist, x, y):
         """ Returns the interpolated or nearest value from an artist at physical coordinates x, y. """
@@ -543,3 +572,98 @@ class MainView(tk.Tk):
         
     def set_current_patient_info(self, info_text):
         self.patient_lbl.config(text=info_text)
+
+    def set_segmentation_classes(self, classes, label_map=None, default='all_classes'):
+        classes = classes or []
+        self.segmentation_label_map = label_map or {}
+        self.segmentation_value_map = {"All Classes": 'all_classes'}
+        display_values = ["All Classes"]
+        for item in classes:
+            display_name = f"[{item['id']}] {item['name']}"
+            display_values.append(display_name)
+            self.segmentation_value_map[display_name] = item['id']
+
+        self.segmentation_combo['values'] = display_values
+        if len(display_values) > 1:
+            self.segmentation_combo.config(state='readonly')
+        else:
+            self.segmentation_combo.config(state='disabled')
+
+        self._generate_segmentation_colors(classes)
+        self.set_current_segmentation_selection(default)
+
+    def set_current_segmentation_selection(self, label_value):
+        target_value = label_value if label_value in self.segmentation_value_map.values() else 'all_classes'
+        for display, value in self.segmentation_value_map.items():
+            if value == target_value:
+                self.segmentation_var.set(display)
+                break
+        else:
+            self.segmentation_var.set("All Classes")
+            target_value = 'all_classes'
+        self.current_segmentation_label = target_value
+
+    def _generate_segmentation_colors(self, classes):
+        self.segmentation_color_lut = {}
+        for item in classes:
+            label_id = item.get('id')
+            if label_id is None:
+                continue
+            self.segmentation_color_lut[label_id] = self._compute_color_from_label(label_id)
+
+    def _compute_color_from_label(self, label_id):
+        hue = ((int(label_id) * 37) % 360) / 360.0
+        rgb = mcolors.hsv_to_rgb((hue, 0.65, 0.95))
+        return (float(rgb[0]), float(rgb[1]), float(rgb[2]), 0.65)
+
+    def _get_color_for_label(self, label_id):
+        label_id = int(label_id)
+        if label_id not in self.segmentation_color_lut:
+            self.segmentation_color_lut[label_id] = self._compute_color_from_label(label_id)
+        return self.segmentation_color_lut[label_id]
+
+    def _build_segmentation_overlay(self, seg_img, segmentation_label):
+        if seg_img is None:
+            return None
+        if not np.any(seg_img):
+            return None
+
+        label_value = segmentation_label or 'all_classes'
+        overlay = np.zeros(seg_img.shape + (4,), dtype=float)
+
+        if label_value == 'all_classes':
+            unique_labels = [int(v) for v in np.unique(seg_img) if v != 0]
+            for label_id in unique_labels:
+                color = self._get_color_for_label(label_id)
+                overlay[seg_img == label_id] = color
+        else:
+            try:
+                label_id = int(label_value)
+            except (ValueError, TypeError):
+                return None
+            mask = seg_img == label_id
+            if not np.any(mask):
+                return None
+            color = self._get_color_for_label(label_id)
+            overlay[mask] = color
+
+        if np.max(overlay[..., 3]) == 0:
+            return None
+        return overlay
+
+    def zoom_to_bounds(self, bounds):
+        """
+        bounds: [xmin, xmax, ymax, ymin] or similar.
+        Note: model.get_segmentation_bounds returns [x1, x2, bottom, top] for Axial where Bottom>Top (value-wise) if inverted Y?
+        Matplotlib axis set_ylim(bottom, top).
+        DataViewer uses standard image coordinates where Y increases downwards?
+        Typically in _on_scroll, ylim is [min, max].
+        Let's interpret bounds as [x_min, x_max, y_min, y_max] to be safe, 
+        or strictly trust the presenter. The present passes result from get_segmentation_bounds directly.
+        """
+        if not bounds: return
+        # model returns [x1, x2, y2, y1] for AXIAL where y2 > y1 usually?
+        # Let's apply directly to limits.
+        xlim = [bounds[0], bounds[1]]
+        ylim = [bounds[2], bounds[3]]
+        self._sync_zoom_pan(xlim, ylim)

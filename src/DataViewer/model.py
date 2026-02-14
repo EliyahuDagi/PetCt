@@ -1,6 +1,8 @@
 import os
+import json
 import pydicom
 import numpy as np
+from src.utils.config import Config
 
 class DicomModel:
     def __init__(self):
@@ -8,6 +10,9 @@ class DicomModel:
         self.current_patient_index = -1
         self.ct_volume = None
         self.pet_volume = None
+        self.segmentation_mask = None
+        self.segmentation_labels = {}
+        self.segmentation_available_classes = []
         self.ct_metadata = None
         self.pet_metadata = None
 
@@ -100,6 +105,26 @@ class DicomModel:
         # Handle Missing Modalities simply
         if self.ct_volume is None and self.pet_volume is None:
              raise ValueError("No CT or PET data found in patient directory.")
+             
+        # Load Segmentation if exists
+        self.segmentation_mask = None
+        self.segmentation_labels = {}
+        self.segmentation_available_classes = []
+        seg_path = os.path.join(patient_path, Config.SEGMENTATION_DIR_NAME, "mask.npy")
+        if os.path.exists(seg_path):
+             try:
+                 print(f"Loading segmentation from {seg_path}")
+                 self.segmentation_mask = np.load(seg_path)
+                 # Verify shape matches CT
+                 if self.ct_volume is not None and self.segmentation_mask.shape != self.ct_volume.shape:
+                      print(f"Warning: Segmentation shape {self.segmentation_mask.shape} != CT shape {self.ct_volume.shape}")
+                      # If mismatch, maybe don't use it or try to recover? For now, discard.
+                      self.segmentation_mask = None
+                 else:
+                      self._load_segmentation_labels(os.path.join(patient_path, Config.SEGMENTATION_DIR_NAME, "labels.json"))
+                      self._update_available_segmentation_classes()
+             except Exception as e:
+                 print(f"Error loading segmentation: {e}")
 
         return True
 
@@ -223,10 +248,12 @@ class DicomModel:
               height = vol.shape[1] * dy
               # Matplotlib imshow extent [left, right, bottom, top]
               # Image coords: row 0 is top usually. origin='upper'.
-              # Physical Y often increases downwards in simple graphics, but in DICOM:
-              # Y is Posterior to Anterior? No.
-              # Let's just strictly assume standard orientation matches pixel grid first.
-              return [0, width, height, 0] # Local coord system relative to Image Top-Left (0,0)
+              # Physical Y often increases downwards or upwards relative to array?
+              # Standard DICOM ImagePositionPatient is top-left voxel.
+              # So top (y start in image space) is oy.
+              # Bottom (y end in image space) is oy + height (assuming standard scanning direction).
+              # [left, right, bottom, top]
+              return [ox, ox + width, oy + height, oy] 
               
               # If we want alignment between CT and PET, we MUST use absolute coords?
               # Yes.
@@ -324,12 +351,85 @@ class DicomModel:
          except:
              return None
 
+    def get_segmentation_bounds(self, orientation='AXIAL', label='all_classes'):
+         """
+         Returns physical bounds [xmin, xmax, ymax, ymin] of the segmentation mask
+         for zooming the view.
+         """
+         if self.segmentation_mask is None:
+             return None
+
+         mask = self._get_binary_mask_for_label(label)
+         if mask is None:
+              return None
+
+         # Find indices
+         indices = np.argwhere(mask > 0)
+         if indices.size == 0:
+             return None
+         
+         # indices are (z, y, x)
+         z_min, y_min, x_min = indices.min(axis=0)
+         z_max, y_max, x_max = indices.max(axis=0)
+         
+         dz, dy, dx = self.get_voxel_spacing()
+         oz, oy, ox = self.get_origin()
+         
+         # Add some padding (e.g., 20mm)
+         pad = 20.0
+         
+         if orientation == 'AXIAL':
+             # X (x indices), Y (y indices)
+             x1 = ox + x_min * dx - pad
+             x2 = ox + x_max * dx + pad
+             y1 = oy + y_min * dy - pad
+             y2 = oy + y_max * dy + pad
+             # y increases? In get_bounds assume standard. 
+             # Return [left, right, bottom, top]
+             return [x1, x2, y2, y1]
+             
+         elif orientation == 'CORONAL':
+             # X (x indices), Y (z indices effectively)
+             x1 = ox + x_min * dx - pad
+             x2 = ox + x_max * dx + pad
+             z1 = oz + z_min * dz - pad
+             z2 = oz + z_max * dz + pad
+             # Z usually corresponds to Y axis on screen
+             return [x1, x2, z2, z1]
+             
+         elif orientation == 'SAGITTAL':
+             # X (y indices), Y (z indices)
+             y1 = oy + y_min * dy - pad
+             y2 = oy + y_max * dy + pad
+             z1 = oz + z_min * dz - pad
+             z2 = oz + z_max * dz + pad
+             return [y1, y2, z2, z1]
+             
+         return None
+         
+    def get_segmentation_center_slice(self, orientation='AXIAL', label='all_classes'):
+         """ Returns the slice index of the center of the segmentation """
+         mask = self._get_binary_mask_for_label(label)
+         if mask is None: return 0
+         indices = np.argwhere(mask > 0)
+         if indices.size == 0: return 0
+         
+         min_idx = indices.min(axis=0)
+         max_idx = indices.max(axis=0)
+         center = (min_idx + max_idx) // 2
+         
+         if orientation == 'AXIAL': return center[0]
+         elif orientation == 'CORONAL': return center[1]
+         elif orientation == 'SAGITTAL': return center[2]
+         return 0
+
     def get_images(self, slice_index, orientation='AXIAL'):
         """
-        Returns (ct_image, pet_image) for a given slice index and orientation.
+        Returns (ct_image, pet_image, seg_image) for a given slice index and orientation.
         """
         ct_img = None
         pet_img = None
+        seg_img = None
         
         # Helper to slice volume
         def get_slice(vol, idx, mode):
@@ -340,10 +440,6 @@ class DicomModel:
             elif mode == 'CORONAL':
                 idx = min(idx, vol.shape[1]-1)
                 # Volume is (Z, Y, X). Coronal is (Z, X) at fixed Y.
-                # We often want Z to be up-down. Matplotlib origin is usually top-left.
-                # Standard Coronal: Top is Head (low Z? or high Z?), Bottom is Feet.
-                # In standard numpy (Z, Y, X), Z index 0 is usually feet or head depending on scan.
-                # Let's just return the raw slice for now, maybe flip Z for display.
                 return np.flipud(vol[:, idx, :]) 
             elif mode == 'SAGITTAL':
                 idx = min(idx, vol.shape[2]-1)
@@ -352,6 +448,10 @@ class DicomModel:
             return None
 
         ct_img = get_slice(self.ct_volume, slice_index, orientation)
+        
+        # Segmentation Logic (matches CT geometry 1:1)
+        if self.segmentation_mask is not None:
+             seg_img = get_slice(self.segmentation_mask, slice_index, orientation)
         
         # PET Logic with orientation is tricky because PET might have different Z-spacing.
         # For MVP, we will only try to slice PET if it matches CT shape or we fail gracefully.
@@ -403,4 +503,44 @@ class DicomModel:
                             # Assuming slice_index is correct for whatever is driving the view
                             pet_img = get_slice(self.pet_volume, slice_index, orientation)
 
-        return ct_img, pet_img
+        return ct_img, pet_img, seg_img
+
+    def _load_segmentation_labels(self, labels_path):
+        self.segmentation_labels = {}
+        if not labels_path or not os.path.exists(labels_path):
+            return
+        try:
+            with open(labels_path, 'r') as f:
+                data = json.load(f)
+            # Ensure keys are ints
+            self.segmentation_labels = {int(k): v for k, v in data.items()}
+        except Exception as e:
+            print(f"Error loading segmentation labels: {e}")
+
+    def _update_available_segmentation_classes(self):
+        if self.segmentation_mask is None:
+            self.segmentation_available_classes = []
+            return
+        unique_vals = np.unique(self.segmentation_mask)
+        self.segmentation_available_classes = [int(val) for val in unique_vals if val != 0]
+
+    def _get_binary_mask_for_label(self, label):
+        if self.segmentation_mask is None:
+            return None
+        if label in (None, 'all_classes'):
+            return (self.segmentation_mask > 0).astype(np.uint8)
+        try:
+            label_id = int(label)
+        except (ValueError, TypeError):
+            return (self.segmentation_mask > 0).astype(np.uint8)
+        return (self.segmentation_mask == label_id).astype(np.uint8)
+
+    def get_segmentation_label_map(self):
+        return self.segmentation_labels
+
+        def get_available_segmentation_classes(self):
+           classes = []
+           for label_id in self.segmentation_available_classes:
+               display = self.segmentation_labels.get(label_id, f"Label {label_id}")
+               classes.append({"id": label_id, "name": display})
+           return classes

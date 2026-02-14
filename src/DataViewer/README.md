@@ -31,7 +31,7 @@
   - 3 Axes: CT, PET, Fusion (Overlay).
   - Controls: Slider (Slice), Buttons (Patient Nav), Toolbar.
 - **Key Methods:**
-  - `update_images(ct_img, pet_img, ...)`: Renders arrays to `imshow`. Applies physical extents and `clim` (W/L).
+  - `update_images(ct_img, pet_img, ..., segmentation_label)`: Renders arrays to `imshow`, applies physical extents/WL, and colorizes segmentation overlays per selected class.
   - `_on_scroll(event)`: Handles **Zoom** (Ctrl+Scroll) and Slice Change (Scroll). Syncs all axes.
   - `_on_mouse_move(event)`: Handles **Pan** (Middle-Click), **Window/Level** (Right-Click), and **Pixel Probe** (Hover).
   - `_get_pixel_value_at_location(artist, x, y)`: Maps physical coords (mm) back to array indices for probing values.
