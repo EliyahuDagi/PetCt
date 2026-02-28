@@ -1,8 +1,13 @@
 
 import os
 import json
+import shutil
+import tempfile
 import torch
 import numpy as np
+import pydicom
+import SimpleITK as sitk
+from pathlib import Path
 from monai.bundle import ConfigParser, download
 from monai.transforms import (
     Compose,
@@ -202,3 +207,211 @@ class SegmentationPredictor:
     def get_label_map(self):
         """Return mapping of label id to readable name (if available)."""
         return self.label_map or {}
+
+
+class TotalSegmentatorRunner:
+    """Run official TotalSegmentator on a patient CT DICOM folder and save viewer-ready outputs."""
+
+    def __init__(self, task="total", device=None, fast=True, ml=True, cache_dir=None, temp_dir=None, output_root=None):
+        self.task = task
+        self.fast = fast
+        self.ml = ml
+        self.device = device or ("gpu" if torch.cuda.is_available() else "cpu")
+        self.cache_dir = Path(cache_dir or Config.TOTALSEG_HOME_DIR).expanduser()
+        self.temp_dir = Path(temp_dir or Config.TOTALSEG_TEMP_DIR).expanduser()
+        self.output_root = Path(output_root) if output_root else None
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+
+        # Ensure TotalSegmentator downloads go to a deterministic location
+        os.environ.setdefault("TOTALSEG_HOME_DIR", str(self.cache_dir))
+        os.environ.setdefault("TOTALSEG_HOME", str(self.cache_dir))
+
+        self.label_map = self._build_label_map()
+
+    def _build_label_map(self):
+        try:
+            from totalsegmentator.map_to_binary import class_map
+
+            task_map = class_map.get(self.task, {})
+            merged = {0: "background"}
+            merged.update({int(k): v for k, v in task_map.items()})
+            return merged
+        except Exception:
+            return {0: "background"}
+
+    def _find_ct_series_dir(self, patient_dir: Path) -> Path:
+        """Locate the best CT series directory inside a patient folder (prefer most CT slices)."""
+        best_root = None
+        best_ct_count = 0
+
+        for root, _, files in os.walk(patient_dir):
+            dicom_files = [f for f in files if f not in ["DICOMDIR", "README.TXT", "CONTENT.XML"]]
+            if not dicom_files:
+                continue
+
+            ct_count = 0
+            for name in dicom_files:
+                file_path = Path(root) / name
+                try:
+                    ds = pydicom.dcmread(str(file_path), stop_before_pixels=True)
+                    if getattr(ds, "Modality", "") == "CT":
+                        ct_count += 1
+                except Exception:
+                    continue
+
+            if ct_count > best_ct_count:
+                best_ct_count = ct_count
+                best_root = Path(root)
+
+        if best_root is None:
+            raise FileNotFoundError(f"No CT series found under {patient_dir}")
+        return best_root
+
+    def _convert_ct_to_nifti(self, patient_dir: Path):
+        ct_dir = self._find_ct_series_dir(patient_dir)
+        reader = sitk.ImageSeriesReader()
+        series_ids = reader.GetGDCMSeriesIDs(str(ct_dir))
+        if not series_ids:
+            raise FileNotFoundError(f"No DICOM series IDs found in {ct_dir}")
+
+        # Choose the series with the most slices to avoid scout/localizer series
+        best_series = None
+        best_len = -1
+        for sid in series_ids:
+            files = reader.GetGDCMSeriesFileNames(str(ct_dir), sid)
+            if len(files) > best_len:
+                best_len = len(files)
+                best_series = sid
+
+        series_files = reader.GetGDCMSeriesFileNames(str(ct_dir), best_series)
+        reader.SetFileNames(series_files)
+        image = reader.Execute()
+
+        if image.GetDimension() != 3:
+            raise ValueError(f"Expected 3D CT volume, got dimension={image.GetDimension()} in {ct_dir}")
+
+        temp_workdir = Path(tempfile.mkdtemp(prefix=f"ts_{patient_dir.name}_", dir=self.temp_dir))
+        nifti_path = temp_workdir / "ct.nii.gz"
+        sitk.WriteImage(image, str(nifti_path))
+        return nifti_path, image, temp_workdir
+
+    def _run_totalseg(self, input_path: Path, output_dir: Path):
+        try:
+            from totalsegmentator.python_api import totalsegmentator
+        except ImportError as exc:
+            raise ImportError("TotalSegmentator is required. Install with 'pip install TotalSegmentator SimpleITK'.") from exc
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # TotalSegmentator handles device selection internally (gpu/cpu/mps/gpu:X)
+        return totalsegmentator(
+            input_path,
+            output_dir,
+            ml=self.ml,
+            fast=self.fast,
+            task=self.task,
+            device=self.device,
+            output_type="nifti",
+            quiet=True,
+            nr_thr_resamp=1,
+            nr_thr_saving=1,
+        )
+
+    def _pick_output_nifti(self, output_dir: Path) -> Path:
+        preferred = ["segmentations.nii.gz", "segmentation.nii.gz", "totalsegmentator.nii.gz"]
+        for name in preferred:
+            candidate = output_dir / name
+            if candidate.exists():
+                return candidate
+
+        nifti_files = sorted(output_dir.glob("*.nii.gz"))
+        if not nifti_files:
+            nifti_files = sorted(output_dir.glob("**/*.nii.gz"))
+        if not nifti_files:
+            raise FileNotFoundError(f"No NIfTI outputs found in {output_dir}")
+        return nifti_files[0]
+
+    def _combine_binary_segmentations(self, output_dir: Path):
+        seg_root = output_dir / "segmentations"
+        if not seg_root.exists():
+            return None
+
+        binary_files = sorted(seg_root.glob("*.nii.gz"))
+        if not binary_files:
+            return None
+
+        first_img = sitk.ReadImage(str(binary_files[0]))
+        combined = np.zeros(sitk.GetArrayFromImage(first_img).shape, dtype=np.uint16)
+
+        # class_map maps integer label -> structure name (usually filename stem)
+        name_to_label = {
+            str(name).lower(): int(label)
+            for label, name in self.label_map.items()
+            if int(label) != 0
+        }
+
+        for bin_path in binary_files:
+            structure_name = bin_path.name
+            if structure_name.endswith(".nii.gz"):
+                structure_name = structure_name[:-7]
+            label_id = name_to_label.get(structure_name.lower())
+            if label_id is None:
+                continue
+
+            bin_img = sitk.ReadImage(str(bin_path))
+            bin_np = sitk.GetArrayFromImage(bin_img)
+            combined[bin_np > 0] = np.uint16(label_id)
+
+        return combined
+
+    def get_label_map(self):
+        return self.label_map
+
+    def run_patient(self, patient_dir: Path, skip_existing=True):
+        patient_dir = Path(patient_dir)
+        target_root = (self.output_root / patient_dir.name) if self.output_root else patient_dir
+        seg_dir = target_root / Config.SEGMENTATION_DIR_NAME
+        seg_dir.mkdir(parents=True, exist_ok=True)
+
+        seg_file = seg_dir / "mask.npy"
+        if skip_existing and seg_file.exists():
+            return False
+
+        temp_workdir = None
+        try:
+            nifti_path, ct_image, temp_workdir = self._convert_ct_to_nifti(patient_dir)
+            out_dir = temp_workdir / "totalseg_output"
+            seg_result = self._run_totalseg(nifti_path, out_dir)
+
+            seg_np = None
+            # Primary path: in-memory result returned by python API
+            seg_image_obj = seg_result
+            if isinstance(seg_result, tuple) and len(seg_result) > 0:
+                seg_image_obj = seg_result[0]
+
+            if seg_image_obj is not None and hasattr(seg_image_obj, "get_fdata"):
+                seg_np = np.asarray(seg_image_obj.get_fdata(), dtype=np.uint16)
+                # nibabel data is typically (X, Y, Z); viewer expects (Z, Y, X)
+                if seg_np.ndim == 3:
+                    seg_np = np.transpose(seg_np, (2, 1, 0))
+
+            # Fallback path: look for on-disk TotalSegmentator outputs
+            if seg_np is None:
+                try:
+                    seg_path = self._pick_output_nifti(out_dir)
+                    seg_img = sitk.ReadImage(str(seg_path))
+                    seg_np = sitk.GetArrayFromImage(seg_img).astype(np.uint16)
+                except FileNotFoundError:
+                    seg_np = self._combine_binary_segmentations(out_dir)
+                    if seg_np is None:
+                        raise
+
+            np.save(seg_file, seg_np)
+            labels_path = seg_dir / "labels.json"
+            with open(labels_path, "w") as f:
+                json.dump({int(k): v for k, v in self.label_map.items()}, f, indent=2)
+            return True
+        finally:
+            if temp_workdir:
+                shutil.rmtree(temp_workdir, ignore_errors=True)
