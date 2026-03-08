@@ -71,6 +71,12 @@ class Config:
         "PET_BOX": "pet_box",
     }
 
+    # TotalSegmentator
+    TOTALSEG_HOME_DIR = os.environ.get("TOTALSEG_HOME_DIR", os.path.expanduser("~/.totalsegmentator"))
+    TOTALSEG_TEMP_DIR = os.environ.get("TOTALSEG_TEMP_DIR", os.path.join(DATA_ROOT, "tmp"))
+    # Optional external root for writing outputs; when None, writes beside the patient folder
+    SEGMENTATION_OUTPUT_ROOT = os.environ.get("SEGMENTATION_OUTPUT_ROOT")
+
     @staticmethod
     def get_organ_id(organ_name):
         return Config.ORGAN_MAP.get(organ_name.upper())
