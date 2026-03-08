@@ -16,6 +16,8 @@ class MainView(tk.Tk):
         self.segmentation_color_lut = {}
         self.segmentation_label_map = {}
         self.current_segmentation_label = 'all_classes'
+        self.segmentation_sources = ["TotalSegmentor", "MONAI"]
+        self.current_segmentation_source = "TotalSegmentor"
         
         self._create_toolbar()
         self._create_plot_area()
@@ -52,6 +54,8 @@ class MainView(tk.Tk):
         self.fig = Figure(figsize=(12, 6), dpi=100)
         self.fig.patch.set_facecolor('black') # Dark theme background
         
+        self.current_seg_img = None  # Init
+        
         # 3 Subplots: CT, PET, Fusion
         # Turn off axis for cleaner "RadiAnt-like" look
         self.ax_ct = self.fig.add_subplot(131)
@@ -76,6 +80,17 @@ class MainView(tk.Tk):
         self.img_pet = self.ax_pet.imshow(blank_data, cmap='hot')
         self.img_fusion = self.ax_fusion.imshow(blank_data, cmap='gray') # Base layer
         # For fusion, we might need complex alpha blending, but for now let's keep it simple
+        
+        # ZOI Rectangle patches
+        from matplotlib.patches import Rectangle
+        self.rect_ct = Rectangle((0,0), 1, 1, linewidth=2, edgecolor='yellow', facecolor='none', visible=False)
+        self.ax_ct.add_patch(self.rect_ct)
+        
+        self.rect_pet = Rectangle((0,0), 1, 1, linewidth=2, edgecolor='yellow', facecolor='none', visible=False)
+        self.ax_pet.add_patch(self.rect_pet)
+        
+        self.rect_fusion = Rectangle((0,0), 1, 1, linewidth=2, edgecolor='yellow', facecolor='none', visible=False)
+        self.ax_fusion.add_patch(self.rect_fusion)        
         
         # HUD Overlays (Text Artists)
         self.overlays = {}
@@ -241,6 +256,20 @@ class MainView(tk.Tk):
         # Segmentation Selection
         seg_frame = ttk.LabelFrame(control_frame, text="Segmentation")
         seg_frame.pack(side=tk.LEFT, padx=10, pady=5)
+
+        ttk.Label(seg_frame, text="Source").pack(padx=5, pady=(2, 0), anchor=tk.W)
+        self.seg_source_var = tk.StringVar(value=self.current_segmentation_source)
+        self.seg_source_combo = ttk.Combobox(
+            seg_frame,
+            textvariable=self.seg_source_var,
+            state="readonly",
+            width=28,
+            values=self.segmentation_sources,
+        )
+        self.seg_source_combo.pack(padx=5, pady=2)
+        self.seg_source_combo.bind("<<ComboboxSelected>>", self._on_segmentation_source_change)
+
+        ttk.Label(seg_frame, text="Class").pack(padx=5, pady=(4, 0), anchor=tk.W)
         self.segmentation_var = tk.StringVar(value="All Classes")
         self.segmentation_combo = ttk.Combobox(seg_frame, textvariable=self.segmentation_var, state="disabled", width=28, values=["All Classes"])
         self.segmentation_combo.pack(padx=5, pady=2)
@@ -286,10 +315,42 @@ class MainView(tk.Tk):
         if self.presenter:
             self.presenter.set_segmentation_class(label_value)
 
-    def update_images(self, ct_img, pet_img, seg_img, slice_idx, wl=50, ww=400, aspect=1.0, ct_extent=None, pet_extent=None, segmentation_label='all_classes'):
+    def _on_segmentation_source_change(self, event=None):
+        source = self.seg_source_var.get()
+        self.current_segmentation_source = source
+        if self.presenter:
+            self.presenter.set_segmentation_source(source)
+
+    def update_images(self, ct_img, pet_img, seg_img, slice_idx, wl=50, ww=400, aspect=1.0, 
+                      ct_extent=None, pet_extent=None, segmentation_label='all_classes', zoi_box=None):
         # Update Images with Physical Extents
         self.current_segmentation_label = segmentation_label or 'all_classes'
+        self.current_seg_img = seg_img  # Store raw seg for probing
         
+        # Update ZOI box visibility and position
+        if zoi_box:
+            # zoi_box = [x, y, w, h] in physical coords.
+            # Matplotlib Rectangle takes (x,y), w, h.
+            x, y, w, h = zoi_box
+            self.rect_ct.set_xy((x, y))
+            self.rect_ct.set_width(w)
+            self.rect_ct.set_height(h)
+            self.rect_ct.set_visible(True)
+            
+            self.rect_pet.set_xy((x, y))
+            self.rect_pet.set_width(w)
+            self.rect_pet.set_height(h)
+            self.rect_pet.set_visible(True)
+
+            self.rect_fusion.set_xy((x, y))
+            self.rect_fusion.set_width(w)
+            self.rect_fusion.set_height(h)
+            self.rect_fusion.set_visible(True)
+        else:
+            self.rect_ct.set_visible(False)
+            self.rect_pet.set_visible(False)
+            self.rect_fusion.set_visible(False)
+
         # 1. CT
         if ct_img is not None:
             self.img_ct.set_data(ct_img)
@@ -394,7 +455,7 @@ class MainView(tk.Tk):
              # Fallback
              pass
 
-    def _get_pixel_value_at_location(self, artist, x, y):
+    def _get_pixel_value_at_location(self, artist, x, y, data_override=None):
         """ Returns the interpolated or nearest value from an artist at physical coordinates x, y. """
         if artist is None: return None
         
@@ -413,10 +474,10 @@ class MainView(tk.Tk):
                  return None
              
              # Map physical to index
-             data = artist.get_array()
+             data = data_override if data_override is not None else artist.get_array()
              if data is None: return None
              
-             h, w = data.shape
+             h, w = data.shape[:2]  # Handle RGBA shapes too
              
              # Calculate ratios
              # For X: (x - left) / (right - left)
@@ -540,6 +601,9 @@ class MainView(tk.Tk):
                 val_ct = self._get_pixel_value_at_location(self.img_ct, x, y)
                 val_pet = self._get_pixel_value_at_location(self.img_pet, x, y)
                 
+                # Get segmentation class using the overlay artist's geometry
+                val_seg = self._get_pixel_value_at_location(self.img_seg_overlay, x, y, data_override=self.current_seg_img)
+
                 status_parts = []
                 status_parts.append(f"Pos: ({x:.1f}, {y:.1f})")
                 
@@ -551,6 +615,11 @@ class MainView(tk.Tk):
                      val_suv = val_pet * suv_factor
                      status_parts.append(f"PET: {val_suv:.2f} SUV")
                 
+                if val_seg is not None and val_seg > 0:
+                     label_id = int(val_seg)
+                     label_name = self.segmentation_label_map.get(label_id, str(label_id))
+                     status_parts.append(f"Class: {label_name}")
+
                 if not val_ct and not val_pet:
                      status_parts.append("Background")
 
@@ -572,6 +641,28 @@ class MainView(tk.Tk):
         
     def set_current_patient_info(self, info_text):
         self.patient_lbl.config(text=info_text)
+
+    def set_segmentation_sources(self, sources, current=None):
+        self.segmentation_sources = sources or []
+        if not self.segmentation_sources:
+            self.seg_source_combo.config(state='disabled')
+            return
+
+        self.seg_source_combo['values'] = self.segmentation_sources
+        target = current if current in self.segmentation_sources else self.segmentation_sources[0]
+        self.seg_source_var.set(target)
+        self.current_segmentation_source = target
+        self.seg_source_combo.config(state='readonly')
+
+    def set_segmentation_source_selection(self, source_name):
+        if not source_name:
+            return
+        if source_name in (self.segmentation_sources or []):
+            self.seg_source_var.set(source_name)
+            self.current_segmentation_source = source_name
+        elif self.segmentation_sources:
+            self.seg_source_var.set(self.segmentation_sources[0])
+            self.current_segmentation_source = self.segmentation_sources[0]
 
     def set_segmentation_classes(self, classes, label_map=None, default='all_classes'):
         classes = classes or []

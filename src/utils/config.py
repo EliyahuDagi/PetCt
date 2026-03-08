@@ -49,11 +49,27 @@ class Config:
     NUM_WORKERS = 4
     SEED = 42
 
+    # Debug
+    # Set env var PROSTATE_LOCATOR_DEBUG=1 to include internal debug metadata
+    # in locate_prostate_bbox() results.
+    PROSTATE_LOCATOR_DEBUG = os.environ.get("PROSTATE_LOCATOR_DEBUG", "0") not in ("0", "false", "False", "")
+
     # MONAI Segmentation Bundle
     # 'prostate_ct_segmentation' does not exist in the Model Zoo. 
     # Using 'wholeBody_ct_segmentation' which contains prostate labels for CT.
     SEGMENTATION_BUNDLE_NAME = "wholeBody_ct_segmentation" 
     SEGMENTATION_DIR_NAME = "Segmentation"
+    # Supported segmentation sources/methods:
+    # - TotalSegmentor: disk mask produced by TotalSegmentor
+    # - MONAI: disk mask produced by MONAI bundle inference
+    # - PET_BOX: PET-only box-filter locator (bbox only, no mask)
+    SEGMENTATION_SOURCES = ["TotalSegmentor", "MONAI", "PET_BOX"]
+    DEFAULT_SEGMENTATION_SOURCE = "PET_BOX"
+    SEGMENTATION_METHOD_MAP = {
+        "TotalSegmentor": "disk",
+        "MONAI": "disk",
+        "PET_BOX": "pet_box",
+    }
 
     @staticmethod
     def get_organ_id(organ_name):

@@ -1,8 +1,12 @@
 import os
 import json
-import pydicom
+
 import numpy as np
+import pydicom
+
 from src.utils.config import Config
+from src.utils.prostate_locator import locate_prostate_bbox
+from src.utils.segmentors import DiskSegmentor, PetBoxSegmentor, SegmentationResult
 
 class DicomModel:
     def __init__(self):
@@ -15,6 +19,10 @@ class DicomModel:
         self.segmentation_available_classes = []
         self.ct_metadata = None
         self.pet_metadata = None
+        self.segmentation_source_name = Config.DEFAULT_SEGMENTATION_SOURCE
+        self.segmentation_bbox_mm = None
+        self.segmentation_bbox_vox = None
+        self.segmentation_method = ""
 
     def load_dataset(self, data_path):
         """
@@ -23,13 +31,25 @@ class DicomModel:
         if not os.path.exists(data_path):
             raise ValueError(f"Path not found: {data_path}")
         
-        # Assume each subdir in data_path is a patient or study
-        self.patient_list = [
-            os.path.join(data_path, d) 
-            for d in os.listdir(data_path) 
+        # Heuristic: allow selecting either a dataset root (many patients) or a single
+        # patient folder (e.g., one that contains DICOM/, SECTRA/, Segmentation/).
+        subdirs = [
+            os.path.join(data_path, d)
+            for d in os.listdir(data_path)
             if os.path.isdir(os.path.join(data_path, d))
         ]
-        self.patient_list.sort()
+        subdir_names = {os.path.basename(d).lower() for d in subdirs}
+        patient_markers = {"dicom", "ct", "pt", "pet", "segmentation", "sectra"}
+
+        looks_like_single_patient = bool(subdir_names & patient_markers)
+
+        if looks_like_single_patient:
+            # Treat the selected folder as the patient root so we find Segmentation next to DICOM.
+            self.patient_list = [data_path]
+        else:
+            # Assume each subdir is a patient or study
+            self.patient_list = sorted(subdirs)
+
         self.current_patient_index = -1
         print(f"Found {len(self.patient_list)} patients/studies.")
 
@@ -39,19 +59,23 @@ class DicomModel:
     def has_prev(self):
         return self.current_patient_index > 0
 
-    def load_next_patient(self):
+    def load_next_patient(self, segmentation_name=None):
         if self.has_next():
             self.current_patient_index += 1
-            return self.load_patient_data(self.patient_list[self.current_patient_index])
+            return self.load_patient_data(
+                self.patient_list[self.current_patient_index], segmentation_name
+            )
         return False
 
-    def load_prev_patient(self):
+    def load_prev_patient(self, segmentation_name=None):
         if self.has_prev():
             self.current_patient_index -= 1
-            return self.load_patient_data(self.patient_list[self.current_patient_index])
+            return self.load_patient_data(
+                self.patient_list[self.current_patient_index], segmentation_name
+            )
         return False
 
-    def load_patient_data(self, patient_path):
+    def load_patient_data(self, patient_path, segmentation_name=None):
         """
         Loads CT and PET series from the patient folder.
         Assumes structure: patient_path/CT/ and patient_path/PT/ or similar.
@@ -61,19 +85,19 @@ class DicomModel:
         self.ct_volume = None
         self.pet_volume = None
         
-        # Simple heuristic to find CT and PT folders
-        ct_path = None
-        pet_path = None
+        # Collect CT/PT candidates and prefer the one with the most slices
+        ct_candidates = {}
+        pet_candidates = {}
         
         for root, dirs, files in os.walk(patient_path):
-            # Check if this folder has DICOM files (ignore extension)
+            # Check if this folder has DICOM files (ignore non-image markers)
             candidates = [f for f in files if f not in ['DICOMDIR', 'README.TXT', 'CONTENT.XML']]
             if not candidates:
                 continue
-            
-            # Check first few candidates to see if they are valid DICOMs
+
+            # Check a few files to confirm DICOM and modality
             valid_dicom_path = None
-            for cand in candidates[:5]: # Check first 5 to be safe/fast
+            for cand in candidates[:5]:  # Check first 5 to be safe/fast
                 try:
                     p = os.path.join(root, cand)
                     pydicom.dcmread(p, stop_before_pixels=True)
@@ -81,20 +105,25 @@ class DicomModel:
                     break
                 except:
                     continue
-            
             if not valid_dicom_path:
                 continue
-            
-            # Read DICOM to determine modality
+
             try:
                 ds = pydicom.dcmread(valid_dicom_path)
                 modality = getattr(ds, 'Modality', '')
-                if modality == 'CT' and not ct_path:
-                    ct_path = root
-                elif modality == 'PT' and not pet_path:
-                    pet_path = root
+                slice_count = len(candidates)
+                if modality == 'CT':
+                    # Keep the largest CT series (most slices)
+                    if slice_count > ct_candidates.get(root, 0):
+                        ct_candidates[root] = slice_count
+                elif modality == 'PT':
+                    if slice_count > pet_candidates.get(root, 0):
+                        pet_candidates[root] = slice_count
             except Exception as e:
                 print(f"Error reading DICOM header in {root}: {e}")
+
+        ct_path = max(ct_candidates, key=ct_candidates.get) if ct_candidates else None
+        pet_path = max(pet_candidates, key=pet_candidates.get) if pet_candidates else None
 
         if ct_path:
             self.ct_volume, self.ct_metadata = self._load_series(ct_path)
@@ -106,27 +135,105 @@ class DicomModel:
         if self.ct_volume is None and self.pet_volume is None:
              raise ValueError("No CT or PET data found in patient directory.")
              
-        # Load Segmentation if exists
+        # Reset segmentation state
         self.segmentation_mask = None
         self.segmentation_labels = {}
         self.segmentation_available_classes = []
-        seg_path = os.path.join(patient_path, Config.SEGMENTATION_DIR_NAME, "mask.npy")
-        if os.path.exists(seg_path):
-             try:
-                 print(f"Loading segmentation from {seg_path}")
-                 self.segmentation_mask = np.load(seg_path)
-                 # Verify shape matches CT
-                 if self.ct_volume is not None and self.segmentation_mask.shape != self.ct_volume.shape:
-                      print(f"Warning: Segmentation shape {self.segmentation_mask.shape} != CT shape {self.ct_volume.shape}")
-                      # If mismatch, maybe don't use it or try to recover? For now, discard.
-                      self.segmentation_mask = None
-                 else:
-                      self._load_segmentation_labels(os.path.join(patient_path, Config.SEGMENTATION_DIR_NAME, "labels.json"))
-                      self._update_available_segmentation_classes()
-             except Exception as e:
-                 print(f"Error loading segmentation: {e}")
+        self.segmentation_bbox_mm = None
+        self.segmentation_bbox_vox = None
+        self.segmentation_method = ""
+
+        # Load Segmentation if exists or run locator
+        if segmentation_name:
+            self.segmentation_source_name = segmentation_name
+        elif not getattr(self, "segmentation_source_name", None):
+            self.segmentation_source_name = Config.DEFAULT_SEGMENTATION_SOURCE
+
+        self._run_segmentor(patient_path, self.segmentation_source_name)
 
         return True
+
+    def reload_segmentation_for_current(self, segmentation_name):
+        if self.current_patient_index < 0 or self.current_patient_index >= len(self.patient_list):
+            return False
+        if segmentation_name:
+            self.segmentation_source_name = segmentation_name
+        patient_path = self.patient_list[self.current_patient_index]
+        self._run_segmentor(patient_path, self.segmentation_source_name)
+        return True
+
+    def _load_segmentation(self, patient_path, segmentation_name):
+        base_dir = os.path.join(patient_path, Config.SEGMENTATION_DIR_NAME)
+        candidates = []
+        if segmentation_name:
+            candidates.append(os.path.join(base_dir, segmentation_name))
+        candidates.append(base_dir)
+
+        for seg_dir in candidates:
+            seg_path = os.path.join(seg_dir, "mask.npy")
+            if not os.path.exists(seg_path):
+                continue
+
+            try:
+                seg_label = os.path.basename(seg_dir)
+                print(f"Loading segmentation from {seg_path} (source: {seg_label})")
+                mask = np.load(seg_path)
+                if self.ct_volume is not None and mask.shape != self.ct_volume.shape:
+                    print(
+                        f"Warning: Segmentation shape {mask.shape} != CT shape {self.ct_volume.shape}"
+                    )
+                    continue
+
+                labels_path = os.path.join(seg_dir, "labels.json")
+                labels = self._read_segmentation_labels(labels_path)
+                return SegmentationResult(
+                    mask=mask,
+                    labels=labels,
+                    method=f"disk:{seg_label}",
+                )
+            except Exception as e:
+                print(f"Error loading segmentation from {seg_path}: {e}")
+                continue
+        return None
+
+    def _apply_segmentation_result(self, result: SegmentationResult):
+        if result is None:
+            return
+        self.segmentation_mask = result.mask
+        self.segmentation_labels = result.labels or {}
+        self.segmentation_bbox_mm = result.bbox_mm
+        self.segmentation_bbox_vox = result.bbox_vox
+        self.segmentation_method = result.method or ""
+        if self.segmentation_mask is not None:
+            self._update_available_segmentation_classes()
+        else:
+            self.segmentation_available_classes = []
+
+    def _run_segmentor(self, patient_path, segmentation_name):
+        method_key = Config.SEGMENTATION_METHOD_MAP.get(segmentation_name, "disk")
+
+        if method_key == "pet_box":
+            pet_spacing, pet_origin = self._get_pet_spacing_origin()
+            seg = PetBoxSegmentor().segment(
+                patient_path,
+                self.ct_volume,
+                self.pet_volume,
+                pet_spacing,
+                pet_origin,
+            )
+            self._apply_segmentation_result(seg)
+            return
+
+        # Default: load from disk
+        seg = DiskSegmentor(segmentation_name, Config.SEGMENTATION_DIR_NAME).segment(
+            patient_path,
+            self.ct_volume,
+            self.pet_volume,
+            self.get_voxel_spacing(),
+            self.get_origin(),
+        )
+        self._apply_segmentation_result(seg)
+
 
     def _load_series(self, series_path):
         """
@@ -190,7 +297,8 @@ class DicomModel:
 
     def get_slice_count(self, orientation='AXIAL'):
         volume = self.ct_volume if self.ct_volume is not None else self.pet_volume
-        if volume is None: return 0
+        if volume is None: 
+            return 0
         
         if orientation == 'AXIAL':     # Z-axis
             return volume.shape[0]
@@ -351,6 +459,27 @@ class DicomModel:
          except:
              return None
 
+    def _get_pet_spacing_origin(self):
+         """Returns (spacing, origin) for PET if available, else falls back to CT spacing/origin."""
+         if not self.pet_metadata:
+             return self.get_voxel_spacing(), self.get_origin()
+         try:
+             ds = self.pet_metadata[0]
+             dy, dx = ds.PixelSpacing
+             if len(self.pet_metadata) > 1:
+                 z1 = float(self.pet_metadata[0].ImagePositionPatient[2])
+                 z2 = float(self.pet_metadata[1].ImagePositionPatient[2])
+                 dz = abs(z2 - z1)
+                 oz = z1
+             else:
+                 dz = getattr(ds, 'SliceThickness', 1.0)
+                 oz = float(ds.ImagePositionPatient[2])
+             ox = float(ds.ImagePositionPatient[0])
+             oy = float(ds.ImagePositionPatient[1])
+             return (float(dz), float(dy), float(dx)), (oz, oy, ox)
+         except Exception:
+             return self.get_voxel_spacing(), self.get_origin()
+
     def get_segmentation_bounds(self, orientation='AXIAL', label='all_classes'):
          """
          Returns physical bounds [xmin, xmax, ymax, ymin] of the segmentation mask
@@ -406,6 +535,134 @@ class DicomModel:
              return [y1, y2, z2, z1]
              
          return None
+
+    def has_segmentation_label(self, label='all_classes'):
+         """Check if the requested label has any voxels in the current mask."""
+         if self.segmentation_mask is None:
+             return False
+         if label in (None, 'all_classes'):
+             return np.any(self.segmentation_mask)
+         try:
+             label_id = int(label)
+         except (ValueError, TypeError):
+             return False
+         return np.any(self.segmentation_mask == label_id)
+
+    def _bbox_mm_to_bounds(self, bbox_mm, orientation='AXIAL'):
+         if not bbox_mm:
+             return None
+         x1, x2 = bbox_mm.get("x", [None, None])
+         y1, y2 = bbox_mm.get("y", [None, None])
+         z1, z2 = bbox_mm.get("z", [None, None])
+         if None in (x1, x2, y1, y2, z1, z2):
+             return None
+         if orientation == 'AXIAL':
+             return [x1, x2, y2, y1]
+         elif orientation == 'CORONAL':
+             return [x1, x2, z2, z1]
+         elif orientation == 'SAGITTAL':
+             return [y1, y2, z2, z1]
+         return None
+
+    def locate_prostate_roi(self, orientation='AXIAL'):
+         """Estimate prostate center slice and bounds using bladder + PET heuristics."""
+         # If a segmentor already produced a bbox (e.g., PET_BOX), use it directly
+         if self.segmentation_bbox_mm:
+             bounds = self._bbox_mm_to_bounds(self.segmentation_bbox_mm, orientation)
+             center_slice = None
+
+             spacing = None
+             origin = None
+             if self.ct_volume is not None and self.ct_metadata:
+                 spacing = self.get_voxel_spacing()
+                 origin = self.get_origin()
+             elif (self.segmentation_method or "").startswith("pet_box") and self.pet_volume is not None:
+                 spacing, origin = self._get_pet_spacing_origin()
+
+             if spacing and origin:
+                 dz, dy, dx = spacing
+                 oz, oy, ox = origin
+                 if orientation == 'AXIAL':
+                     z1, z2 = self.segmentation_bbox_mm.get("z", (0.0, 0.0))
+                     center_slice = int(round(((z1 + z2) / 2 - oz) / max(dz, 1e-6)))
+                 elif orientation == 'CORONAL':
+                     y1, y2 = self.segmentation_bbox_mm.get("y", (0.0, 0.0))
+                     center_slice = int(round(((y1 + y2) / 2 - oy) / max(dy, 1e-6)))
+                 elif orientation == 'SAGITTAL':
+                     x1, x2 = self.segmentation_bbox_mm.get("x", (0.0, 0.0))
+                     center_slice = int(round(((x1 + x2) / 2 - ox) / max(dx, 1e-6)))
+
+             if center_slice is None and self.segmentation_bbox_vox:
+                 if orientation == 'AXIAL':
+                     z_lo, z_hi = self.segmentation_bbox_vox.get("z", (0, 0))
+                     center_slice = (z_lo + z_hi) // 2
+                 elif orientation == 'CORONAL':
+                     y_lo, y_hi = self.segmentation_bbox_vox.get("y", (0, 0))
+                     center_slice = (y_lo + y_hi) // 2
+                 elif orientation == 'SAGITTAL':
+                     x_lo, x_hi = self.segmentation_bbox_vox.get("x", (0, 0))
+                     center_slice = (x_lo + x_hi) // 2
+
+             if center_slice is not None:
+                 max_slices = self.get_slice_count(orientation)
+                 if max_slices > 0:
+                     center_slice = max(0, min(center_slice, max_slices - 1))
+
+             return {
+                 "center_slice": center_slice,
+                 "bounds": bounds,
+                 "method": self.segmentation_method or "segmentor_bbox",
+                 "bbox_vox": self.segmentation_bbox_vox,
+                 "bbox_mm": self.segmentation_bbox_mm,
+             }
+
+         if self.segmentation_mask is None and self.pet_volume is None:
+             return None
+
+         try:
+             bbox = locate_prostate_bbox(
+                 mask=self.segmentation_mask,
+                 labels=self.segmentation_labels or {},
+                 spacing=self.get_voxel_spacing(),
+                 origin=self.get_origin(),
+                pet_volume=self.pet_volume,
+             )
+         except Exception as e:
+             print(f"Prostate locator error: {e}")
+             return None
+
+         if not bbox:
+             return None
+
+         center_vox = bbox.get("center_vox")
+         if not center_vox:
+             return None
+
+         if orientation == 'AXIAL':
+             center_slice = int(center_vox[0])
+         elif orientation == 'CORONAL':
+             center_slice = int(center_vox[1])
+         elif orientation == 'SAGITTAL':
+             center_slice = int(center_vox[2])
+         else:
+             center_slice = int(center_vox[0])
+
+         # Keep slice index within valid range
+         max_slices = self.get_slice_count(orientation)
+         if max_slices > 0:
+             center_slice = max(0, min(center_slice, max_slices - 1))
+
+         bounds = self._bbox_mm_to_bounds(bbox.get("bbox_mm"), orientation)
+
+         return {
+             "center_slice": center_slice,
+             "bounds": bounds,
+             "method": bbox.get("method"),
+             "bbox_vox": bbox.get("bbox_vox"),
+             "bbox_mm": bbox.get("bbox_mm"),
+             "center_vox": bbox.get("center_vox"),
+             "debug": bbox.get("debug"),
+         }
          
     def get_segmentation_center_slice(self, orientation='AXIAL', label='all_classes'):
          """ Returns the slice index of the center of the segmentation """
@@ -505,17 +762,19 @@ class DicomModel:
 
         return ct_img, pet_img, seg_img
 
-    def _load_segmentation_labels(self, labels_path):
-        self.segmentation_labels = {}
+    def _read_segmentation_labels(self, labels_path):
         if not labels_path or not os.path.exists(labels_path):
-            return
+            return {}
         try:
-            with open(labels_path, 'r') as f:
+            with open(labels_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            # Ensure keys are ints
-            self.segmentation_labels = {int(k): v for k, v in data.items()}
+            return {int(k): v for k, v in data.items()}
         except Exception as e:
             print(f"Error loading segmentation labels: {e}")
+            return {}
+
+    def _load_segmentation_labels(self, labels_path):
+        self.segmentation_labels = self._read_segmentation_labels(labels_path)
 
     def _update_available_segmentation_classes(self):
         if self.segmentation_mask is None:
@@ -538,9 +797,9 @@ class DicomModel:
     def get_segmentation_label_map(self):
         return self.segmentation_labels
 
-        def get_available_segmentation_classes(self):
-           classes = []
-           for label_id in self.segmentation_available_classes:
-               display = self.segmentation_labels.get(label_id, f"Label {label_id}")
-               classes.append({"id": label_id, "name": display})
-           return classes
+    def get_available_segmentation_classes(self):
+        classes = []
+        for label_id in self.segmentation_available_classes:
+            display = self.segmentation_labels.get(label_id, f"Label {label_id}")
+            classes.append({"id": label_id, "name": display})
+        return classes
