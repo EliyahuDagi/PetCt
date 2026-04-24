@@ -207,5 +207,6 @@ marimo/_lsp/
 __marimo__/
 data/
 credentials.json
+token.json
 .vscode/
 debug/token.json
