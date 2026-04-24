@@ -5,6 +5,7 @@ import numpy as np
 import pydicom
 
 from src.utils.config import Config
+from src.utils.geometry import VolumeGeometry
 from src.utils.prostate_locator import locate_prostate_bbox
 from src.utils.segmentors import DiskSegmentor, PetBoxSegmentor, SegmentationResult
 
@@ -23,6 +24,7 @@ class DicomModel:
         self.segmentation_bbox_mm = None
         self.segmentation_bbox_vox = None
         self.segmentation_method = ""
+        self.segmentation_debug = None
 
     def load_dataset(self, data_path):
         """
@@ -139,6 +141,7 @@ class DicomModel:
         self.segmentation_mask = None
         self.segmentation_labels = {}
         self.segmentation_available_classes = []
+        self.segmentation_debug = None
         self.segmentation_bbox_mm = None
         self.segmentation_bbox_vox = None
         self.segmentation_method = ""
@@ -204,6 +207,7 @@ class DicomModel:
         self.segmentation_bbox_mm = result.bbox_mm
         self.segmentation_bbox_vox = result.bbox_vox
         self.segmentation_method = result.method or ""
+        self.segmentation_debug = getattr(result, "debug", None)
         if self.segmentation_mask is not None:
             self._update_available_segmentation_classes()
         else:
@@ -565,104 +569,116 @@ class DicomModel:
          return None
 
     def locate_prostate_roi(self, orientation='AXIAL'):
-         """Estimate prostate center slice and bounds using bladder + PET heuristics."""
-         # If a segmentor already produced a bbox (e.g., PET_BOX), use it directly
-         if self.segmentation_bbox_mm:
-             bounds = self._bbox_mm_to_bounds(self.segmentation_bbox_mm, orientation)
-             center_slice = None
+        """Estimate prostate center slice and bounds using bladder + PET heuristics."""
+        # If a segmentor already produced a bbox (e.g., PET_BOX), use it directly
+        if self.segmentation_bbox_mm:
+            bounds = self._bbox_mm_to_bounds(self.segmentation_bbox_mm, orientation)
+            center_slice = None
 
-             spacing = None
-             origin = None
-             if self.ct_volume is not None and self.ct_metadata:
-                 spacing = self.get_voxel_spacing()
-                 origin = self.get_origin()
-             elif (self.segmentation_method or "").startswith("pet_box") and self.pet_volume is not None:
-                 spacing, origin = self._get_pet_spacing_origin()
+            spacing = None
+            origin = None
+            shape_for_geom = None
+            if self.ct_volume is not None and self.ct_metadata:
+                spacing = self.get_voxel_spacing()
+                origin = self.get_origin()
+                shape_for_geom = self.ct_volume.shape
+            elif (self.segmentation_method or "").startswith("pet_box") and self.pet_volume is not None:
+                spacing, origin = self._get_pet_spacing_origin()
+                shape_for_geom = self.pet_volume.shape
 
-             if spacing and origin:
-                 dz, dy, dx = spacing
-                 oz, oy, ox = origin
-                 if orientation == 'AXIAL':
-                     z1, z2 = self.segmentation_bbox_mm.get("z", (0.0, 0.0))
-                     center_slice = int(round(((z1 + z2) / 2 - oz) / max(dz, 1e-6)))
-                 elif orientation == 'CORONAL':
-                     y1, y2 = self.segmentation_bbox_mm.get("y", (0.0, 0.0))
-                     center_slice = int(round(((y1 + y2) / 2 - oy) / max(dy, 1e-6)))
-                 elif orientation == 'SAGITTAL':
-                     x1, x2 = self.segmentation_bbox_mm.get("x", (0.0, 0.0))
-                     center_slice = int(round(((x1 + x2) / 2 - ox) / max(dx, 1e-6)))
+            if spacing and origin and shape_for_geom is not None:
+                geom = VolumeGeometry(spacing, origin, shape_for_geom)
+                z1, z2 = self.segmentation_bbox_mm.get("z", (0.0, 0.0))
+                y1, y2 = self.segmentation_bbox_mm.get("y", (0.0, 0.0))
+                x1, x2 = self.segmentation_bbox_mm.get("x", (0.0, 0.0))
+                center_mm = np.array([(z1 + z2) / 2.0, (y1 + y2) / 2.0, (x1 + x2) / 2.0], dtype=float)
+                center_vox = geom.mm_to_vox(center_mm)
+                if orientation == 'AXIAL':
+                    center_slice = int(round(center_vox[0]))
+                elif orientation == 'CORONAL':
+                    center_slice = int(round(center_vox[1]))
+                elif orientation == 'SAGITTAL':
+                    center_slice = int(round(center_vox[2]))
 
-             if center_slice is None and self.segmentation_bbox_vox:
-                 if orientation == 'AXIAL':
-                     z_lo, z_hi = self.segmentation_bbox_vox.get("z", (0, 0))
-                     center_slice = (z_lo + z_hi) // 2
-                 elif orientation == 'CORONAL':
-                     y_lo, y_hi = self.segmentation_bbox_vox.get("y", (0, 0))
-                     center_slice = (y_lo + y_hi) // 2
-                 elif orientation == 'SAGITTAL':
-                     x_lo, x_hi = self.segmentation_bbox_vox.get("x", (0, 0))
-                     center_slice = (x_lo + x_hi) // 2
+            if center_slice is None and self.segmentation_bbox_vox:
+                if orientation == 'AXIAL':
+                    z_lo, z_hi = self.segmentation_bbox_vox.get("z", (0, 0))
+                    center_slice = (z_lo + z_hi) // 2
+                elif orientation == 'CORONAL':
+                    y_lo, y_hi = self.segmentation_bbox_vox.get("y", (0, 0))
+                    center_slice = (y_lo + y_hi) // 2
+                elif orientation == 'SAGITTAL':
+                    x_lo, x_hi = self.segmentation_bbox_vox.get("x", (0, 0))
+                    center_slice = (x_lo + x_hi) // 2
 
-             if center_slice is not None:
-                 max_slices = self.get_slice_count(orientation)
-                 if max_slices > 0:
-                     center_slice = max(0, min(center_slice, max_slices - 1))
+            if center_slice is not None:
+                max_slices = self.get_slice_count(orientation)
+                if max_slices > 0:
+                    center_slice = max(0, min(center_slice, max_slices - 1))
 
-             return {
-                 "center_slice": center_slice,
-                 "bounds": bounds,
-                 "method": self.segmentation_method or "segmentor_bbox",
-                 "bbox_vox": self.segmentation_bbox_vox,
-                 "bbox_mm": self.segmentation_bbox_mm,
-             }
+            return {
+                "center_slice": center_slice,
+                "bounds": bounds,
+                "method": self.segmentation_method or "segmentor_bbox",
+                "bbox_vox": self.segmentation_bbox_vox,
+                "bbox_mm": self.segmentation_bbox_mm,
+            }
 
-         if self.segmentation_mask is None and self.pet_volume is None:
-             return None
+        if self.segmentation_mask is None and self.pet_volume is None:
+            return None
 
-         try:
-             bbox = locate_prostate_bbox(
-                 mask=self.segmentation_mask,
-                 labels=self.segmentation_labels or {},
-                 spacing=self.get_voxel_spacing(),
-                 origin=self.get_origin(),
+        try:
+            pet_spacing, pet_origin = self._get_pet_spacing_origin()
+            ct_spacing = self.get_voxel_spacing()
+            ct_origin = self.get_origin()
+            bbox = locate_prostate_bbox(
+                mask=self.segmentation_mask,
+                labels=self.segmentation_labels or {},
+                spacing=ct_spacing,
+                origin=ct_origin,
                 pet_volume=self.pet_volume,
-             )
-         except Exception as e:
-             print(f"Prostate locator error: {e}")
-             return None
+                pet_spacing=pet_spacing,
+                pet_origin=pet_origin,
+                ct_volume=self.ct_volume,
+                ct_spacing=ct_spacing,
+                ct_origin=ct_origin,
+            )
+        except Exception as e:
+            print(f"Prostate locator error: {e}")
+            return None
 
-         if not bbox:
-             return None
+        if not bbox:
+            return None
 
-         center_vox = bbox.get("center_vox")
-         if not center_vox:
-             return None
+        center_vox = bbox.get("center_vox")
+        if not center_vox:
+            return None
 
-         if orientation == 'AXIAL':
-             center_slice = int(center_vox[0])
-         elif orientation == 'CORONAL':
-             center_slice = int(center_vox[1])
-         elif orientation == 'SAGITTAL':
-             center_slice = int(center_vox[2])
-         else:
-             center_slice = int(center_vox[0])
+        if orientation == 'AXIAL':
+            center_slice = int(center_vox[0])
+        elif orientation == 'CORONAL':
+            center_slice = int(center_vox[1])
+        elif orientation == 'SAGITTAL':
+            center_slice = int(center_vox[2])
+        else:
+            center_slice = int(center_vox[0])
 
-         # Keep slice index within valid range
-         max_slices = self.get_slice_count(orientation)
-         if max_slices > 0:
-             center_slice = max(0, min(center_slice, max_slices - 1))
+        # Keep slice index within valid range
+        max_slices = self.get_slice_count(orientation)
+        if max_slices > 0:
+            center_slice = max(0, min(center_slice, max_slices - 1))
 
-         bounds = self._bbox_mm_to_bounds(bbox.get("bbox_mm"), orientation)
+        bounds = self._bbox_mm_to_bounds(bbox.get("bbox_mm"), orientation)
 
-         return {
-             "center_slice": center_slice,
-             "bounds": bounds,
-             "method": bbox.get("method"),
-             "bbox_vox": bbox.get("bbox_vox"),
-             "bbox_mm": bbox.get("bbox_mm"),
-             "center_vox": bbox.get("center_vox"),
-             "debug": bbox.get("debug"),
-         }
+        return {
+            "center_slice": center_slice,
+            "bounds": bounds,
+            "method": bbox.get("method"),
+            "bbox_vox": bbox.get("bbox_vox"),
+            "bbox_mm": bbox.get("bbox_mm"),
+            "center_vox": bbox.get("center_vox"),
+            "debug": bbox.get("debug"),
+        }
          
     def get_segmentation_center_slice(self, orientation='AXIAL', label='all_classes'):
          """ Returns the slice index of the center of the segmentation """

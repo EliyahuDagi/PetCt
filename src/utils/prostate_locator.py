@@ -4,6 +4,8 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from src.utils.geometry import VolumeGeometry
+
 
 def _find_label_id(labels: Dict[int, str], needle: str) -> Optional[int]:
     for idx, name in labels.items():
@@ -42,14 +44,6 @@ def _bbox_from_mask(mask: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]
     return coords.min(axis=0), coords.max(axis=0)
 
 
-def _vox_to_mm(indexes: np.ndarray, spacing: Tuple[float, float, float], origin: Tuple[float, float, float]) -> np.ndarray:
-    dz, dy, dx = spacing
-    oz, oy, ox = origin
-    zyx_mm = np.zeros(3, dtype=float)
-    zyx_mm[0] = oz + indexes[0] * dz
-    zyx_mm[1] = oy + indexes[1] * dy
-    zyx_mm[2] = ox + indexes[2] * dx
-    return zyx_mm
 
 
 def _clamp(min_idx: int, max_idx: int, limit: int) -> Tuple[int, int]:
@@ -237,7 +231,11 @@ def locate_prostate_bbox(
     spacing: Tuple[float, float, float],
     origin: Tuple[float, float, float],
     pet_volume: Optional[np.ndarray] = None,
+    pet_spacing: Optional[Tuple[float, float, float]] = None,
+    pet_origin: Optional[Tuple[float, float, float]] = None,
     ct_volume: Optional[np.ndarray] = None,
+    ct_spacing: Optional[Tuple[float, float, float]] = None,
+    ct_origin: Optional[Tuple[float, float, float]] = None,
     inferior_pad_mm: float = 28.0,
     superior_pad_mm: float = 14.0,
     lateral_pad_mm: float = 18.0,
@@ -250,7 +248,9 @@ def locate_prostate_bbox(
     """
     Estimate prostate ROI using TotalSegmentor-like landmarks:
     - Anchor on bladder; nudge inferior.
-    - If ct_volume provided, refine by searching soft tissue below bladder.
+        - If ct_volume provided, refine by searching soft tissue below bladder.
+            If CT is not voxel-grid aligned with the segmentation mask, provide ct_spacing/ct_origin
+            so CT can be sampled into mask space for this refinement.
     - Refine with PET bladder glow if available.
     - Constrain lateral span using femoral heads.
     - Refine superior plane using seminal vesicles if present.
@@ -266,16 +266,41 @@ def locate_prostate_bbox(
     dz, dy, dx = spacing
     oz, oy, ox = origin
 
-    # If CT/PET are not on the same grid as the segmentation, we can still use PET
-    # for bladder glow (via bbox scaling), but we should avoid voxel-wise CT/PET fusion.
-    ct_aligned = ct_volume is not None and getattr(ct_volume, "shape", None) == mask.shape
+    geom_seg = VolumeGeometry(spacing, origin, mask.shape)
+    pet_geom: Optional[VolumeGeometry] = None
+    if pet_volume is not None and pet_spacing is not None and pet_origin is not None:
+        pet_geom = VolumeGeometry(pet_spacing, pet_origin, pet_volume.shape)
+
+    ct_geom: Optional[VolumeGeometry] = None
+    ct_spacing_eff: Optional[Tuple[float, float, float]] = None
+    ct_origin_eff: Optional[Tuple[float, float, float]] = None
+    if ct_volume is not None:
+        ct_spacing_eff = ct_spacing if ct_spacing is not None else spacing
+        ct_origin_eff = ct_origin if ct_origin is not None else origin
+        ct_geom = VolumeGeometry(ct_spacing_eff, ct_origin_eff, ct_volume.shape)
+
+    # Grid alignment flags (index-aligned means we can slice volumes with the same voxel ranges).
+    ct_index_aligned = ct_volume is not None and getattr(ct_volume, "shape", None) == mask.shape
+    ct_aligned = bool(ct_index_aligned)
     pet_aligned = pet_volume is not None and getattr(pet_volume, "shape", None) == mask.shape
+
+    # Even when CT is not index-aligned, we can still use it for refinement by sampling
+    # CT into the segmentation grid using the provided (or defaulted) CT spacing/origin.
+    ct_mappable = bool(ct_volume is not None and ct_geom is not None)
 
     if debug_info is not None:
         debug_info["ct_aligned"] = bool(ct_aligned)
+        debug_info["ct_index_aligned"] = bool(ct_index_aligned)
+        debug_info["ct_mappable"] = bool(ct_mappable)
         debug_info["pet_aligned"] = bool(pet_aligned)
         debug_info["spacing_mm"] = [float(dz), float(dy), float(dx)]
         debug_info["origin_mm"] = [float(oz), float(oy), float(ox)]
+        if ct_spacing_eff is not None and ct_origin_eff is not None:
+            debug_info["ct_spacing_mm"] = [float(ct_spacing_eff[0]), float(ct_spacing_eff[1]), float(ct_spacing_eff[2])]
+            debug_info["ct_origin_mm"] = [float(ct_origin_eff[0]), float(ct_origin_eff[1]), float(ct_origin_eff[2])]
+        if pet_spacing is not None and pet_origin is not None:
+            debug_info["pet_spacing_mm"] = [float(pet_spacing[0]), float(pet_spacing[1]), float(pet_spacing[2])]
+            debug_info["pet_origin_mm"] = [float(pet_origin[0]), float(pet_origin[1]), float(pet_origin[2])]
         debug_info["shapes_vox"] = {
             "mask": [int(v) for v in mask.shape],
             "ct": [int(v) for v in ct_volume.shape] if ct_volume is not None else None,
@@ -306,22 +331,8 @@ def locate_prostate_bbox(
                 (y0 + y1) // 2,
                 (x0 + x1) // 2,
             ], dtype=int)
-
-            bbox_mm = {
-                "z": [
-                    float(_vox_to_mm(np.array([z0, 0, 0]), spacing, origin)[0]),
-                    float(_vox_to_mm(np.array([z1, 0, 0]), spacing, origin)[0]),
-                ],
-                "y": [
-                    float(_vox_to_mm(np.array([0, y0, 0]), spacing, origin)[1]),
-                    float(_vox_to_mm(np.array([0, y1, 0]), spacing, origin)[1]),
-                ],
-                "x": [
-                    float(_vox_to_mm(np.array([0, 0, x0]), spacing, origin)[2]),
-                    float(_vox_to_mm(np.array([0, 0, x1]), spacing, origin)[2]),
-                ],
-            }
-            center_mm = _vox_to_mm(center_vox, spacing, origin).tolist()
+            bbox_mm = geom_seg.bbox_vox_to_mm((np.array([z0, y0, x0]), np.array([z1, y1, x1])))
+            center_mm = geom_seg.vox_to_mm(center_vox).tolist()
             payload = {
                 "method": "prostate_label",
                 "source_label_id": int(prostate_id),
@@ -388,18 +399,140 @@ def locate_prostate_bbox(
             "femoral_head_l": _bbox_to_dict(femoral_head_l),
             "femoral_head_r": _bbox_to_dict(femoral_head_r),
         }
+        if geom_seg is not None:
+            def _bbox_to_mm_dict(bbox: Optional[Tuple[np.ndarray, np.ndarray]]):
+                if bbox is None:
+                    return None
+                return geom_seg.bbox_vox_to_mm(bbox)
+
+            debug_info["landmarks_mm"] = {
+                "bladder": _bbox_to_mm_dict(bladder_bbox),
+                "vesicles": _bbox_to_mm_dict(ves_bbox),
+                "rectum": _bbox_to_mm_dict(rectum_bbox),
+                "colon": _bbox_to_mm_dict(colon_bbox),
+                "femoral_head_l": _bbox_to_mm_dict(femoral_head_l),
+                "femoral_head_r": _bbox_to_mm_dict(femoral_head_r),
+            }
         debug_info["label_ids"] = {
             "bladder": int(bladder_id) if bladder_id is not None else None,
             "rectum": int(rectum_id) if rectum_id is not None else None,
             "colon": [int(v) for v in colon_ids],
         }
 
+    pelvic_band_source = None
+
+    def _pelvic_band_from_landmarks() -> Optional[Tuple[int, int]]:
+        """Derive an inclusive z-band (vox) to constrain PET search to the pelvis."""
+        nonlocal pelvic_band_source
+        z_len = mask.shape[0]
+        if z_len <= 0:
+            return None
+
+        def pad_vox(mm: float) -> int:
+            return int(round(mm / max(dz, 1e-6)))
+
+        # Primary: bladder present -> window around it
+        if bladder_bbox is not None:
+            z0, z1 = int(bladder_bbox[0][0]), int(bladder_bbox[1][0])
+            lo = max(0, z0 - pad_vox(80.0))
+            hi = min(z_len - 1, z1 + pad_vox(60.0))
+            pelvic_band_source = "bladder"
+            return lo, hi
+
+        # Secondary: rectum/colon span
+        if rectum_bbox is not None:
+            z0, z1 = int(rectum_bbox[0][0]), int(rectum_bbox[1][0])
+            lo = max(0, z0 - pad_vox(60.0))
+            hi = min(z_len - 1, z1 + pad_vox(40.0))
+            pelvic_band_source = "rectum"
+            return lo, hi
+        if colon_bbox is not None:
+            z0, z1 = int(colon_bbox[0][0]), int(colon_bbox[1][0])
+            height = max(1, z1 - z0 + 1)
+            lower_hi = z0 + int(math.ceil(height * 0.4))  # restrict to inferior 40% of colon span
+            lo = max(0, min(z0 - pad_vox(30.0), int(z_len * 0.35)))
+            hi = min(z_len - 1, lower_hi + pad_vox(15.0), int(z_len * 0.65))
+            pelvic_band_source = "colon_lower"
+            return lo, hi
+
+        # Tertiary: femoral heads -> roughly pelvic floor to brim
+        if femoral_head_l is not None and femoral_head_r is not None:
+            z_vals = [femoral_head_l[0][0], femoral_head_l[1][0], femoral_head_r[0][0], femoral_head_r[1][0]]
+            lo = max(0, int(min(z_vals) - pad_vox(40.0)))
+            hi = min(z_len - 1, int(max(z_vals) + pad_vox(80.0)))
+            pelvic_band_source = "femoral_heads"
+            return lo, hi
+
+        # Fallback: inferior half (feet-ward) of volume
+        hi = z_len - 1
+        mid = int(round(z_len * 0.45))
+        pelvic_band_source = "inferior_half"
+        return mid, hi
+
+    pelvic_band_vox = _pelvic_band_from_landmarks()
+    pelvic_band_mm = None
+    if pelvic_band_vox is not None and geom_seg is not None:
+        z0_band, z1_band = pelvic_band_vox
+        pelvic_band_mm = (
+            geom_seg.vox_to_mm(np.array([z0_band, 0, 0]))[0],
+            geom_seg.vox_to_mm(np.array([z1_band, 0, 0]))[0],
+        )
+    if debug_info is not None:
+        debug_info["pelvic_band_source"] = pelvic_band_source
+        debug_info["pelvic_band_vox"] = [int(pelvic_band_vox[0]), int(pelvic_band_vox[1])] if pelvic_band_vox else None
+        debug_info["pelvic_band_mm"] = [float(pelvic_band_mm[0]), float(pelvic_band_mm[1])] if pelvic_band_mm else None
+
     # PET glow near bladder
+    def _intersect_bbox(b1: Optional[Tuple[np.ndarray, np.ndarray]], b2: Optional[Tuple[np.ndarray, np.ndarray]]):
+        if b1 is None:
+            return b2
+        if b2 is None:
+            return b1
+        (a0, a1) = b1
+        (b0, b1_) = b2
+        lo = np.maximum(a0, b0)
+        hi = np.minimum(a1, b1_)
+        if np.any(hi < lo):
+            return None
+        return lo, hi
+
     pet_crop_bbox = None
-    if bladder_bbox and pet_volume is not None:
-        pet_crop_bbox = _scale_bbox_between_grids(bladder_bbox, mask.shape, pet_volume.shape)
-        if pet_crop_bbox is not None:
-            pet_crop_bbox = _extend_inferior(pet_crop_bbox, pet_volume.shape, pet_inferior_extension_frac)
+    if pet_volume is not None:
+        # Bladder-guided crop (scale CT mask bbox to PET grid)
+        if bladder_bbox is not None:
+            if pet_geom is not None:
+                bbox_mm = geom_seg.bbox_vox_to_mm(bladder_bbox)
+                pet_crop_bbox = pet_geom.bbox_mm_to_vox(bbox_mm)
+            else:
+                pet_crop_bbox = _scale_bbox_between_grids(bladder_bbox, mask.shape, pet_volume.shape)
+            if pet_crop_bbox is not None:
+                pet_crop_bbox = _extend_inferior(pet_crop_bbox, pet_volume.shape, pet_inferior_extension_frac)
+
+        # Pelvic band crop (scale z-band to PET grid, full XY)
+        pet_band_bbox = None
+        if pelvic_band_vox is not None:
+            z0_band, z1_band = pelvic_band_vox
+            if pet_geom is not None and geom_seg is not None:
+                band_mm = (
+                    geom_seg.vox_to_mm(np.array([z0_band, 0, 0]))[0],
+                    geom_seg.vox_to_mm(np.array([z1_band, 0, 0]))[0],
+                )
+                z_band_pet = pet_geom.z_band_mm_to_vox(band_mm)
+                if z_band_pet is not None:
+                    z_lo, z_hi = z_band_pet
+                    pet_band_bbox = (
+                        np.array([z_lo, 0, 0]),
+                        np.array([z_hi, pet_volume.shape[1] - 1, pet_volume.shape[2] - 1]),
+                    )
+                    if debug_info is not None:
+                        debug_info["pelvic_band_pet_vox"] = [int(z_lo), int(z_hi)]
+                        debug_info["pelvic_band_pet_mm"] = [float(band_mm[0]), float(band_mm[1])]
+            else:
+                band_bbox = (np.array([z0_band, 0, 0]), np.array([z1_band, mask.shape[1] - 1, mask.shape[2] - 1]))
+                pet_band_bbox = _scale_bbox_between_grids(band_bbox, mask.shape, pet_volume.shape)
+
+        pet_crop_bbox = _intersect_bbox(pet_crop_bbox, pet_band_bbox)
+
     bbox_pet = _pet_bladder_guess(pet_volume, crop_bbox=pet_crop_bbox) if pet_volume is not None else None
 
     if debug_info is not None:
@@ -411,16 +544,26 @@ def locate_prostate_bbox(
     # Choose centroid
     centroid = None
     method = None
+    initial_anchor_source = None
+    pet_fused_into_anchor = False
     if bladder_bbox is not None:
+        # If bladder is segmented, always anchor on it first.
+        # PET search remains available (debug/crop/CT+PET refinement), but does not
+        # directly move the initial anchor centroid.
         centroid = _centroid_from_bbox(bladder_bbox)
         method = "bladder_anchor"
-        if bbox_pet is not None:
-            pet_centroid = _centroid_from_bbox(bbox_pet)
-            centroid = 0.25 * pet_centroid + 0.75 * centroid
-            method = "bladder_pet_fusion"
+        initial_anchor_source = "bladder_segmentation"
     elif bbox_pet is not None:
-        centroid = _centroid_from_bbox(bbox_pet)
+        pet_centroid = _centroid_from_bbox(bbox_pet)
+        if pet_geom is not None:
+            centroid = pet_geom.map_point_to(geom_seg, np.array(pet_centroid))
+        else:
+            pet_shape = np.array(pet_volume.shape, dtype=float) if pet_volume is not None else np.array([1.0, 1.0, 1.0])
+            seg_shape = np.array(mask.shape, dtype=float)
+            centroid = np.array(pet_centroid, dtype=float) * (seg_shape / pet_shape)
         method = "pet_only"
+        initial_anchor_source = "pet_hotspot"
+        pet_fused_into_anchor = True
     else:
         return None
 
@@ -432,6 +575,9 @@ def locate_prostate_bbox(
     if debug_info is not None:
         debug_info["initial_centroid_vox"] = [float(centroid[0]), float(centroid[1]), float(centroid[2])]
         debug_info["initial_method"] = str(method)
+        debug_info["initial_anchor_source"] = str(initial_anchor_source)
+        debug_info["pet_fused_into_initial_anchor"] = bool(pet_fused_into_anchor)
+        debug_info["bladder_anchor_only"] = bool(bladder_bbox is not None)
         debug_info["inferior_step"] = int(inferior_step)
     
     # Let's apply valid lateral constraints
@@ -447,7 +593,8 @@ def locate_prostate_bbox(
         debug_info["lateral_lims_from_heads_vox"] = [int(v) for v in lateral_lims] if lateral_lims is not None else None
 
     # REFINEMENT WITH CT (+ PET): pelvic search below bladder between hips
-    if ct_aligned and bladder_bbox is not None:
+    # Works even when CT is not index-aligned by sampling CT into the segmentation grid.
+    if ct_mappable and bladder_bbox is not None:
         b_z_min, b_z_max = int(bladder_bbox[0][0]), int(bladder_bbox[1][0])
         b_y_min, b_y_max = int(bladder_bbox[0][1]), int(bladder_bbox[1][1])
         b_x_min, b_x_max = int(bladder_bbox[0][2]), int(bladder_bbox[1][2])
@@ -496,12 +643,74 @@ def locate_prostate_bbox(
                 "x_range_requested": [int(x0), int(x1)],  # half-open
                 "y_range_requested": [int(y0), int(y1)],  # half-open
                 "exclude_ids": [int(v) for v in exclude_ids],
+                "ct_index_aligned": bool(ct_index_aligned),
                 "ct_soft_tissue_hu": [20.0, 110.0],
                 "pet_hot_percentile": 99.0,
                 "pet_min_vals": 50,
                 "trials": [],
             }
             debug_info["pelvic_refinement"] = pelvic_debug
+
+        ct_same_geom = False
+        if ct_spacing_eff is not None and ct_origin_eff is not None:
+            ct_same_geom = bool(np.allclose(np.array(ct_spacing_eff), np.array(spacing))) and bool(
+                np.allclose(np.array(ct_origin_eff), np.array(origin))
+            )
+
+        def _sample_src_to_seg_roi_nearest(
+            src_vol: np.ndarray,
+            src_geom_: VolumeGeometry,
+            dst_geom_: VolumeGeometry,
+            z0_: int,
+            z1_: int,
+            y0_: int,
+            y1_: int,
+            x0_: int,
+            x1_: int,
+            fill_value: float = -1e9,
+        ) -> np.ndarray:
+            """Nearest-neighbor sample src_vol onto dst voxel grid for the requested half-open ROI."""
+            dz_d, dy_d, dx_d = dst_geom_.spacing
+            oz_d, oy_d, ox_d = dst_geom_.origin
+            dz_s, dy_s, dx_s = src_geom_.spacing
+            oz_s, oy_s, ox_s = src_geom_.origin
+
+            z_idx = np.arange(z0_, z1_, dtype=float)
+            y_idx = np.arange(y0_, y1_, dtype=float)
+            x_idx = np.arange(x0_, x1_, dtype=float)
+
+            z_mm = oz_d + z_idx * dz_d
+            y_mm = oy_d + y_idx * dy_d
+            x_mm = ox_d + x_idx * dx_d
+
+            z_src = np.round((z_mm - oz_s) / max(dz_s, 1e-6)).astype(int)
+            y_src = np.round((y_mm - oy_s) / max(dy_s, 1e-6)).astype(int)
+            x_src = np.round((x_mm - ox_s) / max(dx_s, 1e-6)).astype(int)
+
+            valid_z = (z_src >= 0) & (z_src < src_vol.shape[0])
+            valid_y = (y_src >= 0) & (y_src < src_vol.shape[1])
+            valid_x = (x_src >= 0) & (x_src < src_vol.shape[2])
+
+            z_src = np.clip(z_src, 0, src_vol.shape[0] - 1)
+            y_src = np.clip(y_src, 0, src_vol.shape[1] - 1)
+            x_src = np.clip(x_src, 0, src_vol.shape[2] - 1)
+
+            out = np.asarray(src_vol[z_src[:, None, None], y_src[None, :, None], x_src[None, None, :]], dtype=float)
+            valid = valid_z[:, None, None] & valid_y[None, :, None] & valid_x[None, None, :]
+            if not bool(np.all(valid)):
+                out = out.copy()
+                out[~valid] = float(fill_value)
+            return out
+
+        def _ct_crop_on_seg_grid(z0_: int, z1_: int, y0_: int, y1_: int, x0_: int, x1_: int) -> np.ndarray:
+            """Return a CT crop aligned to the segmentation (mask) voxel grid."""
+            if ct_volume is None:
+                raise RuntimeError("ct_volume is None in CT refinement")
+            if ct_geom is None:
+                raise RuntimeError("ct_geom is None in CT refinement")
+            if ct_index_aligned and ct_same_geom:
+                return np.asarray(ct_volume[z0_:z1_, y0_:y1_, x0_:x1_], dtype=float)
+            return _sample_src_to_seg_roi_nearest(ct_volume, ct_geom, geom_seg, z0_, z1_, y0_, y1_, x0_, x1_)
 
         def _try_refine(z0_cand: int, z1_cand: int, tag: str) -> bool:
             nonlocal centroid, method
@@ -532,7 +741,7 @@ def locate_prostate_bbox(
                 }
                 trial["crop_shape"] = [int(z1_cl - z0_cl), int(y1_cl - y0_cl), int(x1_cl - x0_cl)]
 
-            ct_crop = ct_volume[z0_cl:z1_cl, y0_cl:y1_cl, x0_cl:x1_cl]
+            ct_crop = _ct_crop_on_seg_grid(z0_cl, z1_cl, y0_cl, y1_cl, x0_cl, x1_cl)
             seg_crop = mask[z0_cl:z1_cl, y0_cl:y1_cl, x0_cl:x1_cl]
 
             exclude_mask = np.zeros(seg_crop.shape, dtype=bool)
@@ -681,16 +890,12 @@ def locate_prostate_bbox(
         (x_min_pad + x_max_pad) // 2,
     ], dtype=int)
 
-    bbox_mm = {
-        "z": [float(_vox_to_mm(np.array([z_min_pad, 0, 0]), spacing, origin)[0]),
-               float(_vox_to_mm(np.array([z_max_pad, 0, 0]), spacing, origin)[0])],
-        "y": [float(_vox_to_mm(np.array([0, y_min_pad, 0]), spacing, origin)[1]),
-               float(_vox_to_mm(np.array([0, y_max_pad, 0]), spacing, origin)[1])],
-        "x": [float(_vox_to_mm(np.array([0, 0, x_min_pad]), spacing, origin)[2]),
-               float(_vox_to_mm(np.array([0, 0, x_max_pad]), spacing, origin)[2])],
-    }
+    bbox_mm = geom_seg.bbox_vox_to_mm((
+        np.array([z_min_pad, y_min_pad, x_min_pad]),
+        np.array([z_max_pad, y_max_pad, x_max_pad]),
+    ))
 
-    center_mm = _vox_to_mm(center_vox, spacing, origin).tolist()
+    center_mm = geom_seg.vox_to_mm(center_vox).tolist()
 
     payload = {
         "method": method,
