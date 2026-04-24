@@ -642,6 +642,7 @@ class DicomModel:
                 ct_volume=self.ct_volume,
                 ct_spacing=ct_spacing,
                 ct_origin=ct_origin,
+                debug=bool(getattr(Config, 'PROSTATE_LOCATOR_DEBUG', False)),
             )
         except Exception as e:
             print(f"Prostate locator error: {e}")

@@ -236,30 +236,23 @@ class Presenter:
                     if min(slice_range) <= slice_idx <= max(slice_range):
                         in_slice = True
 
-            # 2. If in slice, get the 2D bounding box
+              # 2. If in slice, project 3D bbox into displayed 2D coordinates
             if in_slice:
-                 bounds = roi.get("bounds") # [left, right, bottom, top] physical coords
-                 if bounds:
-                      left, right, bottom, top = bounds
-                      # Matplotlib Rectangle uses (left, bottom), width, height
-                      # If top < bottom (standard image coords where Y increases down, e.g. 0 to 512):
-                      # We want top-left corner as (x, y_min) if y_min is physically top?
-                      # Wait, matplotlib patches are in data coordinates.
-                      # If ylim is (512, 0), then Y=0 is top.
-                      # Rectangle((x, y), w, h) draws from y towards y+h.
-                      
-                      # Case 1: Standard Cartesian (0 at bottom). rect(x,y, w, h) goes up.
-                      # Case 2: Image (0 at top). rect(x,y, w, h) goes down (increasing Y).
-                      # So regardless, we want (x_min, y_min, w, h) where y_min is the smaller coordinate value?
-                      # No, if 0 is top. y_min is 0. y_max is 100.
-                      # If I say rect(0, 0, 10, 10), it covers 0-10 on both axes.
-                      # So I just need min(y1, y2).
-                      
-                      x = min(left, right)
-                      y = min(top, bottom)
-                      w = abs(right - left)
-                      h = abs(bottom - top)
-                      zoi_box = [x, y, w, h]
+                  # Match prostate_locator_debug display mapping for coronal/sagittal slices,
+                  # where slice planes are flipud()-ed before display.
+                  if bbox_mm:
+                      zoi_box = self._bbox_mm_to_display_box(bbox_mm, ct_extent)
+
+                  # Fallback for legacy ROIs that only provide 2D bounds.
+                  if zoi_box is None:
+                      bounds = roi.get("bounds")  # [left, right, bottom, top] in display coords
+                      if bounds:
+                          left, right, bottom, top = bounds
+                          x = min(left, right)
+                          y = min(top, bottom)
+                          w = abs(right - left)
+                          h = abs(bottom - top)
+                          zoi_box = [x, y, w, h]
 
         self.view.update_images(
             ct,
@@ -303,6 +296,8 @@ class Presenter:
                  if indices is not None and indices.size > 0:
                      z_min, y_min, x_min = indices.min(axis=0)
                      z_max, y_max, x_max = indices.max(axis=0)
+                     dz, dy, dx = self.model.get_voxel_spacing()
+                     oz, oy, ox = self.model.get_origin()
                      roi = {
                          "method": "segmentation_label",
                          "label": label,
@@ -312,6 +307,11 @@ class Presenter:
                              "z": [int(z_min), int(z_max)],
                              "y": [int(y_min), int(y_max)],
                              "x": [int(x_min), int(x_max)],
+                         },
+                         "bbox_mm": {
+                             "z": [float(oz + z_min * dz), float(oz + z_max * dz)],
+                             "y": [float(oy + y_min * dy), float(oy + y_max * dy)],
+                             "x": [float(ox + x_min * dx), float(ox + x_max * dx)],
                          },
                      }
              except Exception as e:
@@ -347,6 +347,60 @@ class Presenter:
             return self.model._get_pet_spacing_origin()  # type: ignore
         except Exception:
             return (None, None)
+
+    def _flip_z_mm_for_display(self, z_mm, extent):
+        if extent is None:
+            return float(z_mm)
+        z_bottom = float(extent[2])
+        z_top = float(extent[3])
+        return float(z_top + z_bottom - float(z_mm))
+
+    def _bbox_mm_to_display_box(self, bbox_mm, ct_extent):
+        """Project a 3D mm bbox into displayed 2D coordinates for the current orientation."""
+        if not isinstance(bbox_mm, dict):
+            return None
+
+        try:
+            if self.orientation == 'AXIAL':
+                x0, x1 = bbox_mm.get("x", (None, None))
+                y0, y1 = bbox_mm.get("y", (None, None))
+                if None in (x0, x1, y0, y1):
+                    return None
+                x = min(float(x0), float(x1))
+                y = min(float(y0), float(y1))
+                w = abs(float(x1) - float(x0))
+                h = abs(float(y1) - float(y0))
+                return [x, y, w, h]
+
+            if self.orientation == 'CORONAL':
+                x0, x1 = bbox_mm.get("x", (None, None))
+                z0, z1 = bbox_mm.get("z", (None, None))
+                if None in (x0, x1, z0, z1):
+                    return None
+                z0_d = self._flip_z_mm_for_display(float(z0), ct_extent)
+                z1_d = self._flip_z_mm_for_display(float(z1), ct_extent)
+                x = min(float(x0), float(x1))
+                y = min(z0_d, z1_d)
+                w = abs(float(x1) - float(x0))
+                h = abs(z1_d - z0_d)
+                return [x, y, w, h]
+
+            if self.orientation == 'SAGITTAL':
+                y0, y1 = bbox_mm.get("y", (None, None))
+                z0, z1 = bbox_mm.get("z", (None, None))
+                if None in (y0, y1, z0, z1):
+                    return None
+                z0_d = self._flip_z_mm_for_display(float(z0), ct_extent)
+                z1_d = self._flip_z_mm_for_display(float(z1), ct_extent)
+                x = min(float(y0), float(y1))
+                y = min(z0_d, z1_d)
+                w = abs(float(y1) - float(y0))
+                h = abs(z1_d - z0_d)
+                return [x, y, w, h]
+        except Exception:
+            return None
+
+        return None
 
     def set_segmentation_source(self, source_name):
         """Switch segmentation source (e.g., MONAI vs TotalSegmentor) and reload masks."""

@@ -209,4 +209,5 @@ data/
 credentials.json
 token.json
 .vscode/
-debug/token.json
+debug/
+
