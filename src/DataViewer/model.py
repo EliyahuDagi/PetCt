@@ -1,5 +1,6 @@
 import os
 import json
+from typing import Optional
 
 import numpy as np
 import pydicom
@@ -568,10 +569,10 @@ class DicomModel:
              return [y1, y2, z2, z1]
          return None
 
-    def locate_prostate_roi(self, orientation='AXIAL'):
+    def locate_prostate_roi(self, orientation='AXIAL', force_locator: bool = False, debug_override: Optional[bool] = None):
         """Estimate prostate center slice and bounds using bladder + PET heuristics."""
         # If a segmentor already produced a bbox (e.g., PET_BOX), use it directly
-        if self.segmentation_bbox_mm:
+        if self.segmentation_bbox_mm and not force_locator:
             bounds = self._bbox_mm_to_bounds(self.segmentation_bbox_mm, orientation)
             center_slice = None
 
@@ -631,6 +632,9 @@ class DicomModel:
             pet_spacing, pet_origin = self._get_pet_spacing_origin()
             ct_spacing = self.get_voxel_spacing()
             ct_origin = self.get_origin()
+            debug_flag = bool(getattr(Config, 'PROSTATE_LOCATOR_DEBUG', False))
+            if debug_override is not None:
+                debug_flag = bool(debug_override)
             bbox = locate_prostate_bbox(
                 mask=self.segmentation_mask,
                 labels=self.segmentation_labels or {},
@@ -642,7 +646,7 @@ class DicomModel:
                 ct_volume=self.ct_volume,
                 ct_spacing=ct_spacing,
                 ct_origin=ct_origin,
-                debug=bool(getattr(Config, 'PROSTATE_LOCATOR_DEBUG', False)),
+                debug=debug_flag,
             )
         except Exception as e:
             print(f"Prostate locator error: {e}")

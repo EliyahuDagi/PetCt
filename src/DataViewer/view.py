@@ -16,7 +16,7 @@ class MainView(tk.Tk):
         self.segmentation_color_lut = {}
         self.segmentation_label_map = {}
         self.current_segmentation_label = 'all_classes'
-        self.segmentation_sources = ["TotalSegmentor", "MONAI"]
+        self.segmentation_sources = ["TotalSegmentor"]
         self.current_segmentation_source = "TotalSegmentor"
         
         self._create_toolbar()
@@ -259,15 +259,8 @@ class MainView(tk.Tk):
 
         ttk.Label(seg_frame, text="Source").pack(padx=5, pady=(2, 0), anchor=tk.W)
         self.seg_source_var = tk.StringVar(value=self.current_segmentation_source)
-        self.seg_source_combo = ttk.Combobox(
-            seg_frame,
-            textvariable=self.seg_source_var,
-            state="readonly",
-            width=28,
-            values=self.segmentation_sources,
-        )
-        self.seg_source_combo.pack(padx=5, pady=2)
-        self.seg_source_combo.bind("<<ComboboxSelected>>", self._on_segmentation_source_change)
+        self.seg_source_label = ttk.Label(seg_frame, textvariable=self.seg_source_var)
+        self.seg_source_label.pack(padx=5, pady=2, anchor=tk.W)
 
         ttk.Label(seg_frame, text="Class").pack(padx=5, pady=(4, 0), anchor=tk.W)
         self.segmentation_var = tk.StringVar(value="All Classes")
@@ -316,10 +309,8 @@ class MainView(tk.Tk):
             self.presenter.set_segmentation_class(label_value)
 
     def _on_segmentation_source_change(self, event=None):
-        source = self.seg_source_var.get()
-        self.current_segmentation_source = source
-        if self.presenter:
-            self.presenter.set_segmentation_source(source)
+        # Segmentation source is fixed in the viewer.
+        return
 
     def update_images(self, ct_img, pet_img, seg_img, slice_idx, wl=50, ww=400, aspect=1.0, 
                       ct_extent=None, pet_extent=None, segmentation_label='all_classes', zoi_box=None):
@@ -644,15 +635,9 @@ class MainView(tk.Tk):
 
     def set_segmentation_sources(self, sources, current=None):
         self.segmentation_sources = sources or []
-        if not self.segmentation_sources:
-            self.seg_source_combo.config(state='disabled')
-            return
-
-        self.seg_source_combo['values'] = self.segmentation_sources
-        target = current if current in self.segmentation_sources else self.segmentation_sources[0]
+        target = current if current in (self.segmentation_sources or []) else self.current_segmentation_source
         self.seg_source_var.set(target)
         self.current_segmentation_source = target
-        self.seg_source_combo.config(state='readonly')
 
     def set_segmentation_source_selection(self, source_name):
         if not source_name:
@@ -660,9 +645,6 @@ class MainView(tk.Tk):
         if source_name in (self.segmentation_sources or []):
             self.seg_source_var.set(source_name)
             self.current_segmentation_source = source_name
-        elif self.segmentation_sources:
-            self.seg_source_var.set(self.segmentation_sources[0])
-            self.current_segmentation_source = self.segmentation_sources[0]
 
     def set_segmentation_classes(self, classes, label_map=None, default='all_classes'):
         classes = classes or []

@@ -210,4 +210,5 @@ credentials.json
 token.json
 .vscode/
 debug/
+.github/
 

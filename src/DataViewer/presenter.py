@@ -25,13 +25,14 @@ class Presenter:
         self.wl = 40
         self.ww = 400
         self.selected_segmentation_label = 'all_classes'
-        self.segmentation_source_name = Config.DEFAULT_SEGMENTATION_SOURCE
+        # Viewer is fixed to TotalSegmentor segmentation.
+        self.segmentation_source_name = "TotalSegmentor"
         self.show_zoi = False
         self.prostate_roi_cache = None
 
         # Connect View -> Presenter
         self.view.set_presenter(self)
-        self.view.set_segmentation_sources(Config.SEGMENTATION_SOURCES, self.segmentation_source_name)
+        self.view.set_segmentation_sources([self.segmentation_source_name], self.segmentation_source_name)
 
     def set_orientation(self, mode):
         self.orientation = mode
@@ -272,9 +273,22 @@ class Presenter:
          """Toggle visibility of the ZOI bbox on the current slice."""
          self.show_zoi = not getattr(self, 'show_zoi', False)
          
-         if self.show_zoi and self.prostate_roi_cache is None:
-             # Calculate ROI if not cached
+         if self.show_zoi:
+             # Recalculate to keep ZOI consistent with current data/orientation.
              self._calculate_roi()
+             roi = self.prostate_roi_cache or {}
+             center_slice = roi.get("center_slice")
+             if center_slice is not None:
+                 try:
+                     center_slice = int(center_slice)
+                 except Exception:
+                     center_slice = None
+             if center_slice is not None:
+                 self.current_slice = center_slice
+                 try:
+                     self.view.slice_scale.set(center_slice)
+                 except Exception:
+                     pass
          
          # Re-render current slice
          self.set_slice(self.current_slice)
@@ -284,43 +298,8 @@ class Presenter:
              print("No segmentation or PET available.")
              return
 
-         roi = None
-
-         # Prefer the explicitly selected label when it actually exists
-         label_specific = self.selected_segmentation_label not in (None, 'all_classes')
-         if label_specific and self.model.has_segmentation_label(self.selected_segmentation_label):
-             try:
-                 label = self.selected_segmentation_label
-                 mask = self.model._get_binary_mask_for_label(label)
-                 indices = np.argwhere(mask > 0) if mask is not None else None
-                 if indices is not None and indices.size > 0:
-                     z_min, y_min, x_min = indices.min(axis=0)
-                     z_max, y_max, x_max = indices.max(axis=0)
-                     dz, dy, dx = self.model.get_voxel_spacing()
-                     oz, oy, ox = self.model.get_origin()
-                     roi = {
-                         "method": "segmentation_label",
-                         "label": label,
-                         "center_slice": int(self.model.get_segmentation_center_slice(self.orientation, label)),
-                         "bounds": self.model.get_segmentation_bounds(self.orientation, label),
-                         "bbox_vox": {
-                             "z": [int(z_min), int(z_max)],
-                             "y": [int(y_min), int(y_max)],
-                             "x": [int(x_min), int(x_max)],
-                         },
-                         "bbox_mm": {
-                             "z": [float(oz + z_min * dz), float(oz + z_max * dz)],
-                             "y": [float(oy + y_min * dy), float(oy + y_max * dy)],
-                             "x": [float(ox + x_min * dx), float(ox + x_max * dx)],
-                         },
-                     }
-             except Exception as e:
-                 print(f"ZOI label ROI error: {e}")
-                 roi = None
-
-         # Use the smart locator by default (prostate)
-         if roi is None:
-             roi = self.model.locate_prostate_roi(self.orientation)
+         # Use the prostate locator algorithm used by the debug script.
+         roi = self.model.locate_prostate_roi(self.orientation, force_locator=True, debug_override=True)
          self.prostate_roi_cache = roi
          if roi:
              print(f"ZOI method: {roi.get('method')}")
