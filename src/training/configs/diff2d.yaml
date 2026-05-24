@@ -1,0 +1,17 @@
+seed: 42
+output_dir: outputs/diff2d
+slice_manifest: data/training/slices.jsonl
+batch_size: 16
+num_workers: 4
+learning_rate: 1.0e-4
+max_epochs: 200
+latent_channels: 4
+model:
+  spatial_dims: 2
+  in_channels: 4
+  out_channels: 4
+  num_channels: [64, 128, 256]
+  attention_levels: [false, true, true]
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0

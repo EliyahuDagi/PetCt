@@ -1,0 +1,16 @@
+data_root: data
+output_root: data/training
+slice_manifest: data/training/slices.jsonl
+volume_manifest: data/training/volumes.jsonl
+cache_root: data/training/cache
+splits:
+  train: 0.8
+  val: 0.1
+  test: 0.1
+modalities:
+  - nac
+  - ac
+extract:
+  orientation: axial
+  target_size: [128, 128]
+  normalize: true
