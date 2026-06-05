@@ -65,6 +65,14 @@ Key pitfalls (see `.github/agents/core-summary.md` for the full list):
   train|val) + `best.pt`/`last.pt`.
 - Inference: `python -m src.training.infer` writes
   `outputs/infer/<task>/{pred.npy,gt.npy,meta.json}`.
+- **Multi-root datasets**: every entry point takes `--data_dir` as `nargs="+"`
+  (one flag, space-separated roots); `--patient_index` is a single global index
+  across all roots, resolved via the torch-free `src/training/dataset_index.py`
+  `enumerate_patients(...)`. AE stages (ae2d/ae3d) pool any available PET volume
+  (unpaired NAC *or* AC is fine); diffusion stages require paired NAC+AC and skip
+  patients missing a pair. Train/val is by-patient holdout when >1 usable patient,
+  else the original within-patient depth split. The GUI Train tab lists roots in an
+  Add/Remove listbox and shows a `Dataset: N patients` count.
 - See `memory/train-viewer.md` for the durable design record.
 
 ## Running things

@@ -161,7 +161,7 @@ def main():
     torch.manual_seed(seed)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    configure_backends(logger)
+    configure_backends(device, logger)
 
     ae, ae_config = load_frozen_ae(args.ae_ckpt, device)
     latent_channels = int(ae_config.get("latent_channels", config.get("latent_channels", 4)))
