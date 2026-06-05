@@ -90,6 +90,8 @@ def _reset_peak(device):
 
 
 def _write_jsonl(path, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
@@ -103,7 +105,7 @@ def main():
     parser.add_argument("--ae2d_size", type=int, default=256)
     parser.add_argument("--diff2d_size", type=int, default=32)
     parser.add_argument("--diff3d_size", type=int, default=16)
-    parser.add_argument("--output", default="profile_report.jsonl")
+    parser.add_argument("--output", default="outputs/profiling/profile_report.jsonl")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")

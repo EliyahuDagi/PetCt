@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.training.train import train_ae2d, train_diff2d, train_ft3d
+from src.training.train import train_ae2d, train_ae3d, train_diff2d, train_ft3d
 
 
 def load_state(path):
@@ -44,11 +44,17 @@ def run_all(steps, state_path, resume=False, start_step=None):
             pre.append(name)
         completed = pre
 
+    first_to_run = True
     for name, fn, argv in steps:
         if name in completed:
             continue
+        # When resuming, the first stage we run is the one that was interrupted;
+        # let it continue from its last.pt. Later stages never started (no last.pt)
+        # so they begin fresh.
+        run_argv = argv + ["--resume"] if (resume and first_to_run) else argv
+        first_to_run = False
         try:
-            fn(argv)
+            fn(run_argv)
             completed.append(name)
             save_state(state_path, completed)
         except Exception:
@@ -60,70 +66,53 @@ def run_all(steps, state_path, resume=False, start_step=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", required=True, help="Dataset root or patient folder")
+    parser.add_argument("--data_dir", required=True, nargs="+", help="One or more dataset roots / patient folders")
     parser.add_argument("--patient_index", type=int, default=0)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--steps", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--steps_per_epoch", type=int, default=50)
+    parser.add_argument("--val_every", type=int, default=25)
+    parser.add_argument("--val_fraction", type=float, default=0.2)
     parser.add_argument("--slice_size", type=int, default=128)
+    parser.add_argument("--crop_size", type=int, default=64, help="Cube size for the 3D AE (ae3d) stage")
     parser.add_argument("--latent_size", type=int, default=128)
     parser.add_argument("--latent_size_3d", type=int, default=64)
     parser.add_argument("--inflate_from", default=None)
     parser.add_argument("--state_path", default="outputs/run_all_state.json")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--start_step", default=None, choices=["ae2d", "diff2d", "ft3d"])
+    parser.add_argument("--start_step", default=None, choices=["ae2d", "ae3d", "diff2d", "ft3d"])
     args = parser.parse_args()
+
+    common = [
+        "--data_dir", *args.data_dir,
+        "--patient_index", str(args.patient_index),
+        "--device", args.device,
+        "--epochs", str(args.epochs),
+        "--steps_per_epoch", str(args.steps_per_epoch),
+        "--val_every", str(args.val_every),
+        "--val_fraction", str(args.val_fraction),
+    ]
 
     steps = [
         (
             "ae2d",
             lambda argv: run_module_main(train_ae2d.main, argv),
-            [
-                "train_ae2d.py",
-                "--data_dir",
-                args.data_dir,
-                "--patient_index",
-                str(args.patient_index),
-                "--device",
-                args.device,
-                "--steps",
-                str(args.steps),
-                "--slice_size",
-                str(args.slice_size),
-            ],
+            ["train_ae2d.py"] + common + ["--slice_size", str(args.slice_size)],
+        ),
+        (
+            "ae3d",
+            lambda argv: run_module_main(train_ae3d.main, argv),
+            ["train_ae3d.py"] + common + ["--crop_size", str(args.crop_size)],
         ),
         (
             "diff2d",
             lambda argv: run_module_main(train_diff2d.main, argv),
-            [
-                "train_diff2d.py",
-                "--data_dir",
-                args.data_dir,
-                "--patient_index",
-                str(args.patient_index),
-                "--device",
-                args.device,
-                "--steps",
-                str(args.steps),
-                "--latent_size",
-                str(args.latent_size),
-            ],
+            ["train_diff2d.py"] + common + ["--latent_size", str(args.latent_size)],
         ),
         (
             "ft3d",
             lambda argv: run_module_main(train_ft3d.main, argv),
-            [
-                "train_ft3d.py",
-                "--data_dir",
-                args.data_dir,
-                "--patient_index",
-                str(args.patient_index),
-                "--device",
-                args.device,
-                "--steps",
-                str(args.steps),
-                "--latent_size",
-                str(args.latent_size_3d),
-            ]
+            ["train_ft3d.py"] + common + ["--latent_size", str(args.latent_size_3d)]
             + (["--inflate_from", args.inflate_from] if args.inflate_from else []),
         ),
     ]

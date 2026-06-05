@@ -1,8 +1,13 @@
-"""Train the 2D AutoencoderKL (encode/decode).
+"""Fine-tune a 3D AutoencoderKL inflated from the trained 2D AE.
 
-Trains on pooled PET slices (NAC + AC) by default so NAC and AC share one latent
-space for the downstream NAC->AC translation. Emits structured JSONL metrics and
-saves best/last checkpoints (with config embedded) for the Train Viewer.
+Stage 2 of the pipeline (between ae2d and the diffusion stages). Loads the frozen
+2D AE checkpoint, builds a 3D AutoencoderKL with the *same* architecture, centre-
+inflates the 2D weights into it (so each 3D conv starts out behaving like its 2D
+counterpart on every z-plane) and fine-tunes on pooled NAC+AC 3D crops. The
+result encodes volumetric context and compresses the depth axis, giving the
+downstream 3D diffusion a richer, smaller latent than a depth-uncompressed 2D
+encoding. Emits JSONL metrics and best/last checkpoints (config embedded for
+inference).
 """
 
 import argparse
@@ -16,12 +21,13 @@ from src.training.data import (
     PatientVolumeCache,
     ae_pool_volumes,
     load_patient_volumes,
-    make_depth_split,
     make_patient_split,
-    sample_slices,
+    sample_volumes,
+    sample_volumes_full,
 )
 from src.training.dataset_index import enumerate_patients
-from src.training.models.autoencoder2d import build_autoencoder_2d
+from src.training.models.autoencoder3d import build_autoencoder_3d
+from src.training.models.inflation import map_state_dict_2d_to_3d
 from src.training.utils.checkpointing import (
     capture_rng_state,
     load_checkpoint,
@@ -39,8 +45,8 @@ from src.training.utils.perf import (
     to_model_memory_format,
 )
 
-TASK = "ae2d"
-SPATIAL_DIMS = 2
+TASK = "ae3d"
+SPATIAL_DIMS = 3
 
 
 def _ae_metrics(model, batch):
@@ -77,22 +83,38 @@ def eval_step(model, batch):
 
 
 def build_model(config):
-    return build_autoencoder_2d(config)
+    return build_autoencoder_3d(config)
+
+
+def inflate_and_load(model_3d, state_dict_2d):
+    mapped, missing = map_state_dict_2d_to_3d(state_dict_2d, model_3d.state_dict())
+    model_3d.load_state_dict(mapped, strict=False)
+    return mapped, missing
+
+
+def load_ae2d_config(ae2d_ckpt):
+    if not ae2d_ckpt or not os.path.exists(ae2d_ckpt):
+        raise FileNotFoundError(
+            "2D AE checkpoint not found at %r. Train ae2d first (writes outputs/ae2d/best.pt)." % ae2d_ckpt
+        )
+    state = load_checkpoint(ae2d_ckpt)
+    return state.get("config", {}), state.get("model", state)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", required=True, nargs="+", help="One or more dataset roots / patient folders")
     parser.add_argument("--patient_index", type=int, default=0)
-    parser.add_argument("--config", default=None, help="Optional YAML config path")
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--ae2d_ckpt", default="outputs/ae2d/best.pt", help="2D AE checkpoint to inflate from")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--steps_per_epoch", type=int, default=50)
-    parser.add_argument("--val_every", type=int, default=25, help="Validate every N global steps")
+    parser.add_argument("--val_every", type=int, default=25)
     parser.add_argument("--val_fraction", type=float, default=0.2)
-    parser.add_argument("--val_batches", type=int, default=4)
+    parser.add_argument("--val_batches", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
-    parser.add_argument("--slice_size", type=int, default=128)
+    parser.add_argument("--crop_size", type=int, default=64, help="Cube size of 3D crops fed to the AE")
     parser.add_argument("--modality", choices=["pet", "ct"], default="pet")
     parser.add_argument("--save_dir", default=None)
     parser.add_argument("--device", default="cuda")
@@ -107,16 +129,9 @@ def main():
 
     default_config = {
         "seed": 42,
-        "output_dir": "outputs/ae2d",
-        "batch_size": 4,
+        "output_dir": "outputs/ae3d",
+        "batch_size": 1,
         "learning_rate": 1.0e-4,
-        "latent_channels": 4,
-        "model": {
-            "in_channels": 1,
-            "out_channels": 1,
-            "block_out_channels": [16, 32, 64],
-            "num_res_blocks": 1,
-        },
     }
 
     config = _load_config(args.config, default_config)
@@ -139,19 +154,31 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     configure_backends(device, logger)
 
-    # raw_model owns the weights (state_dict / resume); model is the (optionally)
-    # compiled handle used only for the forward pass. They share parameters.
+    # Build the 3D AE with the SAME architecture as the 2D AE so weights inflate
+    # cleanly; the 2D AE's config is the source of truth and is re-embedded here.
+    ae2d_config, ae2d_state = load_ae2d_config(args.ae2d_ckpt)
+    config["model"] = dict(ae2d_config.get("model", {}))
+    config["latent_channels"] = int(ae2d_config.get("latent_channels", 4))
+
+    # raw_model owns the weights (inflation / state_dict / resume); model is the
+    # (optionally) compiled forward handle. They share parameters.
     raw_model = build_model(config).to(device)
     raw_model = to_model_memory_format(raw_model, SPATIAL_DIMS)
     optimizer = torch.optim.Adam(raw_model.parameters(), lr=float(config.get("learning_rate", 1.0e-4)))
+
+    # Inflation seeds the 3D weights; a --resume checkpoint takes precedence and
+    # overwrites them, so only inflate on a fresh run. Inflate before compiling.
+    if resume_path is None:
+        _, missing = inflate_and_load(raw_model, ae2d_state)
+        logger.info("Inflated 3D AE from %s; %s params left at fresh init.", args.ae2d_ckpt, len(missing))
+
     model = maybe_compile(raw_model, logger)
 
     rng = np.random.RandomState(seed)
-    batch_size = int(config.get("batch_size", 4))
+    batch_size = int(config.get("batch_size", 1))
 
-    # Enumerate patients across all roots (missing_ok lets monkeypatched / GUI
-    # callers pass non-existent paths). With <=1 enumerated patient we fall back
-    # to the legacy single-patient depth split so existing behavior is unchanged.
+    # Enumerate patients across roots; <=1 patient falls back to the legacy
+    # single-patient depth-band split (keeps existing behavior/tests unchanged).
     patients = enumerate_patients(args.data_dir, missing_ok=True)
     multi_patient = len(patients) > 1
 
@@ -161,40 +188,33 @@ def main():
         if not pool_vols and args.modality == "pet":
             logger.info("No PET volumes found; falling back to CT for AE training.")
         if not pool_vols:
-            raise ValueError("No volumes available for AE training.")
-        train_pool, val_pool = make_depth_split(seed, args.val_fraction)
+            raise ValueError("No volumes available for 3D AE training.")
         logger.info("Training on 1 patient (train 1 / val 1) across %d roots.", len(args.data_dir))
 
         def sample_train():
-            return sample_slices(pool_vols, train_pool, batch_size, args.slice_size, rng)
+            return sample_volumes(pool_vols, batch_size, args.crop_size, "train", args.val_fraction, rng)
 
         def sample_val():
-            return sample_slices(pool_vols, val_pool, batch_size, args.slice_size, rng)
+            return sample_volumes(pool_vols, batch_size, args.crop_size, "val", args.val_fraction, rng)
     else:
         cache = PatientVolumeCache(patients, device=device, max_cached=4)
         train_idx, val_idx = make_patient_split(len(patients), args.val_fraction, seed)
-        full_pool = np.linspace(0.0, 1.0, num=128, endpoint=False)
         logger.info(
             "Training on %d patients (train %d / val %d) across %d roots.",
             len(patients), len(train_idx), len(val_idx), len(args.data_dir),
         )
 
-        def _pool_for(idx):
-            vols = cache.get(idx)
-            return ae_pool_volumes(vols, args.modality)
-
         def _sample_from(indices):
             pool_vols = []
-            # Try patients until one yields usable volumes (handles unpaired data).
             order = list(indices)
             rng.shuffle(order)
             for idx in order:
-                pool_vols = _pool_for(idx)
+                pool_vols = ae_pool_volumes(cache.get(idx), args.modality)
                 if pool_vols:
                     break
             if not pool_vols:
-                raise ValueError("No volumes available for AE training across selected patients.")
-            return sample_slices(pool_vols, full_pool, batch_size, args.slice_size, rng)
+                raise ValueError("No volumes available for 3D AE training across selected patients.")
+            return sample_volumes_full(pool_vols, batch_size, args.crop_size, rng)
 
         def sample_train():
             return _sample_from(train_idx)
@@ -233,14 +253,16 @@ def main():
     logger.info("Training finished. best_val_loss=%.6f", best_val)
 
 
+@torch.no_grad()
 def _validate(model, sample_val, n_batches):
     accum = {}
-    for _ in range(max(1, n_batches)):
+    n = max(1, n_batches)
+    for _ in range(n):
         batch = sample_val()
         m = eval_step(model, batch)
         for k, v in m.items():
             accum[k] = accum.get(k, 0.0) + v
-    return {k: v / max(1, n_batches) for k, v in accum.items()}
+    return {k: v / n for k, v in accum.items()}
 
 
 def _checkpoint_state(model, optimizer, rng, config, step, epoch, val_loss, best_val):
@@ -266,7 +288,7 @@ def _resume(model, optimizer, rng, resume_path, logger):
         optimizer.load_state_dict(state["optimizer"])
     restore_rng_state(state.get("rng"), rng)
     best_val = float(state.get("best_val", float("inf")))
-    start_step = int(state.get("step", 0))  # "step" = number of steps already completed
+    start_step = int(state.get("step", 0))
     logger.info("Resumed from %s at step=%s best_val=%.6f", resume_path, start_step, best_val)
     return start_step, best_val
 

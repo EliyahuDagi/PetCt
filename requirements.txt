@@ -1,7 +1,11 @@
---extra-index-url https://download.pytorch.org/whl/cu128
-torch
-torchvision
-torchaudio
+# PyTorch CUDA 12.8 builds come from the cu128 index (primary). PyPI is added as
+# a fallback so the non-torch deps below still resolve. The torch trio is pinned
+# to its +cu128 local version so PyPI's default (cu130) build can't win.
+--index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.org/simple
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+torchaudio==2.11.0+cu128
 monai
 monai-generative
 nibabel

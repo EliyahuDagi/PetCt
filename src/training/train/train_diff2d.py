@@ -1,52 +1,115 @@
+"""Train the 2D latent diffusion UNet for NAC->AC translation.
+
+A frozen 2D AutoencoderKL encodes paired NAC and AC slices to latents. The UNet
+is conditioned on the NAC latent by channel-concatenation (in_channels =
+2*latent_channels) and trained to predict the noise added to the AC latent under
+the shared DiffusionSchedule. Emits JSONL metrics and best/last checkpoints.
+"""
+
 import argparse
 import os
 import random
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-from src.DataViewer.model import DicomModel
+from src.training.data import (
+    PatientVolumeCache,
+    filter_paired_patients,
+    load_patient_volumes,
+    make_depth_split,
+    make_patient_split,
+    sample_pairs,
+)
+from src.training.dataset_index import enumerate_patients
+from src.training.models.autoencoder2d import ae_decode, ae_encode, build_autoencoder_2d
 from src.training.models.diffusion2d import build_diffusion_2d
+from src.training.utils.checkpointing import (
+    capture_rng_state,
+    load_checkpoint,
+    resolve_resume_path,
+    restore_rng_state,
+    save_training_checkpoint,
+)
 from src.training.utils.logging import setup_logging
+from src.training.utils.metrics import MetricsWriter
+from src.training.utils.perf import (
+    autocast,
+    configure_backends,
+    maybe_compile,
+    to_input_memory_format,
+    to_model_memory_format,
+)
+from src.training.utils.sampling import DiffusionSchedule
+from src.training.utils.schedule import EMA, build_lr_scheduler
 
-
-def train_step(model, latents, optimizer):
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
-    timesteps = torch.randint(0, 1000, (latents.shape[0],), device=latents.device)
-    noise = torch.randn_like(latents)
-    noisy_latents = latents + noise
-    pred_noise = model(noisy_latents, timesteps)
-    loss = torch.mean((pred_noise - noise) ** 2)
-    loss.backward()
-    optimizer.step()
-    return {"loss": float(loss.detach().cpu())}
-
-
-@torch.no_grad()
-def eval_step(model, latents):
-    model.eval()
-    timesteps = torch.randint(0, 1000, (latents.shape[0],), device=latents.device)
-    noise = torch.randn_like(latents)
-    noisy_latents = latents + noise
-    pred_noise = model(noisy_latents, timesteps)
-    loss = torch.mean((pred_noise - noise) ** 2)
-    return {"loss": float(loss.detach().cpu())}
+TASK = "diff2d"
+SPATIAL_DIMS = 2
 
 
 def build_model(config):
     return build_diffusion_2d(config)
 
 
+def load_frozen_ae(ae_ckpt, device):
+    if not ae_ckpt or not os.path.exists(ae_ckpt):
+        raise FileNotFoundError(
+            "AE checkpoint not found at %r. Train ae2d first (it writes outputs/ae2d/best.pt)." % ae_ckpt
+        )
+    state = load_checkpoint(ae_ckpt)
+    ae_config = state.get("config", {})
+    ae = build_autoencoder_2d(ae_config).to(device)
+    ae.load_state_dict(state.get("model", state))
+    ae.eval()
+    for p in ae.parameters():
+        p.requires_grad_(False)
+    return ae, ae_config
+
+
+def diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma=None):
+    """Predict noise added to the AC latent, conditioned on the NAC latent.
+
+    ``snr_gamma`` (e.g. 5.0) enables Min-SNR-gamma loss weighting; ``None`` keeps
+    the plain unweighted MSE.
+    """
+    timesteps = torch.randint(0, schedule.num_train_timesteps, (ac_lat.shape[0],), device=ac_lat.device)
+    noise = torch.randn_like(ac_lat)
+    x_t = schedule.q_sample(ac_lat, timesteps, noise)
+    model_in = to_input_memory_format(torch.cat([x_t, nac_lat], dim=1))
+    with autocast():
+        pred = model(model_in, timesteps)
+    if snr_gamma is None:
+        loss = torch.mean((pred - noise) ** 2)
+    else:
+        per_sample = torch.mean((pred - noise) ** 2, dim=list(range(1, pred.ndim)))
+        weights = schedule.min_snr_weights(timesteps, gamma=float(snr_gamma))
+        loss = torch.mean(weights * per_sample)
+    return loss, x_t, timesteps, pred, noise
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", required=True, help="Dataset root or patient folder")
+    parser.add_argument("--data_dir", required=True, nargs="+", help="One or more dataset roots / patient folders")
     parser.add_argument("--patient_index", type=int, default=0)
-    parser.add_argument("--config", default=None, help="Optional YAML config path")
-    parser.add_argument("--steps", type=int, default=10, help="Number of training steps")
-    parser.add_argument("--latent_size", type=int, default=128)
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--ae_ckpt", default="outputs/ae2d/best.pt")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--steps_per_epoch", type=int, default=50)
+    parser.add_argument("--val_every", type=int, default=25)
+    parser.add_argument("--val_fraction", type=float, default=0.2)
+    parser.add_argument("--val_batches", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--latent_size", type=int, default=128, help="Image size of slices fed to the AE encoder")
+    parser.add_argument("--save_dir", default=None)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="Resume training. Bare flag resumes from <save_dir>/last.pt; pass a path to resume from a specific checkpoint.",
+    )
     args = parser.parse_args()
 
     default_config = {
@@ -55,9 +118,12 @@ def main():
         "batch_size": 4,
         "learning_rate": 1.0e-4,
         "latent_channels": 4,
+        "noise_schedule": "cosine",
+        "snr_gamma": 5.0,
+        "rescale_zero_terminal_snr": False,
+        "ema_decay": 0.9999,
+        "lr_min_ratio": 0.1,
         "model": {
-            "in_channels": 4,
-            "out_channels": 4,
             "num_channels": [16, 32, 64],
             "attention_levels": [False, True, True],
             "num_res_blocks": 1,
@@ -65,7 +131,16 @@ def main():
     }
 
     config = _load_config(args.config, default_config)
-    logger = setup_logging(config["output_dir"])
+    save_dir = args.save_dir or config["output_dir"]
+    if args.batch_size is not None:
+        config["batch_size"] = args.batch_size
+    if args.learning_rate is not None:
+        config["learning_rate"] = args.learning_rate
+
+    resume_path = resolve_resume_path(save_dir, args.resume)
+
+    logger = setup_logging(save_dir)
+    metrics_writer = MetricsWriter(save_dir, TASK, append=resume_path is not None)
 
     seed = int(config.get("seed", 42))
     random.seed(seed)
@@ -73,37 +148,210 @@ def main():
     torch.manual_seed(seed)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    configure_backends(logger)
 
-    model = build_model(config).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(config.get("learning_rate", 1.0e-4)))
+    ae, ae_config = load_frozen_ae(args.ae_ckpt, device)
+    latent_channels = int(ae_config.get("latent_channels", config.get("latent_channels", 4)))
+    config["latent_channels"] = latent_channels
+    # Conditioning by concatenation: input is [noisy_AC | NAC] latents.
+    model_cfg = dict(config.get("model", {}))
+    model_cfg["in_channels"] = 2 * latent_channels
+    model_cfg["out_channels"] = latent_channels
+    config["model"] = model_cfg
 
-    ct_tensor = _load_ct_tensor(args.data_dir, args.patient_index, device)
+    # raw_model owns the weights (EMA / state_dict / resume); model is the
+    # (optionally) compiled forward handle. They share parameters.
+    raw_model = build_model(config).to(device)
+    raw_model = to_model_memory_format(raw_model, SPATIAL_DIMS)
+    optimizer = torch.optim.Adam(raw_model.parameters(), lr=float(config.get("learning_rate", 1.0e-4)))
+    model = maybe_compile(raw_model, logger)
+    schedule = DiffusionSchedule(
+        schedule=config.get("noise_schedule", "cosine"),
+        rescale_zero_terminal_snr=bool(config.get("rescale_zero_terminal_snr", False)),
+        device=device,
+    )
+    snr_gamma = config.get("snr_gamma", 5.0)
 
-    for step in range(int(args.steps)):
-        latents = _sample_latents(ct_tensor, int(config.get("batch_size", 4)), args.latent_size, int(config.get("latent_channels", 4)))
-        metrics = train_step(model, latents, optimizer)
-        logger.info("step=%s loss=%.6f", step, metrics["loss"])
+    rng = np.random.RandomState(seed)
+    batch_size = int(config.get("batch_size", 4))
 
-    logger.info("Training smoke test finished.")
+    # Diffusion requires paired NAC+AC. Enumerate across roots, keep only paired
+    # patients (logging skips). <=1 paired patient -> legacy within-patient split.
+    patients = enumerate_patients(args.data_dir, missing_ok=True)
+    if len(patients) > 1:
+        patients = filter_paired_patients(patients, log=logger.info)
+        if not patients:
+            raise ValueError("No paired NAC+AC patients found for diff2d across the given roots.")
+    multi_patient = len(patients) > 1
+
+    if not multi_patient:
+        vols = load_patient_volumes(args.data_dir[0], args.patient_index, device=device)
+        if vols.get("pet_nac") is None or vols.get("pet_ac") is None:
+            raise ValueError("Both NAC and AC PET volumes are required for diff2d training.")
+        train_pool, val_pool = make_depth_split(seed, args.val_fraction)
+        logger.info("Training on 1 patient (train 1 / val 1) across %d roots.", len(args.data_dir))
+
+        def sample_train_pair():
+            return sample_pairs(vols["pet_nac"], vols["pet_ac"], train_pool, batch_size, args.latent_size, rng)
+
+        def sample_val_pair():
+            return sample_pairs(vols["pet_nac"], vols["pet_ac"], val_pool, batch_size, args.latent_size, rng)
+    else:
+        cache = PatientVolumeCache(patients, device=device, max_cached=4)
+        train_idx, val_idx = make_patient_split(len(patients), args.val_fraction, seed)
+        full_pool = np.linspace(0.0, 1.0, num=128, endpoint=False)
+        logger.info(
+            "Training on %d patients (train %d / val %d) across %d roots.",
+            len(patients), len(train_idx), len(val_idx), len(args.data_dir),
+        )
+
+        def _sample_from(indices):
+            idx = int(indices[rng.randint(0, len(indices))])
+            vols = cache.get(idx)
+            return sample_pairs(vols["pet_nac"], vols["pet_ac"], full_pool, batch_size, args.latent_size, rng)
+
+        def sample_train_pair():
+            return _sample_from(train_idx)
+
+        def sample_val_pair():
+            return _sample_from(val_idx)
+
+    steps_per_epoch = int(args.steps_per_epoch)
+    total_steps = int(args.epochs) * steps_per_epoch
+
+    ema_decay = float(config.get("ema_decay", 0.0))
+    # EMA tracks the raw (uncompiled) weights so its shadow keys stay prefix-free.
+    ema = EMA(raw_model, decay=ema_decay) if ema_decay > 0 else None
+    config.setdefault("lr_total_steps", total_steps)
+    config.setdefault("lr_warmup_steps", min(500, max(1, total_steps // 10)))
+    lr_scheduler = build_lr_scheduler(optimizer, config)
+
+    best_val = float("inf")
+    start_step = 0
+    if resume_path is not None:
+        start_step, best_val = _resume(raw_model, optimizer, rng, resume_path, logger, ema)
+        # Fast-forward the LR schedule so the resumed LR matches an uninterrupted run.
+        if lr_scheduler is not None:
+            for _ in range(start_step):
+                lr_scheduler.step()
+
+    for global_step in range(start_step, total_steps):
+        epoch = global_step // max(1, steps_per_epoch)
+        nac_img, ac_img = sample_train_pair()
+        ac_lat = ae_encode(ae, ac_img)
+        nac_lat = ae_encode(ae, nac_img)
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        loss, _, _, _, _ = diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma)
+        loss.backward()
+        optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+        if ema is not None:
+            ema.update(raw_model)
+        metrics = {"loss": float(loss.detach().cpu())}
+        logger.info("step=%s loss=%.6f", global_step, metrics["loss"])
+        metrics_writer.log("train", global_step, metrics, epoch)
+
+        if args.val_every > 0 and global_step % args.val_every == 0:
+            val_metrics = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma)
+            logger.info("VAL step=%s loss=%.6f l1=%.6f", global_step, val_metrics["loss"], val_metrics["l1"])
+            metrics_writer.log("val", global_step, val_metrics, epoch)
+            is_best = val_metrics["loss"] < best_val
+            best_val = min(best_val, val_metrics["loss"])
+            save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, global_step + 1, epoch, val_metrics["loss"], best_val, ema), is_best)
+
+    final_val = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma)
+    metrics_writer.log("val", total_steps, final_val, int(args.epochs))
+    is_best = final_val["loss"] < best_val
+    best_val = min(best_val, final_val["loss"])
+    save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, total_steps, int(args.epochs), final_val["loss"], best_val, ema), is_best)
+    metrics_writer.close()
+    logger.info("Training finished. best_val_loss=%.6f", best_val)
 
 
-if __name__ == "__main__":
-    main()
+@torch.no_grad()
+def _validate(model, raw_model, ema, ae, schedule, sample_val_pair, n_batches, snr_gamma=None):
+    # Evaluate under the EMA weights when available -- consistently higher quality.
+    # The EMA swap targets raw_model (shared params); forward still runs via model.
+    ctx = ema.average_parameters(raw_model) if ema is not None else _null_context(raw_model)
+    with ctx:
+        model.eval()
+        accum = {"loss": 0.0, "l1": 0.0}
+        n = max(1, n_batches)
+        for _ in range(n):
+            nac_img, ac_img = sample_val_pair()
+            ac_lat = ae_encode(ae, ac_img)
+            nac_lat = ae_encode(ae, nac_img)
+            loss, x_t, timesteps, pred, noise = diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma)
+            # Cheap recon proxy: one-step x0 estimate decoded back to image space.
+            acp = schedule.alphas_cumprod[timesteps]
+            sqrt_acp = schedule._broadcast(torch.sqrt(acp), x_t)
+            sqrt_one_minus = schedule._broadcast(torch.sqrt(1.0 - acp), x_t)
+            x0_pred = (x_t - sqrt_one_minus * pred) / sqrt_acp
+            recon = ae_decode(ae, x0_pred)
+            accum["loss"] += float(loss.cpu())
+            accum["l1"] += float(torch.mean(torch.abs(recon - ac_img)).cpu())
+    return {k: v / n for k, v in accum.items()}
+
+
+class _null_context:
+    """No-op stand-in for EMA.average_parameters when EMA is disabled."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def __enter__(self):
+        return self.model
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _checkpoint_state(model, optimizer, rng, config, step, epoch, val_loss, best_val, ema=None):
+    state = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "rng": capture_rng_state(rng),
+        "config": config,
+        "task": TASK,
+        "step": step,
+        "epoch": epoch,
+        "val_loss": val_loss,
+        "best_val": best_val,
+        "latent_channels": int(config.get("latent_channels", 4)),
+    }
+    if ema is not None:
+        state["ema"] = ema.state_dict()
+    return state
+
+
+def _resume(model, optimizer, rng, resume_path, logger, ema=None):
+    """Restore model/optimizer/RNG (and EMA) from a checkpoint; return (start_step, best_val)."""
+    state = load_checkpoint(resume_path)
+    model.load_state_dict(state["model"])
+    if state.get("optimizer") is not None:
+        optimizer.load_state_dict(state["optimizer"])
+    if ema is not None and state.get("ema") is not None:
+        ema.load_state_dict(state["ema"])
+    restore_rng_state(state.get("rng"), rng)
+    best_val = float(state.get("best_val", float("inf")))
+    start_step = int(state.get("step", 0))  # "step" = number of steps already completed
+    logger.info("Resumed from %s at step=%s best_val=%.6f", resume_path, start_step, best_val)
+    return start_step, best_val
 
 
 def _load_config(path, fallback):
-    if not path:
-        return dict(fallback)
-    if not os.path.exists(path):
-        return dict(fallback)
+    if not path or not os.path.exists(path):
+        return _deep_copy_config(fallback)
     try:
         import yaml  # type: ignore
     except Exception:
-        return dict(fallback)
+        return _deep_copy_config(fallback)
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    merged = dict(fallback)
-    merged.update(data)
+    merged = _deep_copy_config(fallback)
+    merged.update({k: v for k, v in data.items() if k != "model"})
     if "model" in data and isinstance(data["model"], dict):
         model_cfg = dict(fallback.get("model", {}))
         model_cfg.update(data["model"])
@@ -111,34 +359,12 @@ def _load_config(path, fallback):
     return merged
 
 
-def _normalize_volume(vol_np: np.ndarray) -> np.ndarray:
-    vol = vol_np.astype(np.float32)
-    vmin = np.percentile(vol, 1.0)
-    vmax = np.percentile(vol, 99.0)
-    if vmax <= vmin:
-        vmax = vmin + 1.0
-    return np.clip((vol - vmin) / (vmax - vmin), 0.0, 1.0)
+def _deep_copy_config(config):
+    out = dict(config)
+    if isinstance(config.get("model"), dict):
+        out["model"] = dict(config["model"])
+    return out
 
 
-def _load_ct_tensor(data_dir: str, patient_index: int, device: torch.device) -> torch.Tensor:
-    model = DicomModel()
-    model.load_dataset(data_dir)
-    if patient_index >= len(model.patient_list):
-        raise ValueError("patient_index out of range")
-    model.load_patient_data(model.patient_list[patient_index])
-    if model.ct_volume is None:
-        raise ValueError("CT volume not found")
-    ct = _normalize_volume(model.ct_volume)
-    return torch.from_numpy(ct).to(device)
-
-
-def _sample_latents(ct_tensor: torch.Tensor, batch_size: int, size: int, channels: int) -> torch.Tensor:
-    z_dim = ct_tensor.shape[0]
-    idx = torch.randint(0, z_dim, (batch_size,), device=ct_tensor.device)
-    slices = ct_tensor[idx, :, :].unsqueeze(1)
-    slices = F.interpolate(slices, size=(size, size), mode="bilinear", align_corners=False)
-    if channels == 1:
-        return slices
-    reps = max(1, channels)
-    tiled = slices.repeat(1, reps, 1, 1)
-    return tiled[:, :channels, :, :]
+if __name__ == "__main__":
+    main()

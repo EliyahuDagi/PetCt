@@ -22,7 +22,17 @@ def map_state_dict_2d_to_3d(state_2d, state_3d):
         if tensor.shape == target.shape:
             mapped[name] = tensor
             continue
-        if tensor.ndim == 4 and target.ndim == 5:
+        # Inflate Conv2d -> Conv3d only when out/in channels and the H,W kernel
+        # dims match; otherwise the layer differs structurally (e.g. different
+        # num_channels per level) and must be left to its fresh init.
+        if (
+            tensor.ndim == 4
+            and target.ndim == 5
+            and tensor.shape[0] == target.shape[0]
+            and tensor.shape[1] == target.shape[1]
+            and tensor.shape[2] == target.shape[3]
+            and tensor.shape[3] == target.shape[4]
+        ):
             mapped[name] = inflate_conv2d_to_3d(tensor, target.shape[2])
             continue
         missing.append(name)

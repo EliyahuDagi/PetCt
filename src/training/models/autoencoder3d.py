@@ -1,3 +1,13 @@
+"""3D AutoencoderKL built by inflating the pretrained 2D AE.
+
+Mirrors :func:`build_autoencoder_2d` but with ``spatial_dims=3`` so the encoder
+sees volumetric context and compresses the depth axis along with H/W (the latent
+becomes (B, C, d, h, w) with d < D). Weights are warm-started from the 2D AE via
+centre inflation (see :func:`map_state_dict_2d_to_3d`): each 3D conv begins acting
+exactly like its 2D counterpart and learns z-mixing during a short volume
+fine-tune, recovering 3D encoding richness without a from-scratch 3D AE.
+"""
+
 import torch
 
 
@@ -21,7 +31,7 @@ def _resolve_norm_num_groups(num_channels, requested):
     return 1
 
 
-def build_autoencoder_2d(config):
+def build_autoencoder_3d(config):
     AutoencoderKL = _require_monai()
 
     model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
@@ -32,6 +42,8 @@ def build_autoencoder_2d(config):
     latent_channels = config.get("latent_channels", model_cfg.get("latent_channels", 4))
     attention_levels = model_cfg.get("attention_levels")
     if attention_levels is None:
+        # 3D self-attention is O(N^2) over voxels and the main 3D-AE memory risk;
+        # default it off (the 2D AE has no attention to inflate from either).
         attention_levels = [False] * len(block_out_channels)
     norm_num_groups = _resolve_norm_num_groups(
         block_out_channels,
@@ -39,7 +51,7 @@ def build_autoencoder_2d(config):
     )
 
     return AutoencoderKL(
-        spatial_dims=2,
+        spatial_dims=3,
         in_channels=in_channels,
         out_channels=out_channels,
         num_channels=block_out_channels,
@@ -51,9 +63,8 @@ def build_autoencoder_2d(config):
 
 
 @torch.no_grad()
-def ae_encode(model, x):
-    """Encode images to the latent mean (z_mu). Normalizes MONAI's encode() API,
-    which returns (z_mu, z_sigma)."""
+def ae3d_encode(model, x):
+    """Encode a volume (B,1,D,H,W) to the latent mean (B,C,d,h,w)."""
     out = model.encode(x)
     if isinstance(out, (tuple, list)):
         return out[0]
@@ -61,39 +72,6 @@ def ae_encode(model, x):
 
 
 @torch.no_grad()
-def ae_decode(model, z):
-    """Decode a latent tensor back to image space."""
+def ae3d_decode(model, z):
+    """Decode a latent volume (B,C,d,h,w) back to image space (B,1,D,H,W)."""
     return model.decode(z)
-
-
-def encode_volume_slicewise(model, vol):
-    """Encode a 3D volume slice-by-slice with the 2D AE.
-
-    Args:
-        vol: (B, 1, D, H, W) tensor.
-    Returns:
-        (B, C, D, h, w) latent tensor, where C is latent_channels and (h, w) are
-        the AE-downsampled spatial dims.
-    """
-    b, c, d, h, w = vol.shape
-    flat = vol.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)  # (B*D,1,H,W)
-    z = ae_encode(model, flat)  # (B*D, C, h', w')
-    zc, zh, zw = z.shape[1], z.shape[2], z.shape[3]
-    z = z.reshape(b, d, zc, zh, zw).permute(0, 2, 1, 3, 4).contiguous()  # (B,C,D,h',w')
-    return z
-
-
-def decode_volume_slicewise(model, z):
-    """Decode a 3D latent volume slice-by-slice with the 2D AE.
-
-    Args:
-        z: (B, C, D, h, w) latent tensor.
-    Returns:
-        (B, 1, D, H, W) image tensor.
-    """
-    b, c, d, h, w = z.shape
-    flat = z.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)  # (B*D,C,h,w)
-    img = ae_decode(model, flat)  # (B*D,1,H,W)
-    ic, ih, iw = img.shape[1], img.shape[2], img.shape[3]
-    img = img.reshape(b, d, ic, ih, iw).permute(0, 2, 1, 3, 4).contiguous()
-    return img
