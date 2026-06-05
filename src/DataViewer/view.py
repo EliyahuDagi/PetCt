@@ -56,7 +56,7 @@ class MainView(tk.Tk):
         
         self.current_seg_img = None  # Init
         
-        # 3 Subplots: CT, PET, Fusion
+        # 3 Subplots: CT, PET AC, PET NAC
         # Turn off axis for cleaner "RadiAnt-like" look
         self.ax_ct = self.fig.add_subplot(131)
         self.ax_ct.set_axis_off()
@@ -64,11 +64,11 @@ class MainView(tk.Tk):
         
         self.ax_pet = self.fig.add_subplot(132)
         self.ax_pet.set_axis_off()
-        self.ax_pet.set_title("PET", color='white')
+        self.ax_pet.set_title("PET AC", color='white')
         
         self.ax_fusion = self.fig.add_subplot(133)
         self.ax_fusion.set_axis_off()
-        self.ax_fusion.set_title("Fusion", color='white')
+        self.ax_fusion.set_title("PET NAC", color='white')
         
         # Placeholder Images
         blank_data = np.zeros((512, 512))
@@ -78,8 +78,7 @@ class MainView(tk.Tk):
         self.img_seg_overlay = self.ax_ct.imshow(np.zeros((512, 512, 4), dtype=float), alpha=0.0)
 
         self.img_pet = self.ax_pet.imshow(blank_data, cmap='hot')
-        self.img_fusion = self.ax_fusion.imshow(blank_data, cmap='gray') # Base layer
-        # For fusion, we might need complex alpha blending, but for now let's keep it simple
+        self.img_pet_nac = self.ax_fusion.imshow(blank_data, cmap='hot')
         
         # ZOI Rectangle patches
         from matplotlib.patches import Rectangle
@@ -90,7 +89,7 @@ class MainView(tk.Tk):
         self.ax_pet.add_patch(self.rect_pet)
         
         self.rect_fusion = Rectangle((0,0), 1, 1, linewidth=2, edgecolor='yellow', facecolor='none', visible=False)
-        self.ax_fusion.add_patch(self.rect_fusion)        
+        self.ax_fusion.add_patch(self.rect_fusion)
         
         # HUD Overlays (Text Artists)
         self.overlays = {}
@@ -214,10 +213,14 @@ class MainView(tk.Tk):
                     val_unit = "SUV bw (g/ml)"
 
                 elif event.inaxes == self.ax_fusion:
-                     # Probe CT on fusion for now
-                     img_source = "Fusion(CT)"
-                     val_unit = "HU"
-                     val = self.img_fusion.get_cursor_data(event)
+                    img_source = "PET NAC"
+                    val = self.img_pet_nac.get_cursor_data(event)
+                    suv_factor = self.presenter.model.get_suv_factor()
+                    if val is not None:
+                        if hasattr(val, 'item'):
+                            val = val.item()
+                        val = val * suv_factor
+                    val_unit = "SUV bw (g/ml)"
                 
                 if val is not None:
                     if hasattr(val, 'item'): val = val.item()
@@ -312,8 +315,8 @@ class MainView(tk.Tk):
         # Segmentation source is fixed in the viewer.
         return
 
-    def update_images(self, ct_img, pet_img, seg_img, slice_idx, wl=50, ww=400, aspect=1.0, 
-                      ct_extent=None, pet_extent=None, segmentation_label='all_classes', zoi_box=None):
+    def update_images(self, ct_img, pet_img, pet_nac_img, seg_img, slice_idx, wl=50, ww=400, aspect=1.0, 
+                      ct_extent=None, pet_extent=None, pet_nac_extent=None, segmentation_label='all_classes', zoi_box=None):
         # Update Images with Physical Extents
         self.current_segmentation_label = segmentation_label or 'all_classes'
         self.current_seg_img = seg_img  # Store raw seg for probing
@@ -376,19 +379,7 @@ class MainView(tk.Tk):
                 self.img_seg_overlay.set_data(blank)
                 self.img_seg_overlay.set_alpha(0.0)
 
-            # 3. Fusion (Base Layer CT)
-            self.img_fusion.set_data(ct_img) 
-            self.img_fusion.set_clim(vmin, vmax)
-            if ct_extent:
-                self.img_fusion.set_extent(ct_extent)
-                self.ax_fusion.set_xlim(ct_extent[0], ct_extent[1])
-                self.ax_fusion.set_ylim(ct_extent[2], ct_extent[3])
-                self.ax_fusion.set_aspect('equal')
-            else:
-                self.img_fusion.set_extent([0, ct_img.shape[1], ct_img.shape[0], 0])
-                self.ax_fusion.set_aspect(aspect)
-
-        # 2. PET
+        # 2. PET AC
         if pet_img is not None:
             self.img_pet.set_data(pet_img)
             
@@ -408,25 +399,44 @@ class MainView(tk.Tk):
                 self.ax_pet.set_aspect(aspect)
                 
             self.img_pet.set_clim(0, np.max(pet_img) if np.max(pet_img) > 0 else 1)
-            
-            # Fusion Overlay (PET on CT)
-            # Check if we already have the overlay text artist or image
-            if not hasattr(self, 'img_fusion_overlay'):
-                blank = np.zeros_like(pet_img)
-                self.img_fusion_overlay = self.ax_fusion.imshow(blank, cmap='hot', alpha=0.4)
-            
-            self.img_fusion_overlay.set_data(pet_img)
-            if pet_extent:
-                self.img_fusion_overlay.set_extent(pet_extent)
-            elif ct_extent:
-                self.img_fusion_overlay.set_extent(ct_extent)
-            else:
-                self.img_fusion_overlay.set_extent([0, pet_img.shape[1], pet_img.shape[0], 0])
-
-            self.img_fusion_overlay.set_clim(0, np.max(pet_img) if np.max(pet_img) > 0 else 1)
-            
+            self.ax_pet.set_title(f"PET AC (Slice {slice_idx})", color='white')
         else:
-            pass
+            if ct_img is not None:
+                blank = np.zeros_like(ct_img)
+            else:
+                blank = np.zeros((512, 512))
+            self.img_pet.set_data(blank)
+            self.img_pet.set_clim(0, 1)
+            self.ax_pet.set_title("PET AC", color='white')
+
+        # 3. PET NAC
+        if pet_nac_img is not None:
+            self.img_pet_nac.set_data(pet_nac_img)
+
+            if pet_nac_extent:
+                self.img_pet_nac.set_extent(pet_nac_extent)
+                self.ax_fusion.set_xlim(pet_nac_extent[0], pet_nac_extent[1])
+                self.ax_fusion.set_ylim(pet_nac_extent[2], pet_nac_extent[3])
+                self.ax_fusion.set_aspect('equal')
+            elif ct_extent:
+                self.img_pet_nac.set_extent(ct_extent)
+                self.ax_fusion.set_xlim(ct_extent[0], ct_extent[1])
+                self.ax_fusion.set_ylim(ct_extent[2], ct_extent[3])
+                self.ax_fusion.set_aspect('equal')
+            else:
+                self.img_pet_nac.set_extent([0, pet_nac_img.shape[1], pet_nac_img.shape[0], 0])
+                self.ax_fusion.set_aspect(aspect)
+
+            self.img_pet_nac.set_clim(0, np.max(pet_nac_img) if np.max(pet_nac_img) > 0 else 1)
+            self.ax_fusion.set_title(f"PET NAC (Slice {slice_idx})", color='white')
+        else:
+            if ct_img is not None:
+                blank = np.zeros_like(ct_img)
+            else:
+                blank = np.zeros((512, 512))
+            self.img_pet_nac.set_data(blank)
+            self.img_pet_nac.set_clim(0, 1)
+            self.ax_fusion.set_title("PET NAC", color='white')
         
         self.canvas.draw_idle()
 
@@ -591,6 +601,7 @@ class MainView(tk.Tk):
                 # Get Values from both sources
                 val_ct = self._get_pixel_value_at_location(self.img_ct, x, y)
                 val_pet = self._get_pixel_value_at_location(self.img_pet, x, y)
+                val_pet_nac = self._get_pixel_value_at_location(self.img_pet_nac, x, y)
                 
                 # Get segmentation class using the overlay artist's geometry
                 val_seg = self._get_pixel_value_at_location(self.img_seg_overlay, x, y, data_override=self.current_seg_img)
@@ -604,15 +615,20 @@ class MainView(tk.Tk):
                 if val_pet is not None:
                      suv_factor = self.presenter.model.get_suv_factor()
                      val_suv = val_pet * suv_factor
-                     status_parts.append(f"PET: {val_suv:.2f} SUV")
+                     status_parts.append(f"PET AC: {val_suv:.2f} SUV")
+
+                if val_pet_nac is not None:
+                    suv_factor = self.presenter.model.get_suv_factor()
+                    val_suv = val_pet_nac * suv_factor
+                    status_parts.append(f"PET NAC: {val_suv:.2f} SUV")
                 
                 if val_seg is not None and val_seg > 0:
                      label_id = int(val_seg)
                      label_name = self.segmentation_label_map.get(label_id, str(label_id))
                      status_parts.append(f"Class: {label_name}")
 
-                if not val_ct and not val_pet:
-                     status_parts.append("Background")
+                if not val_ct and not val_pet and not val_pet_nac:
+                    status_parts.append("Background")
 
                 self.status_bar_var.set(" | ".join(status_parts))
                 

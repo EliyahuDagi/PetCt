@@ -16,11 +16,13 @@ class DicomModel:
         self.current_patient_index = -1
         self.ct_volume = None
         self.pet_volume = None
+        self.pet_nac_volume = None
         self.segmentation_mask = None
         self.segmentation_labels = {}
         self.segmentation_available_classes = []
         self.ct_metadata = None
         self.pet_metadata = None
+        self.pet_nac_metadata = None
         self.segmentation_source_name = Config.DEFAULT_SEGMENTATION_SOURCE
         self.segmentation_bbox_mm = None
         self.segmentation_bbox_vox = None
@@ -87,10 +89,12 @@ class DicomModel:
         # Reset volumes
         self.ct_volume = None
         self.pet_volume = None
+        self.pet_nac_volume = None
+        self.pet_nac_metadata = None
         
         # Collect CT/PT candidates and prefer the one with the most slices
         ct_candidates = {}
-        pet_candidates = {}
+        pet_candidates = []
         
         for root, dirs, files in os.walk(patient_path):
             # Check if this folder has DICOM files (ignore non-image markers)
@@ -120,19 +124,52 @@ class DicomModel:
                     if slice_count > ct_candidates.get(root, 0):
                         ct_candidates[root] = slice_count
                 elif modality == 'PT':
-                    if slice_count > pet_candidates.get(root, 0):
-                        pet_candidates[root] = slice_count
+                    pet_candidates.append({
+                        "path": root,
+                        "slice_count": slice_count,
+                        "series_number": getattr(ds, "SeriesNumber", None),
+                        "series_description": getattr(ds, "SeriesDescription", ""),
+                        "image_type": getattr(ds, "ImageType", None),
+                        "ac_class": self._classify_pet_series(ds),
+                    })
             except Exception as e:
                 print(f"Error reading DICOM header in {root}: {e}")
 
         ct_path = max(ct_candidates, key=ct_candidates.get) if ct_candidates else None
-        pet_path = max(pet_candidates, key=pet_candidates.get) if pet_candidates else None
+        pet_ac_path = None
+        pet_nac_path = None
+        pet_fallback_path = None
+
+        if pet_candidates:
+            def _pick_best(candidates):
+                return max(
+                    candidates,
+                    key=lambda c: (c.get("slice_count", 0), c.get("series_number") or -1)
+                )
+
+            ac_candidates = [c for c in pet_candidates if c.get("ac_class") == "ac"]
+            nac_candidates = [c for c in pet_candidates if c.get("ac_class") == "nac"]
+            unknown_candidates = [c for c in pet_candidates if c.get("ac_class") is None]
+
+            if ac_candidates:
+                pet_ac_path = _pick_best(ac_candidates).get("path")
+            if nac_candidates:
+                pet_nac_path = _pick_best(nac_candidates).get("path")
+            if unknown_candidates:
+                pet_fallback_path = _pick_best(unknown_candidates).get("path")
+            if not pet_ac_path:
+                pet_ac_path = pet_fallback_path
 
         if ct_path:
             self.ct_volume, self.ct_metadata = self._load_series(ct_path)
         
-        if pet_path:
-            self.pet_volume, self.pet_metadata = self._load_series(pet_path)
+        if pet_ac_path:
+            self.pet_volume, self.pet_metadata = self._load_series(pet_ac_path)
+        if pet_nac_path:
+            self.pet_nac_volume, self.pet_nac_metadata = self._load_series(pet_nac_path)
+
+        # SUV factor uses the AC series when available, else fallback to NAC
+        self.suv_factor = self._compute_suv_factor(self.pet_metadata or self.pet_nac_metadata)
 
         # Handle Missing Modalities simply
         if self.ct_volume is None and self.pet_volume is None:
@@ -263,27 +300,6 @@ class DicomModel:
         # Sort by ImagePositionPatient Z coordinate (usually index 2)
         slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
         
-        # Calculate SUV Factor if PET
-        self.suv_factor = 1.0
-        try:
-             ds = slices[0]
-             if getattr(ds, 'Modality', '') == 'PT':
-                # SUV Formula: pixel(Bq/ml) * weight(kg) * 1000(g/kg) / dose(Bq)
-                weight_kg = float(getattr(ds, 'PatientWeight', 75.0)) # Default 75kg if missing
-                
-                dose_bq = 1.0
-                # Radiopharmaceutical Info usually in Sequence
-                if hasattr(ds, 'RadiopharmaceuticalInformationSequence'):
-                     seq = ds.RadiopharmaceuticalInformationSequence[0]
-                     dose_bq = float(getattr(seq, 'RadionuclideTotalDose', 1.0))
-                
-                # Some scanners behave differently, but simplistic approach:
-                if dose_bq > 0:
-                     self.suv_factor = (weight_kg * 1000) / dose_bq
-        except Exception as e:
-             print(f"Error calculating SUV factor: {e}")
-             self.suv_factor = 1.0
-
         # Stack pixel data
         # Handle Rescale Slope/Intercept if present to get Hunsfield Units or Bq/ml
         images = []
@@ -295,6 +311,50 @@ class DicomModel:
             images.append(img)
             
         return np.stack(images), slices
+
+    def _compute_suv_factor(self, metadata):
+        if not metadata:
+            return 1.0
+        try:
+            ds = metadata[0]
+            if getattr(ds, 'Modality', '') != 'PT':
+                return 1.0
+            # SUV Formula: pixel(Bq/ml) * weight(kg) * 1000(g/kg) / dose(Bq)
+            weight_kg = float(getattr(ds, 'PatientWeight', 75.0))
+            dose_bq = 1.0
+            if hasattr(ds, 'RadiopharmaceuticalInformationSequence'):
+                seq = ds.RadiopharmaceuticalInformationSequence[0]
+                dose_bq = float(getattr(seq, 'RadionuclideTotalDose', 1.0))
+            if dose_bq > 0:
+                return (weight_kg * 1000) / dose_bq
+        except Exception as e:
+            print(f"Error calculating SUV factor: {e}")
+        return 1.0
+
+    def _classify_pet_series(self, ds):
+        """Classify PET series as AC, NAC, or unknown using DICOM tags only."""
+        desc = str(getattr(ds, "SeriesDescription", "")).upper()
+        img_type = getattr(ds, "ImageType", None)
+
+        def _tokens(val):
+            if val is None:
+                return []
+            if isinstance(val, (list, tuple)):
+                raw = [str(v) for v in val]
+            else:
+                raw = str(val).replace("\\", " ").replace("/", " ").split()
+            return [t.strip().upper() for t in raw if t]
+
+        desc_tokens = _tokens(desc)
+        img_tokens = _tokens(img_type)
+        all_tokens = set(desc_tokens + img_tokens)
+
+        if "NAC" in all_tokens or "NON-AC" in all_tokens or "NONAC" in all_tokens or "UNCORRECTED" in all_tokens:
+            return "nac"
+        if "AC" in all_tokens or "ATTENUATION" in all_tokens or "CORRECTED" in all_tokens:
+            return "ac"
+
+        return None
 
     def get_suv_factor(self):
         return getattr(self, 'suv_factor', 1.0)
@@ -414,55 +474,50 @@ class DicomModel:
              
              return [oy, oy + width, z_end, z_start]
 
-    def get_pet_bounds(self, orientation='AXIAL'):
-         """ Returns extents for PET independent of CT """
-         if self.pet_volume is None: return None
-         
-         # Need PET spacing/origin independent of CT
-         # We need to actually read PET metadata properly.
-         # _load_series returns (volume, metadata)
-         if not self.pet_metadata: return None
-         
+    def _get_bounds_for_metadata(self, volume, metadata, orientation='AXIAL'):
+         if volume is None or not metadata:
+             return None
          try:
-             ds = self.pet_metadata[0]
+             ds = metadata[0]
              dy, dx = ds.PixelSpacing
-             if len(self.pet_metadata) > 1:
-                z1 = float(self.pet_metadata[0].ImagePositionPatient[2])
-                z2 = float(self.pet_metadata[1].ImagePositionPatient[2])
-                dz = abs(z2 - z1) # Assuming slice thickness/sorting
-                oz = z1
+             if len(metadata) > 1:
+                 z1 = float(metadata[0].ImagePositionPatient[2])
+                 z2 = float(metadata[1].ImagePositionPatient[2])
+                 dz = abs(z2 - z1)
+                 oz = z1
              else:
-                dz = getattr(ds, 'SliceThickness', 1.0)
-                oz = float(ds.ImagePositionPatient[2])
-                
+                 dz = getattr(ds, 'SliceThickness', 1.0)
+                 oz = float(ds.ImagePositionPatient[2])
+
              ox = float(ds.ImagePositionPatient[0])
              oy = float(ds.ImagePositionPatient[1])
-             
-             vol = self.pet_volume
-             
+
+             vol = volume
+
              if orientation == 'AXIAL':
-                  width = vol.shape[2] * dx
-                  height = vol.shape[1] * dy
-                  return [ox, ox + width, oy + height, oy] 
-             elif orientation == 'CORONAL':
-                  width = vol.shape[2] * dx
-                  height = vol.shape[0] * dz
-                  # Z direction
-                  # Check if z1 < z2 or > z2 to determine start/end relative to top/bottom
-                  # Usually we want Top = Head. 
-                  # If z1 (slice 0) is Feet, and zN is Head.
-                  # Matplotlib origin='upper' means Top is Y-min? No Y-max usually in plot but pixel 0.
-                  # extent=[left, right, bottom, top]
-                  z_end = oz + (vol.shape[0] * dz) # This is purely additive
-                  # If we just treat Z as values:
-                  return [ox, ox + width, z_end, oz] # Using Z values directly.
-             elif orientation == 'SAGITTAL':
-                  width = vol.shape[1] * dy
-                  height = vol.shape[0] * dz
-                  z_end = oz + (vol.shape[0] * dz)
-                  return [oy, oy + width, z_end, oz]
-         except:
+                 width = vol.shape[2] * dx
+                 height = vol.shape[1] * dy
+                 return [ox, ox + width, oy + height, oy]
+             if orientation == 'CORONAL':
+                 width = vol.shape[2] * dx
+                 height = vol.shape[0] * dz
+                 z_end = oz + (vol.shape[0] * dz)
+                 return [ox, ox + width, z_end, oz]
+             if orientation == 'SAGITTAL':
+                 width = vol.shape[1] * dy
+                 height = vol.shape[0] * dz
+                 z_end = oz + (vol.shape[0] * dz)
+                 return [oy, oy + width, z_end, oz]
+         except Exception:
              return None
+
+    def get_pet_bounds(self, orientation='AXIAL'):
+         """Returns extents for PET AC (legacy PET fields)."""
+         return self._get_bounds_for_metadata(self.pet_volume, self.pet_metadata, orientation)
+
+    def get_pet_nac_bounds(self, orientation='AXIAL'):
+         """Returns extents for PET NAC if available."""
+         return self._get_bounds_for_metadata(self.pet_nac_volume, self.pet_nac_metadata, orientation)
 
     def _get_pet_spacing_origin(self):
          """Returns (spacing, origin) for PET if available, else falls back to CT spacing/origin."""
@@ -732,56 +787,92 @@ class DicomModel:
              seg_img = get_slice(self.segmentation_mask, slice_index, orientation)
         
         # PET Logic with orientation is tricky because PET might have different Z-spacing.
-        # For MVP, we will only try to slice PET if it matches CT shape or we fail gracefully.
-        # If geometry differs, MPR on PET natively requires volume resampling.
-        # Check if basic shapes match
-        if self.pet_volume is not None:
-             if self.ct_volume is not None and self.ct_volume.shape == self.pet_volume.shape:
-                  pet_img = get_slice(self.pet_volume, slice_index, orientation)
-             else:
-                  # Fallback or simple slice if independent
-                  # If we are in Axial, we use the sophisticated Z-matching
-                  if orientation == 'AXIAL':
-                      # ... (existing Z-matching logic reused largely)
-                      if self.ct_volume is not None:
-                           # ... reusing old logic if desired, or just simple index for now to save time
-                           # Let's stick to the sophisticated logic for Axial:
-                           ct_z = float(self.ct_metadata[min(slice_index, len(self.ct_metadata)-1)].ImagePositionPatient[2])
-                           best_idx = 0
-                           min_dist = float('inf')
-                           for i, s in enumerate(self.pet_metadata):
-                               z = float(s.ImagePositionPatient[2])
-                               dist = abs(z - ct_z)
-                               if dist < min_dist:
-                                   min_dist = dist
-                                   best_idx = i
-                           pet_img = self.pet_volume[best_idx]
-                  else:
-                       # Handle MPR for PET when shapes differ from CT
-                       # We map the slice index from CT space to PET space
-                       if self.ct_volume is not None:
-                           # Determine Ratio
-                           ct_max = 0
-                           pet_max = 0
-                           if orientation == 'CORONAL':
-                               ct_max = self.ct_volume.shape[1]
-                               pet_max = self.pet_volume.shape[1]
-                           elif orientation == 'SAGITTAL':
-                               ct_max = self.ct_volume.shape[2]
-                               pet_max = self.pet_volume.shape[2]
-                           
-                           if ct_max > 0 and pet_max > 0:
-                               ratio = pet_max / ct_max
-                               pet_idx = int(slice_index * ratio)
-                               pet_img = get_slice(self.pet_volume, pet_idx, orientation)
-                           else:
-                               pet_img = None
-                       else:
-                            # No CT, just slice PET directly (though slice_index might be wrong range?)
-                            # Assuming slice_index is correct for whatever is driving the view
-                            pet_img = get_slice(self.pet_volume, slice_index, orientation)
+        pet_img = self._get_pet_slice_for_volume(
+            self.pet_volume,
+            self.pet_metadata,
+            slice_index,
+            orientation,
+            get_slice,
+        )
 
         return ct_img, pet_img, seg_img
+
+    def get_images_with_nac(self, slice_index, orientation='AXIAL'):
+        """Returns (ct_image, pet_ac_image, pet_nac_image, seg_image)."""
+        ct_img = None
+        seg_img = None
+
+        def get_slice(vol, idx, mode):
+            if vol is None:
+                return None
+            if mode == 'AXIAL':
+                idx = min(idx, vol.shape[0] - 1)
+                return vol[idx, :, :]
+            if mode == 'CORONAL':
+                idx = min(idx, vol.shape[1] - 1)
+                return np.flipud(vol[:, idx, :])
+            if mode == 'SAGITTAL':
+                idx = min(idx, vol.shape[2] - 1)
+                return np.flipud(vol[:, :, idx])
+            return None
+
+        ct_img = get_slice(self.ct_volume, slice_index, orientation)
+        if self.segmentation_mask is not None:
+            seg_img = get_slice(self.segmentation_mask, slice_index, orientation)
+
+        pet_ac_img = self._get_pet_slice_for_volume(
+            self.pet_volume,
+            self.pet_metadata,
+            slice_index,
+            orientation,
+            get_slice,
+        )
+        pet_nac_img = self._get_pet_slice_for_volume(
+            self.pet_nac_volume,
+            self.pet_nac_metadata,
+            slice_index,
+            orientation,
+            get_slice,
+        )
+
+        return ct_img, pet_ac_img, pet_nac_img, seg_img
+
+    def _get_pet_slice_for_volume(self, volume, metadata, slice_index, orientation, get_slice):
+        if volume is None or metadata is None:
+            return None
+        if self.ct_volume is not None and volume.shape == self.ct_volume.shape:
+            return get_slice(volume, slice_index, orientation)
+
+        if orientation == 'AXIAL':
+            if self.ct_volume is not None and self.ct_metadata:
+                ct_z = float(self.ct_metadata[min(slice_index, len(self.ct_metadata) - 1)].ImagePositionPatient[2])
+                best_idx = 0
+                min_dist = float('inf')
+                for i, s in enumerate(metadata):
+                    z = float(s.ImagePositionPatient[2])
+                    dist = abs(z - ct_z)
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_idx = i
+                return volume[best_idx]
+            return get_slice(volume, slice_index, orientation)
+
+        if self.ct_volume is not None:
+            ct_max = 0
+            pet_max = 0
+            if orientation == 'CORONAL':
+                ct_max = self.ct_volume.shape[1]
+                pet_max = volume.shape[1]
+            elif orientation == 'SAGITTAL':
+                ct_max = self.ct_volume.shape[2]
+                pet_max = volume.shape[2]
+
+            if ct_max > 0 and pet_max > 0:
+                ratio = pet_max / ct_max
+                pet_idx = int(slice_index * ratio)
+                return get_slice(volume, pet_idx, orientation)
+
+        return get_slice(volume, slice_index, orientation)
 
     def _read_segmentation_labels(self, labels_path):
         if not labels_path or not os.path.exists(labels_path):

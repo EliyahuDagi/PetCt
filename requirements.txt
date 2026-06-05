@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+torchaudio
+monai
+monai-generative
+nibabel
+numpy
+pydicom
+SimpleITK

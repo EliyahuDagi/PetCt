@@ -149,7 +149,7 @@ class Presenter:
 
     def set_slice(self, slice_idx):
         self.current_slice = slice_idx
-        ct, pet, seg = self.model.get_images(slice_idx, self.orientation)
+        ct, pet_ac, pet_nac, seg = self.model.get_images_with_nac(slice_idx, self.orientation)
         
         # Calculate Aspect Ratio
         dz, dy, dx = self.model.get_voxel_spacing()
@@ -189,6 +189,7 @@ class Presenter:
         # Determine Extents for proper alignment
         ct_extent = self.model.get_bounds(self.orientation)
         pet_extent = self.model.get_pet_bounds(self.orientation)
+        pet_nac_extent = self.model.get_pet_nac_bounds(self.orientation)
         
         # Calculate ZOI box for current slice
         zoi_box = None
@@ -257,7 +258,8 @@ class Presenter:
 
         self.view.update_images(
             ct,
-            pet,
+            pet_ac,
+            pet_nac,
             seg,
             slice_idx,
             self.wl,
@@ -265,6 +267,7 @@ class Presenter:
             aspect,
             ct_extent,
             pet_extent,
+            pet_nac_extent,
             segmentation_label=self.selected_segmentation_label,
             zoi_box=zoi_box
         )

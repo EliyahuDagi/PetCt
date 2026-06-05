@@ -15,7 +15,7 @@
 ### `model.py` (`DicomModel`)
 - **Role:** Data persistence, DICOM I/O, Logic.
 - **Key Attributes:** 
-  - `ct_volume`, `pet_volume`: 3D numpy arrays (Z, Y, X).
+  - `ct_volume`, `pet_volume`, `pet_nac_volume`: 3D numpy arrays (Z, Y, X). `pet_volume` holds PET AC when available.
   - `patient_list`: List of available patient ID paths.
   - `suv_factor`: Computed scalar for raw->SUV conversion.
 - **Key Methods:**
@@ -28,10 +28,10 @@
 ### `view.py` (`MainView`)
 - **Role:** GUI (Tkinter), Rendering (Matplotlib), User Input.
 - **Components:** 
-  - 3 Axes: CT, PET, Fusion (Overlay).
+  - 3 Axes: CT, PET AC, PET NAC.
   - Controls: Slider (Slice), Buttons (Patient Nav), Toolbar.
 - **Key Methods:**
-  - `update_images(ct_img, pet_img, ..., segmentation_label)`: Renders arrays to `imshow`, applies physical extents/WL, and colorizes segmentation overlays per selected class.
+  - `update_images(ct_img, pet_img, pet_nac_img, ..., segmentation_label)`: Renders arrays to `imshow`, applies physical extents/WL, and colorizes segmentation overlays per selected class.
   - `_on_scroll(event)`: Handles **Zoom** (Ctrl+Scroll) and Slice Change (Scroll). Syncs all axes.
   - `_on_mouse_move(event)`: Handles **Pan** (Middle-Click), **Window/Level** (Right-Click), and **Pixel Probe** (Hover).
   - `_get_pixel_value_at_location(artist, x, y)`: Maps physical coords (mm) back to array indices for probing values.
