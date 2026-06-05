@@ -211,5 +211,5 @@ token.json
 .vscode/
 debug/
 .github/
-.outputs/
+outputs/
 .claude/
