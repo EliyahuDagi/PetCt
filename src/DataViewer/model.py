@@ -80,10 +80,15 @@ class DicomModel:
             )
         return False
 
-    def load_patient_data(self, patient_path, segmentation_name=None):
+    def load_patient_data(self, patient_path, segmentation_name=None, load_ct=True, run_segmentation=True):
         """
         Loads CT and PET series from the patient folder.
         Assumes structure: patient_path/CT/ and patient_path/PT/ or similar.
+
+        ``load_ct=False`` skips the (costly) full CT series read and
+        ``run_segmentation=False`` skips the segmentor. Both default True to
+        preserve viewer behavior; the training PET pipelines pass False since
+        they use PET only and never need a segmentation.
         """
         print(f"Loading data from {patient_path}")
         # Reset volumes
@@ -160,9 +165,11 @@ class DicomModel:
             if not pet_ac_path:
                 pet_ac_path = pet_fallback_path
 
-        if ct_path:
+        # Skipping the CT read (load_ct=False) is the main speedup for training:
+        # the CT series is by far the largest volume and PET stages never use it.
+        if ct_path and load_ct:
             self.ct_volume, self.ct_metadata = self._load_series(ct_path)
-        
+
         if pet_ac_path:
             self.pet_volume, self.pet_metadata = self._load_series(pet_ac_path)
         if pet_nac_path:
@@ -171,8 +178,9 @@ class DicomModel:
         # SUV factor uses the AC series when available, else fallback to NAC
         self.suv_factor = self._compute_suv_factor(self.pet_metadata or self.pet_nac_metadata)
 
-        # Handle Missing Modalities simply
-        if self.ct_volume is None and self.pet_volume is None:
+        # Handle Missing Modalities simply. Include NAC PET so a NAC-only (or
+        # CT-skipped) load is not rejected when it still has usable PET data.
+        if self.ct_volume is None and self.pet_volume is None and self.pet_nac_volume is None:
              raise ValueError("No CT or PET data found in patient directory.")
              
         # Reset segmentation state
@@ -190,7 +198,9 @@ class DicomModel:
         elif not getattr(self, "segmentation_source_name", None):
             self.segmentation_source_name = Config.DEFAULT_SEGMENTATION_SOURCE
 
-        self._run_segmentor(patient_path, self.segmentation_source_name)
+        # Segmentation is a viewer-only feature; training loads skip it.
+        if run_segmentation:
+            self._run_segmentor(patient_path, self.segmentation_source_name)
 
         return True
 

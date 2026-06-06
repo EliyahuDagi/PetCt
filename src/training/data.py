@@ -36,23 +36,39 @@ def normalize_volume(vol_np):
     return np.clip((vol - vmin) / (vmax - vmin), 0.0, 1.0)
 
 
-def load_patient_by_path(patient_path, device=None):
+def load_patient_by_path(patient_path, device=None, load_ct=True, run_segmentation=True):
     """Load one patient's normalized CT / AC-PET / NAC-PET volumes by folder path.
 
     Returns a dict with torch tensors (or None) under keys ``ct``, ``pet_ac``,
     ``pet_nac`` plus ``spacing`` (dz,dy,dx) and ``origin`` (z,y,x). Each volume is
     shaped (Z, Y, X). ``DicomModel`` is imported lazily so the torch-free
     enumeration helpers stay importable on a host without the viewer deps.
+
+    ``load_ct=False`` skips reading the (large) CT series and ``run_segmentation
+    =False`` skips the segmentor -- the PET training pipelines pass both False,
+    which cuts per-patient load time several-fold (CT I/O dominates the cost).
     """
     from src.DataViewer.model import DicomModel
 
     dm = DicomModel()
-    # The path is already a single patient folder; DicomModel's own heuristic
-    # recognizes it (its subdirs contain DICOM/SECTRA/... markers).
-    dm.load_dataset(patient_path)
-    if not dm.patient_list:
-        raise ValueError("No patient found at %r" % (patient_path,))
-    dm.load_patient_data(dm.patient_list[0])
+    # `patient_path` is already a single patient folder (enumerate_patients
+    # resolved it), so load it directly instead of via load_dataset(). That
+    # method's study-grouping heuristic only recognizes subdirs named *exactly*
+    # CT/PET/PT/Segmentation/..., so a layout like ACRIN 6668 -- whose patient
+    # folders hold sibling study dirs CT_*/PET_AC_*/PET_NAC_PET_WB_UNCORRECTED --
+    # is split into separate "studies" and only the first (the CT) would load,
+    # silently dropping the NAC/AC PET pair. load_patient_data() os.walks the
+    # whole folder and collects every CT/PET series, so AC and NAC are both found.
+    dm.patient_list = [patient_path]
+    dm.current_patient_index = 0
+    try:
+        dm.load_patient_data(patient_path, load_ct=load_ct, run_segmentation=run_segmentation)
+    except ValueError:
+        # No usable volumes (e.g. CT skipped and this patient has no PET).
+        # Return an all-None dict so multi-patient samplers skip it instead of
+        # crashing; single-patient callers still fail downstream as before.
+        return {"ct": None, "pet_ac": None, "pet_nac": None,
+                "spacing": None, "origin": None, "patient_path": patient_path}
 
     def _to_tensor(vol):
         if vol is None:
@@ -91,9 +107,21 @@ class PatientVolumeCache:
     bounds GPU/host memory when pooling across many patients.
     """
 
-    def __init__(self, patient_paths, device=None, max_cached=4):
+    def __init__(self, patient_paths, device=None, max_cached=4, load_ct=False, run_segmentation=False):
         self.patient_paths = list(patient_paths)
         self.device = device
+        # Training pools are PET-only: skip CT + segmentation per load (default).
+        self.load_ct = bool(load_ct)
+        self.run_segmentation = bool(run_segmentation)
+        # The cache size is the dominant lever on multi-patient step time: a tiny
+        # cache over a large pool means nearly every step re-reads DICOM from disk
+        # (~8 s/patient). PET-only entries are small (~100 MB: AC+NAC), so for the
+        # PET pipelines raise the floor to cover the pool -- up to 64 patients
+        # (~6.4 GB), which fully caches the diffusion pool (ACRIN, ~20 patients)
+        # and gives the AE pool a high hit rate. CT-bearing caches keep the small
+        # default (each entry is ~5x larger).
+        if not self.load_ct:
+            max_cached = max(int(max_cached), min(len(self.patient_paths), 64))
         self.max_cached = max(1, int(max_cached))
         self._cache = OrderedDict()  # index -> volumes dict (LRU: newest at end)
 
@@ -105,7 +133,10 @@ class PatientVolumeCache:
         if index in self._cache:
             self._cache.move_to_end(index)
             return self._cache[index]
-        vols = load_patient_by_path(self.patient_paths[index], device=self.device)
+        vols = load_patient_by_path(
+            self.patient_paths[index], device=self.device,
+            load_ct=self.load_ct, run_segmentation=self.run_segmentation,
+        )
         self._cache[index] = vols
         self._cache.move_to_end(index)
         while len(self._cache) > self.max_cached:
@@ -140,7 +171,9 @@ def filter_paired_patients(patient_paths, device=None, log=None):
     paired = []
     skipped = 0
     for path in patient_paths:
-        vols = load_patient_by_path(path, device=device)
+        # Only PET presence matters for pairing; skip CT + segmentation so this
+        # startup scan over every patient stays cheap.
+        vols = load_patient_by_path(path, device=device, load_ct=False, run_segmentation=False)
         if vols.get("pet_nac") is not None and vols.get("pet_ac") is not None:
             paired.append(path)
         else:
@@ -189,14 +222,25 @@ def make_depth_split(seed, val_fraction, num_positions=128):
     return positions[n_val:], positions[:n_val]
 
 
-def _slice_at(volume, t, size):
-    """Extract the slice at normalized depth ``t`` in [0,1), resized to size x size.
+def _slice_at(volume, t, size, axis=0):
+    """Extract a 2D slice at normalized position ``t`` in [0,1) along ``axis``,
+    resized to size x size. ``volume`` is a (Z, Y, X) tensor.
 
-    ``volume`` is a (Z, Y, X) tensor. Returns a (1, size, size) tensor.
+    ``axis`` selects the orthogonal plane through the volume:
+      0 -> XY (axial,    slice index along Z) -> (Y, X)
+      1 -> XZ (coronal,  slice index along Y) -> (Z, X)
+      2 -> YZ (sagittal, slice index along X) -> (Z, Y)
+    Returns a (1, size, size) tensor.
     """
-    z_dim = volume.shape[0]
-    idx = int(min(z_dim - 1, max(0, round(t * (z_dim - 1)))))
-    sl = volume[idx, :, :].unsqueeze(0).unsqueeze(0)  # (1,1,Y,X)
+    n = volume.shape[axis]
+    idx = int(min(n - 1, max(0, round(t * (n - 1)))))
+    if axis == 0:
+        sl = volume[idx, :, :]
+    elif axis == 1:
+        sl = volume[:, idx, :]
+    else:
+        sl = volume[:, :, idx]
+    sl = sl.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
     sl = F.interpolate(sl, size=(size, size), mode="bilinear", align_corners=False)
     return sl.squeeze(0)  # (1,size,size)
 
@@ -205,7 +249,9 @@ def sample_slices(volumes, pool, batch_size, size, rng):
     """Sample a batch of single-channel 2D slices pooled across ``volumes``.
 
     ``volumes`` is a list of (Z,Y,X) tensors (Nones skipped). ``pool`` is the
-    train/val normalized-position array. Returns (batch_size, 1, size, size).
+    train/val normalized-position array. Each slice is taken from a randomly
+    chosen orthogonal plane (XY / XZ / YZ) so the 2D model sees all three
+    viewing aspects of the volume. Returns (batch_size, 1, size, size).
     """
     vols = [v for v in volumes if v is not None]
     if not vols:
@@ -213,23 +259,27 @@ def sample_slices(volumes, pool, batch_size, size, rng):
     out = []
     for _ in range(batch_size):
         v = vols[rng.randint(0, len(vols))]
+        axis = int(rng.randint(0, 3))  # 0=XY axial, 1=XZ coronal, 2=YZ sagittal
         t = float(pool[rng.randint(0, len(pool))])
-        out.append(_slice_at(v, t, size))
+        out.append(_slice_at(v, t, size, axis))
     return torch.stack(out, dim=0)
 
 
 def sample_pairs(nac, ac, pool, batch_size, size, rng):
-    """Sample paired (NAC, AC) 2D slices at matching normalized depths.
+    """Sample paired (NAC, AC) 2D slices at matching plane + normalized position.
 
-    Returns two tensors each (batch_size, 1, size, size).
+    Each sample picks one orthogonal plane (XY / XZ / YZ) and one normalized
+    position, then slices BOTH volumes the same way so the NAC/AC pair stays
+    spatially corresponding. Returns two tensors each (batch_size, 1, size, size).
     """
     if nac is None or ac is None:
         raise ValueError("Both NAC and AC volumes are required for NAC->AC training.")
     nac_b, ac_b = [], []
     for _ in range(batch_size):
+        axis = int(rng.randint(0, 3))  # same plane for both halves of the pair
         t = float(pool[rng.randint(0, len(pool))])
-        nac_b.append(_slice_at(nac, t, size))
-        ac_b.append(_slice_at(ac, t, size))
+        nac_b.append(_slice_at(nac, t, size, axis))
+        ac_b.append(_slice_at(ac, t, size, axis))
     return torch.stack(nac_b, dim=0), torch.stack(ac_b, dim=0)
 
 
