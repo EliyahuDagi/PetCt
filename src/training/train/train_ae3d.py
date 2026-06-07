@@ -35,6 +35,7 @@ from src.training.utils.checkpointing import (
     restore_rng_state,
     save_training_checkpoint,
 )
+from src.training.utils.image_metrics import image_quality_metrics
 from src.training.utils.logging import setup_logging
 from src.training.utils.metrics import MetricsWriter
 from src.training.utils.perf import (
@@ -59,17 +60,18 @@ def _ae_metrics(model, batch):
         recon_loss = torch.mean(torch.abs(recon - batch))
         kl_loss = torch.mean(0.5 * (z_mu.pow(2) + z_sigma.pow(2) - 1.0 - torch.log(z_sigma.pow(2) + 1.0e-6)))
         loss = recon_loss + (1.0e-6 * kl_loss)
-    return loss, {
+    metrics = {
         "loss": float(loss.detach().cpu()),
         "recon_l1": float(recon_loss.detach().cpu()),
         "kl": float(kl_loss.detach().cpu()),
     }
+    return loss, metrics, recon
 
 
 def train_step(model, batch, optimizer):
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    loss, metrics = _ae_metrics(model, batch)
+    loss, metrics, _ = _ae_metrics(model, batch)
     loss.backward()
     optimizer.step()
     return metrics
@@ -78,12 +80,63 @@ def train_step(model, batch, optimizer):
 @torch.no_grad()
 def eval_step(model, batch):
     model.eval()
-    _, metrics = _ae_metrics(model, batch)
+    _, metrics, recon = _ae_metrics(model, batch)
+    # Image-quality metrics on the 3D reconstruction (val rows carry these).
+    metrics.update(image_quality_metrics(recon, batch))
     return metrics
 
 
 def build_model(config):
     return build_autoencoder_3d(config)
+
+
+def append_extra_levels(model_cfg, extra_levels):
+    """Append ``extra_levels`` downsample level(s) to a 3D AE's ``model`` config.
+
+    The 3D AE architecture is otherwise inherited wholesale from the 2D AE
+    checkpoint, which forces it to share the 2D AE's depth (compression factor).
+    Each appended level adds another /2 spatial downsample, so a 128^3 crop with
+    one extra level lands a 16^3 latent (factor 8) while ft3d's latent grid -- and
+    thus its cost -- is unchanged. The 2D AE's own depth is never modified.
+
+    Pads every per-level list (``block_out_channels`` / ``num_channels``,
+    ``attention_levels``, list-valued ``num_res_blocks``) so they stay the same
+    length. The fresh 3D level has no 2D counterpart to inflate from; the
+    ``strict=False`` inflation path leaves it at its random init (verified by
+    test_sizing).
+
+    Returns the same dict (mutated) for convenience. ``extra_levels <= 0`` is a
+    no-op so the default run is byte-identical to before.
+    """
+    extra_levels = int(extra_levels or 0)
+    if extra_levels <= 0:
+        return model_cfg
+
+    key = "block_out_channels" if "block_out_channels" in model_cfg else "num_channels"
+    channels = list(model_cfg.get(key, [64, 128, 256]))
+    if not channels:
+        channels = [64, 128, 256]
+    # New levels keep widening: double the last width per level (no decoder/encoder
+    # asymmetry to worry about -- AutoencoderKL mirrors num_channels).
+    for _ in range(extra_levels):
+        channels.append(channels[-1] * 2)
+    model_cfg[key] = channels
+    n = len(channels)
+
+    attn = model_cfg.get("attention_levels")
+    if isinstance(attn, (list, tuple)):
+        attn = list(attn)
+        attn += [False] * (n - len(attn))
+        model_cfg["attention_levels"] = attn[:n]
+
+    nrb = model_cfg.get("num_res_blocks")
+    if isinstance(nrb, (list, tuple)):
+        nrb = list(nrb)
+        pad = nrb[-1] if nrb else 2
+        nrb += [pad] * (n - len(nrb))
+        model_cfg["num_res_blocks"] = nrb[:n]
+
+    return model_cfg
 
 
 def inflate_and_load(model_3d, state_dict_2d):
@@ -115,6 +168,16 @@ def main():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--crop_size", type=int, default=64, help="Cube size of 3D crops fed to the AE")
+    parser.add_argument(
+        "--extra_levels",
+        type=int,
+        default=0,
+        help=(
+            "Append N extra downsample level(s) to the inflated 3D AE (each level "
+            "doubles the spatial compression factor). Opt-in: 0 keeps the 2D AE depth. "
+            "B2 config uses crop_size 128 + extra_levels 1 -> latent stays 16^3 at factor 8."
+        ),
+    )
     parser.add_argument("--modality", choices=["pet", "ct"], default="pet")
     parser.add_argument("--save_dir", default=None)
     parser.add_argument("--device", default="cuda")
@@ -159,6 +222,13 @@ def main():
     ae2d_config, ae2d_state = load_ae2d_config(args.ae2d_ckpt)
     config["model"] = dict(ae2d_config.get("model", {}))
     config["latent_channels"] = int(ae2d_config.get("latent_channels", 4))
+    # Opt-in: deepen the 3D AE beyond the 2D AE's depth so it compresses harder
+    # (e.g. 128^3 -> 16^3). The 2D AE checkpoint is untouched; the extra level
+    # warm-starts at fresh init via the strict=False inflation below.
+    if args.extra_levels:
+        append_extra_levels(config["model"], args.extra_levels)
+        logger.info("Appended %d extra 3D AE downsample level(s): %s",
+                    args.extra_levels, config["model"].get("block_out_channels", config["model"].get("num_channels")))
 
     # raw_model owns the weights (inflation / state_dict / resume); model is the
     # (optionally) compiled forward handle. They share parameters.
@@ -204,7 +274,7 @@ def main():
             len(patients), len(train_idx), len(val_idx), len(args.data_dir),
         )
 
-        def _sample_from(indices):
+        def _sample_from(indices, augment):
             pool_vols = []
             order = list(indices)
             rng.shuffle(order)
@@ -214,13 +284,14 @@ def main():
                     break
             if not pool_vols:
                 raise ValueError("No volumes available for 3D AE training across selected patients.")
-            return sample_volumes_full(pool_vols, batch_size, args.crop_size, rng)
+            return sample_volumes_full(pool_vols, batch_size, args.crop_size, rng, augment=augment)
 
+        # Train augments (random crop/flip/rotation); val stays clean.
         def sample_train():
-            return _sample_from(train_idx)
+            return _sample_from(train_idx, True)
 
         def sample_val():
-            return _sample_from(val_idx)
+            return _sample_from(val_idx, False)
 
     steps_per_epoch = int(args.steps_per_epoch)
     total_steps = int(args.epochs) * steps_per_epoch

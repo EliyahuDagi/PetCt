@@ -284,10 +284,64 @@ def sample_pairs(nac, ac, pool, batch_size, size, rng):
 
 
 def _resize_volume(volume, size):
-    """Resize a (Z,Y,X) tensor to a (size,size,size) cube -> (1,size,size,size)."""
+    """Resize a (Z,Y,X) tensor to a (size,size,size) cube -> (1,size,size,size).
+
+    Follow-up for anisotropic crops: accept ``size`` as a (dz,dy,dx) tuple and
+    pass it straight to ``F.interpolate(size=...)`` (samplers would thread the
+    tuple through). Cube-only for now per the B2 config.
+    """
     vol = volume.unsqueeze(0).unsqueeze(0)  # (1,1,Z,Y,X)
     vol = F.interpolate(vol, size=(size, size, size), mode="trilinear", align_corners=False)
     return vol.squeeze(0)  # (1,size,size,size)
+
+
+def _rand_crop_window(rng, min_frac=0.7):
+    """A random [start, end) sub-window covering a fraction in [min_frac, 1] of an
+    axis, expressed in normalized [0, 1) coordinates so it can be applied to two
+    volumes of differing shape (NAC/AC) identically."""
+    frac = float(min_frac) + (1.0 - float(min_frac)) * float(rng.rand())
+    start = (1.0 - frac) * float(rng.rand())
+    return start, start + frac
+
+
+def _crop_normalized(volume, windows):
+    """Crop a (Z,Y,X) tensor to per-axis normalized [start, end) ``windows``."""
+    out = volume
+    for axis, (s, e) in enumerate(windows):
+        n = out.shape[axis]
+        a = int(round(s * n))
+        b = max(a + 1, int(round(e * n)))
+        b = min(b, n)
+        a = min(a, b - 1)
+        idx = [slice(None)] * out.ndim
+        idx[axis] = slice(a, b)
+        out = out[tuple(idx)]
+    return out
+
+
+def draw_volume_aug(rng, min_frac=0.7):
+    """Draw one set of 3D augmentation parameters (shared across a NAC/AC pair so
+    the pair stays spatially corresponding): a normalized crop window per axis,
+    a flip flag per spatial axis, and a 0/90/180/270-degree axial rotation."""
+    return {
+        "windows": [_rand_crop_window(rng, min_frac) for _ in range(3)],
+        "flips": [bool(rng.rand() < 0.5) for _ in range(3)],  # Z, Y, X
+        "rot_k": int(rng.randint(0, 4)),                      # 90 deg steps in the Y-X (axial) plane
+    }
+
+
+def apply_volume_aug(volume, size, params):
+    """Apply ``params`` (from :func:`draw_volume_aug`) to a (Z,Y,X) volume:
+    normalized crop -> resize to size^3 -> per-axis flips -> axial rot90.
+    Returns (1, size, size, size). Output shape is invariant to ``params``."""
+    v = _crop_normalized(volume, params["windows"])
+    v = _resize_volume(v, size)  # (1, S, S, S)
+    flip_dims = [d + 1 for d, f in enumerate(params["flips"]) if f]  # spatial dims are 1,2,3
+    if flip_dims:
+        v = torch.flip(v, dims=flip_dims)
+    if params["rot_k"]:
+        v = torch.rot90(v, params["rot_k"], dims=[2, 3])  # rotate within the Y-X plane (equal size)
+    return v
 
 
 def _band_crop(volume, size, phase, val_fraction):
@@ -321,30 +375,52 @@ def sample_pair_volumes(nac, ac, batch_size, size, phase, val_fraction, rng):
     return nac_b, ac_b
 
 
-def sample_pair_volumes_full(nac, ac, batch_size, size, rng):
+def sample_pair_volumes_full(nac, ac, batch_size, size, rng, augment=False):
     """Sample paired (NAC, AC) 3D crops over the FULL depth (no band split).
 
     Used in the multi-patient diffusion case where train/val separation comes
     from a by-patient holdout. Returns two (batch_size, 1, size, size, size).
+
+    With ``augment=True`` each sample gets independent random crop/flip/rotation
+    (the SAME transform for its NAC and AC halves), so a small pool of patients
+    yields diverse 3D examples instead of one fixed resized cube per patient.
+    Validation should pass ``augment=False`` for a stable, comparable metric.
     """
     if nac is None or ac is None:
         raise ValueError("Both NAC and AC volumes are required for NAC->AC 3D training.")
-    nac_b = torch.stack([_resize_volume(nac, size) for _ in range(batch_size)], dim=0)
-    ac_b = torch.stack([_resize_volume(ac, size) for _ in range(batch_size)], dim=0)
-    return nac_b, ac_b
+    nac_list, ac_list = [], []
+    for _ in range(batch_size):
+        if augment:
+            p = draw_volume_aug(rng)
+            nac_list.append(apply_volume_aug(nac, size, p))
+            ac_list.append(apply_volume_aug(ac, size, p))
+        else:
+            nac_list.append(_resize_volume(nac, size))
+            ac_list.append(_resize_volume(ac, size))
+    return torch.stack(nac_list, dim=0), torch.stack(ac_list, dim=0)
 
 
-def sample_volumes_full(volumes, batch_size, size, rng):
+def sample_volumes_full(volumes, batch_size, size, rng, augment=False):
     """Sample single-channel 3D crops over the FULL depth of ``volumes``.
 
     Used in the multi-patient case where train/val separation comes from a
     by-patient holdout, so no within-volume depth band split is needed.
     Returns (batch_size, 1, size, size, size).
+
+    With ``augment=True`` each sample gets a random crop/flip/rotation, turning a
+    small patient pool into diverse 3D examples. Validation should pass
+    ``augment=False``.
     """
     vols = [v for v in volumes if v is not None]
     if not vols:
         raise ValueError("No volumes available to sample from.")
-    out = [_resize_volume(vols[rng.randint(0, len(vols))], size) for _ in range(batch_size)]
+    out = []
+    for _ in range(batch_size):
+        v = vols[rng.randint(0, len(vols))]
+        if augment:
+            out.append(apply_volume_aug(v, size, draw_volume_aug(rng)))
+        else:
+            out.append(_resize_volume(v, size))
     return torch.stack(out, dim=0)
 
 

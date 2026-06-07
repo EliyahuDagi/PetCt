@@ -100,7 +100,9 @@ class TestTrainScriptsCpu(unittest.TestCase):
             self.assertTrue(any(r["phase"] == "train" for r in rows))
 
             # --- diff2d (uses frozen 2D ae) ---
-            self._run(train_diff2d.main, common + ["--latent_size", "32", "--ae_ckpt", ae_ckpt, "--save_dir", d2_dir])
+            # perceptual_weight 0 keeps the smoke test offline (no VGG download).
+            self._run(train_diff2d.main, common + ["--latent_size", "32", "--ae_ckpt", ae_ckpt,
+                                                   "--perceptual_weight", "0", "--save_dir", d2_dir])
             self.assertTrue(os.path.exists(d2_ckpt), "diff2d best.pt missing")
             rows = read_metrics(os.path.join(d2_dir, "metrics.jsonl"))
             self.assertTrue(any(r["phase"] == "val" and "l1" in r for r in rows))
@@ -108,6 +110,7 @@ class TestTrainScriptsCpu(unittest.TestCase):
             # --- ft3d (frozen 3D ae + inflate diffusion UNet from diff2d) ---
             self._run(train_ft3d.main, common + ["--latent_size", "16", "--ae_ckpt", ae3_ckpt,
                                                   "--inflate_from", d2_ckpt, "--save_dir", d3_dir,
+                                                  "--perceptual_weight", "0",
                                                   "--steps_per_epoch", "1", "--val_every", "1"])
             self.assertTrue(os.path.exists(d3_ckpt), "ft3d best.pt missing")
 

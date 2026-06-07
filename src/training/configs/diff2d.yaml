@@ -5,13 +5,19 @@ batch_size: 16
 num_workers: 4
 learning_rate: 1.0e-4
 max_epochs: 200
-latent_channels: 4
+# latent_channels / in_channels(2C) / out_channels(C) are runtime-overridden from
+# the AE checkpoint; mirrored here for clarity (B2: latent_channels 8 -> in 16/out 8).
+latent_channels: 8
 model:
   spatial_dims: 2
-  in_channels: 4
-  out_channels: 4
+  in_channels: 16
+  out_channels: 8
   num_channels: [64, 128, 256]
   attention_levels: [false, true, true]
 loss:
   noise_mse_weight: 1.0
   recon_l1_weight: 1.0
+# Perceptual loss on the in-graph decoded x0 estimate (frozen VGG by default).
+# >0 enables it; 0 disables (no-op). Backend pluggable: "vgg" now, "medical_sam" later.
+perceptual_weight: 0.1
+perceptual_backend: vgg

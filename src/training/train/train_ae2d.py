@@ -29,6 +29,7 @@ from src.training.utils.checkpointing import (
     restore_rng_state,
     save_training_checkpoint,
 )
+from src.training.utils.image_metrics import image_quality_metrics
 from src.training.utils.logging import setup_logging
 from src.training.utils.metrics import MetricsWriter
 from src.training.utils.perf import (
@@ -53,17 +54,18 @@ def _ae_metrics(model, batch):
         recon_loss = torch.mean(torch.abs(recon - batch))
         kl_loss = torch.mean(0.5 * (z_mu.pow(2) + z_sigma.pow(2) - 1.0 - torch.log(z_sigma.pow(2) + 1.0e-6)))
         loss = recon_loss + (1.0e-6 * kl_loss)
-    return loss, {
+    metrics = {
         "loss": float(loss.detach().cpu()),
         "recon_l1": float(recon_loss.detach().cpu()),
         "kl": float(kl_loss.detach().cpu()),
     }
+    return loss, metrics, recon
 
 
 def train_step(model, batch, optimizer):
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    loss, metrics = _ae_metrics(model, batch)
+    loss, metrics, _ = _ae_metrics(model, batch)
     loss.backward()
     optimizer.step()
     return metrics
@@ -72,7 +74,9 @@ def train_step(model, batch, optimizer):
 @torch.no_grad()
 def eval_step(model, batch):
     model.eval()
-    _, metrics = _ae_metrics(model, batch)
+    _, metrics, recon = _ae_metrics(model, batch)
+    # Image-quality metrics on the reconstruction (val rows carry these).
+    metrics.update(image_quality_metrics(recon, batch))
     return metrics
 
 
@@ -110,7 +114,10 @@ def main():
         "output_dir": "outputs/ae2d",
         "batch_size": 4,
         "learning_rate": 1.0e-4,
-        "latent_channels": 4,
+        # Wider latent (8) -> richer AE code; lifts the recon ceiling that caps the
+        # downstream 3D diffusion. The launcher passes no --config, so this in-script
+        # default is the source of truth for real runs (ae2d.yaml mirrors it).
+        "latent_channels": 8,
         "model": {
             "in_channels": 1,
             "out_channels": 1,

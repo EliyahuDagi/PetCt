@@ -30,7 +30,7 @@ PET/CT medical-imaging research code with three loosely-coupled parts:
 | `src/training/utils/` | `sampling.py` (`DiffusionSchedule`: cosine/linear betas, zero-terminal-SNR, Min-SNR, DDIM/Karras), `schedule.py` (LR warmup/cosine + EMA), `checkpointing.py`, `logging.py`, `metrics.py`, `amp.py`. |
 | `src/training/configs/` | YAML configs per stage (`ae2d.yaml`, `diff2d.yaml`, `ft3d.yaml`, `slices.yaml`). |
 | `src/training/{data,infer}.py` | Dataset/manifest loading and the inference CLI. |
-| `src/TrainViewer/` | Tkinter GUI to launch training, watch metrics, and view inference (MVP, mirrors DataViewer). |
+| `src/TrainViewer/` | Gradio web GUI to launch training, watch metrics, and view inference. `model.py` (subprocess/file backend) + `controller.py` (UI-agnostic logic) + `app.py` (Gradio UI); `main.py` is the entry. |
 | `src/tests/` | `pytest` suite (models, training steps, scheduling, viewers, resume, CPU end-to-end). |
 | `scripts/`, `src/scripts/` | Data download/prep (TCIA), profiling, segmentation, `run_all_training.py`. |
 
@@ -71,8 +71,8 @@ Key pitfalls (see `.github/agents/core-summary.md` for the full list):
   `enumerate_patients(...)`. AE stages (ae2d/ae3d) pool any available PET volume
   (unpaired NAC *or* AC is fine); diffusion stages require paired NAC+AC and skip
   patients missing a pair. Train/val is by-patient holdout when >1 usable patient,
-  else the original within-patient depth split. The GUI Train tab lists roots in an
-  Add/Remove listbox and shows a `Dataset: N patients` count.
+  else the original within-patient depth split. The GUI Train tab lists roots in a
+  single-column dataframe editor and shows a `Dataset: N patients` count.
 - See `memory/train-viewer.md` for the durable design record.
 
 ## Running things

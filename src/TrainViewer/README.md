@@ -1,13 +1,15 @@
 # TrainViewer Architecture Summary
 
-**Project:** PetCt Train Viewer (Python/Tkinter/Matplotlib)
-**Architecture:** Model-View-Presenter (MVP), mirroring `src/DataViewer`.
+**Project:** PetCt Train Viewer (Python/Gradio)
+**Architecture:** Model + UI-agnostic Controller + Gradio UI.
 
-A single Tk window that launches/monitors training jobs in WSL, tails their
+A Gradio web app that launches/monitors training jobs in WSL, tails their
 metrics + stdout, and runs inference to compare Predicted vs Ground Truth.
 
 The GUI never imports torch. It only spawns WSL subprocesses and reads files
 (metrics.jsonl, *.pt presence, infer/*.npy) directly via Windows paths.
+`model.py` and `controller.py` import neither gradio nor tkinter, so the logic
+stays unit-testable; only `app.py` imports gradio.
 
 ---
 
@@ -15,7 +17,7 @@ The GUI never imports torch. It only spawns WSL subprocesses and reads files
 
 ### `main.py`
 Entry point. Adds the repo root to `sys.path`, then:
-`model = TrainModel(); view = TrainView(); presenter = TrainPresenter(model, view); view.mainloop()`.
+`model = TrainModel(); app = build_app(model); app.launch(inbrowser=True, share=False)`.
 Runnable as `python -m src.TrainViewer.main` or `python src/TrainViewer/main.py`.
 
 ### `model.py`
@@ -34,25 +36,32 @@ All subprocess + file logic. No Tk.
 - `TrainModel`: owns config/runners/readers/checkpoints and settings persistence
   to `outputs/trainviewer_settings.json`.
 
-### `view.py` (`TrainView(tk.Tk)`)
-All Tk + matplotlib. Top bar task `ttk.Combobox` + a `ttk.Notebook` with tabs:
-- **Train**: hyperparameter form (Entry/Spinbox/Combobox), Browse for data_dir,
-  WSL settings group, Start/Stop buttons, status label. The size field label
+### `app.py` (Gradio UI)
+`build_app(model=None) -> gr.Blocks` + `launch()`. All gradio lives here. A top
+`gr.Dropdown` task selector + `gr.Tabs`:
+- **Train**: hyperparameter form (`gr.Number`/`gr.Dropdown`), a single-column
+  `gr.Dataframe` of dataset roots with a live `Dataset: N patients` count, WSL
+  settings group, Start/Stop/Smoke buttons, status box. The size field label
   adapts: `slice_size` (ae2d), `crop_size` (ae3d), `latent_size` (diff2d/ft3d).
-- **Log**: a matplotlib figure plotting train vs val for a chosen metric key
-  (combobox: loss/recon_l1/kl/psnr) vs step, plus an append-only `tk.Text` log.
-- **View**: Load best model, data_dir/patient_index/slice inputs, Run inference,
-  and a 3-axis figure: Predicted | Ground Truth | Difference (pred-gt, `bwr`).
-  Predicted/GT use `gray`. Window/level drag (right-click) and synced zoom/pan
-  (ctrl+scroll / middle-drag) mirror DataViewer; the slice slider scrolls all
-  three axes for 3D (ft3d) volumes; 2D tasks show a single frame.
-A `self.after(750, self._tick)` loop drives `presenter.tick()` without blocking
-the mainloop. `run_on_ui(fn)` marshals worker-thread callbacks back to Tk.
+- **Log**: run `gr.Dropdown` + metric `gr.Dropdown` (loss/recon_l1/kl/psnr), a
+  native `gr.LinePlot` (x=step, y=value, color=phase) of train vs val, and an
+  append-only scrolling log `gr.Textbox`.
+- **View**: Load best model, infer data_dir/patient_index inputs, a **slice
+  slider** + **vmin/vmax window sliders**, Run inference, and three `gr.Image`s:
+  Predicted | Ground Truth | Difference. Pred/GT are windowed grayscale uint8;
+  Difference maps `pred-gt` through matplotlib's `bwr` colormap (symmetric about
+  0) to RGB uint8 (no figure). 3D (ft3d) volumes drive the slice slider range;
+  2D tasks show a single frame.
+A `gr.Timer(0.75)` drives `controller.poll()` each tick, appending stdout to the
+log, redrawing the curve when metric rows change, and refreshing status + runs.
 
-### `presenter.py` (`TrainPresenter`)
-Orchestration only; no Tk objects. Maps task display labels to internal keys,
-pulls form values into config, starts/stops training, polls model queues on each
-tick, updates curves/log, refreshes checkpoint info, and drives inference.
+### `controller.py` (`TrainController`, no gradio/tkinter)
+UI-agnostic orchestration. Maps task display labels to internal keys, starts/
+stops training, polls model queues via `tick()`/`poll()` returning a
+`PollResult`, resolves the live/pinned run path, recomputes dataset size,
+refreshes checkpoint info, and provides blocking wrappers around the model's
+callback-async smoke + inference runners. Settings are saved at the same points
+the old presenter saved them.
 
 ---
 
@@ -95,13 +104,14 @@ python -m src.TrainViewer.main
 # or
 python src/TrainViewer/main.py
 ```
-1. Pick a task in the top combobox.
+1. Pick a task in the top dropdown.
 2. Train tab: set hyperparameters + WSL settings, click **Start Training**.
 3. Log tab: watch train/val curves and streaming stdout.
-4. View tab: **Load best model**, set patient/slice, **Run inference**, compare
-   Predicted | Ground Truth | Difference.
+4. View tab: **Load best model**, set patient, **Run inference**, then use the
+   slice + vmin/vmax sliders to inspect Predicted | Ground Truth | Difference.
 
-Settings persist to `outputs/trainviewer_settings.json` on Start/Run/close and
+Settings persist to `outputs/trainviewer_settings.json` on Start/Run/smoke and
 reload on startup.
 
-**Dependencies:** `tkinter`, `matplotlib`, `numpy`. (No torch, no pydicom.)
+**Dependencies:** `gradio`, `matplotlib`, `numpy`. (No torch, no tkinter, no
+pydicom.)

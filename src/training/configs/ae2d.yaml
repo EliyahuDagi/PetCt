@@ -5,7 +5,9 @@ batch_size: 16
 num_workers: 4
 learning_rate: 1.0e-4
 max_epochs: 100
-latent_channels: 4
+# Source of truth for latent_channels: ae3d/diff2d/ft3d derive this from the AE
+# checkpoint at runtime (the values mirrored in their configs are informational).
+latent_channels: 8
 model:
   spatial_dims: 2
   in_channels: 1

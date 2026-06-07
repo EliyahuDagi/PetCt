@@ -80,6 +80,13 @@ def _data_dir_arg(data_dirs):
     return " ".join(quoted)
 
 
+def _safe_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
 def bash_quote(p):
     """shlex.quote for a bash arg, but keep a leading ~ / ~user unquoted so
     bash still performs tilde expansion. Spaces elsewhere are still quoted.
@@ -133,17 +140,25 @@ class MetricsReader:
     def __init__(self, path):
         self.path = path
         self._offset = 0
+        # Set when the file is truncated/recreated under us (a new run started
+        # while we were tailing). Consumers read this to drop stale rows.
+        self.restarted = False
 
     def reset(self):
         self._offset = 0
+        self.restarted = False
 
     def read_new(self):
         """Return a list of newly-appended, fully-parsed JSON rows.
-        Tolerates the file being absent, truncated, or recreated.
+        Tolerates the file being absent, truncated, or recreated. When a restart
+        is detected (file shrank or vanished after we had read content), the
+        ``restarted`` flag is set so the GUI can discard the previous run's rows.
         """
         rows = []
         if not self.path or not os.path.exists(self.path):
             # File gone (e.g. cleared at run start): reset for the next run.
+            if self._offset != 0:
+                self.restarted = True
             self._offset = 0
             return rows
         try:
@@ -152,6 +167,7 @@ class MetricsReader:
             return rows
         # File shrank/recreated -> start over.
         if size < self._offset:
+            self.restarted = True
             self._offset = 0
         if size == self._offset:
             return rows
@@ -538,23 +554,77 @@ class TrainModel:
         # Load persisted settings if present.
         self.load_settings()
 
-    # --- metrics ---
-    def metrics_reader(self, task):
-        if task not in self._readers:
-            path = os.path.join(self.outputs_root, task, "metrics.jsonl")
-            self._readers[task] = MetricsReader(path)
-        return self._readers[task]
+    # --- runs ---
+    def runs_root(self, task):
+        return os.path.join(self.outputs_root, task, "runs")
 
-    def read_new_metrics(self, task):
-        return self.metrics_reader(task).read_new()
+    def live_metrics_path(self, task):
+        """The root 'live mirror' file the trainer always writes to."""
+        return os.path.join(self.outputs_root, task, "metrics.jsonl")
 
-    def reset_metrics(self, task):
-        self.metrics_reader(task).reset()
+    def list_runs(self, task):
+        """Enumerate archived runs for a task, newest-first.
+
+        Each run is {"run_id", "path", "mtime"}. Reads the per-run archive under
+        outputs/<task>/runs/<run_id>/metrics.jsonl. Falls back to the legacy root
+        metrics.jsonl as a single run named "current" when no archive exists yet
+        (e.g. data from before archival, or a run launched by old training code).
+        """
+        runs = []
+        rroot = self.runs_root(task)
+        if os.path.isdir(rroot):
+            try:
+                names = os.listdir(rroot)
+            except OSError:
+                names = []
+            for name in names:
+                p = os.path.join(rroot, name, "metrics.jsonl")
+                if os.path.exists(p):
+                    runs.append({"run_id": name, "path": p, "mtime": _safe_mtime(p)})
+        if not runs:
+            root = self.live_metrics_path(task)
+            if os.path.exists(root):
+                runs.append({"run_id": "current", "path": root, "mtime": _safe_mtime(root)})
+        runs.sort(key=lambda r: r["mtime"], reverse=True)
+        return runs
+
+    def latest_run(self, task):
+        runs = self.list_runs(task)
+        return runs[0] if runs else None
+
+    def run_path(self, task, run_id):
+        """Resolve a run_id to its metrics path (None if it no longer exists)."""
+        for r in self.list_runs(task):
+            if r["run_id"] == run_id:
+                return r["path"]
+        return None
+
+    # --- metrics (path-based: one tailing reader per distinct file) ---
+    def _reader_for_path(self, path):
+        if path not in self._readers:
+            self._readers[path] = MetricsReader(path)
+        return self._readers[path]
+
+    def read_new_metrics_path(self, path):
+        return self._reader_for_path(path).read_new()
+
+    def consume_metrics_restart_path(self, path):
+        """Return True once if the file at path was truncated/recreated since the
+        last check (a new run started under us), clearing the flag."""
+        reader = self._reader_for_path(path)
+        if reader.restarted:
+            reader.restarted = False
+            return True
+        return False
+
+    def reset_metrics_path(self, path):
+        self._reader_for_path(path).reset()
 
     # --- training ---
     def start_training(self, task):
-        # Fresh metrics tail for this run; roots come from config.data_dirs.
-        self.reset_metrics(task)
+        # Fresh tail of the live mirror; the presenter live-follows the new run
+        # dir once the trainer creates it. Roots come from config.data_dirs.
+        self.reset_metrics_path(self.live_metrics_path(task))
         return self.runner.start(task, self.config, self.outputs_root)
 
     def stop_training(self):

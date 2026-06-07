@@ -61,7 +61,10 @@ def _stage_argv(stage, args, work_dir):
     if stage == "ae2d":
         return common + ["--batch_size", str(args.batch2d), "--slice_size", str(args.size)]
     if stage == "ae3d":
-        return common + ["--batch_size", str(args.batch3d), "--crop_size", str(args.crop3d), "--ae2d_ckpt", ae2d_ckpt]
+        argv = common + ["--batch_size", str(args.batch3d), "--crop_size", str(args.crop3d), "--ae2d_ckpt", ae2d_ckpt]
+        if getattr(args, "extra_levels", 0):
+            argv += ["--extra_levels", str(args.extra_levels)]
+        return argv
     if stage == "diff2d":
         return common + ["--batch_size", str(args.batch2d), "--latent_size", str(args.size), "--ae_ckpt", ae2d_ckpt]
     if stage == "ft3d":
@@ -226,6 +229,8 @@ def main():
     parser.add_argument("--steps", type=int, default=6, help="Timed train steps per stage")
     parser.add_argument("--size", type=int, default=128, help="2D slice/latent size (ae2d, diff2d)")
     parser.add_argument("--crop3d", type=int, default=64, help="3D cube size (ae3d, ft3d)")
+    parser.add_argument("--extra_levels", type=int, default=0,
+                        help="Extra 3D AE downsample level(s) for ae3d (B2 config: crop3d 128 + extra_levels 1).")
     parser.add_argument("--batch2d", type=int, default=4)
     parser.add_argument("--batch3d", type=int, default=1)
     parser.add_argument("--plan_epochs", type=int, default=1, help="Epochs to extrapolate ETA for")

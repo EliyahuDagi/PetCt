@@ -80,6 +80,54 @@ class TestMetricsReader(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["step"], 0)
 
+    def test_restarted_flag_set_on_truncate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "metrics.jsonl")
+            reader = tvm.MetricsReader(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"step": 5}\n{"step": 6}\n')
+            reader.read_new()
+            self.assertFalse(reader.restarted)  # first read is not a restart
+            # New run truncates the file.
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"step": 0}\n')
+            reader.read_new()
+            self.assertTrue(reader.restarted)
+
+
+class TestRunDiscovery(unittest.TestCase):
+    def _write(self, path, mtime=None):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"step": 0, "loss": 1.0}\n')
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+
+    def test_lists_archived_runs_newest_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = tvm.TrainModel(outputs_root=tmp)
+            self._write(os.path.join(tmp, "ae2d", "runs", "runA", "metrics.jsonl"), mtime=1000)
+            self._write(os.path.join(tmp, "ae2d", "runs", "runB", "metrics.jsonl"), mtime=2000)
+            runs = model.list_runs("ae2d")
+            self.assertEqual([r["run_id"] for r in runs], ["runB", "runA"])
+            self.assertEqual(model.latest_run("ae2d")["run_id"], "runB")
+
+    def test_legacy_root_file_is_a_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = tvm.TrainModel(outputs_root=tmp)
+            self._write(os.path.join(tmp, "ae2d", "metrics.jsonl"))
+            runs = model.list_runs("ae2d")
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["run_id"], "current")
+
+    def test_archive_hides_legacy_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = tvm.TrainModel(outputs_root=tmp)
+            self._write(os.path.join(tmp, "ae2d", "metrics.jsonl"))
+            self._write(os.path.join(tmp, "ae2d", "runs", "runA", "metrics.jsonl"))
+            runs = model.list_runs("ae2d")
+            self.assertEqual([r["run_id"] for r in runs], ["runA"])
+
 
 class TestCommandBuilding(unittest.TestCase):
     def setUp(self):

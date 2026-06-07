@@ -5,7 +5,8 @@ batch_size: 1
 num_workers: 2
 learning_rate: 1.0e-4
 max_epochs: 100
-latent_channels: 4
+# Runtime-overridden from the 2D AE checkpoint; kept in sync for clarity (B2: 8).
+latent_channels: 8
 # NOTE: the 3D AE architecture is inherited from the 2D AE checkpoint at train
 # time (so weights inflate cleanly); the model block below is informational. The
 # 3D AE is built with spatial_dims=3 and the same block_out_channels, so it also

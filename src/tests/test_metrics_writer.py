@@ -43,6 +43,38 @@ class TestMetricsWriter(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["loss"], 0.2)
 
+    def test_archives_each_run_separately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w1 = MetricsWriter(tmp, "ae2d", run_id="runA")
+            w1.log("train", 0, {"loss": 1.0})
+            w1.close()
+            w2 = MetricsWriter(tmp, "ae2d", run_id="runB")
+            w2.log("train", 0, {"loss": 0.2})
+            w2.close()
+            # Each run kept its own archive + meta.
+            a = read_metrics(os.path.join(tmp, "runs", "runA", "metrics.jsonl"))
+            b = read_metrics(os.path.join(tmp, "runs", "runB", "metrics.jsonl"))
+            self.assertEqual(a[0]["loss"], 1.0)
+            self.assertEqual(b[0]["loss"], 0.2)
+            self.assertTrue(os.path.exists(os.path.join(tmp, "runs", "runA", "meta.json")))
+            # The root mirror reflects the most recent run.
+            root = read_metrics(os.path.join(tmp, "metrics.jsonl"))
+            self.assertEqual(len(root), 1)
+            self.assertEqual(root[0]["loss"], 0.2)
+
+    def test_resume_appends_to_latest_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w1 = MetricsWriter(tmp, "ae2d", run_id="runA")
+            w1.log("train", 0, {"loss": 1.0})
+            w1.close()
+            # Resume (append, no run_id) continues the latest run's archive.
+            w2 = MetricsWriter(tmp, "ae2d", append=True)
+            self.assertEqual(w2.run_id, "runA")
+            w2.log("train", 1, {"loss": 0.9})
+            w2.close()
+            a = read_metrics(os.path.join(tmp, "runs", "runA", "metrics.jsonl"))
+            self.assertEqual(len(a), 2)
+
     def test_read_metrics_skips_partial_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "metrics.jsonl")

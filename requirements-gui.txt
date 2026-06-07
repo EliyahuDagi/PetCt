@@ -1,0 +1,6 @@
+# Windows GUI (TrainViewer / DataViewer) deps — the torch-free front-end.
+# Install in the Windows host venv that runs the GUIs. The CUDA torch stack
+# lives in requirements.txt and runs under WSL; the GUI never imports torch.
+gradio        # TrainViewer web UI (src/TrainViewer/app.py)
+matplotlib    # diverging colormap for the diff image + DataViewer rendering
+numpy

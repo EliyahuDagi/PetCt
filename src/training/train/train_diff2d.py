@@ -31,7 +31,9 @@ from src.training.utils.checkpointing import (
     restore_rng_state,
     save_training_checkpoint,
 )
+from src.training.utils.image_metrics import image_quality_metrics
 from src.training.utils.logging import setup_logging
+from src.training.utils.perceptual import build_perceptual_loss
 from src.training.utils.metrics import MetricsWriter
 from src.training.utils.perf import (
     autocast,
@@ -87,6 +89,34 @@ def diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma=None):
     return loss, x_t, timesteps, pred, noise
 
 
+def x0_decode_in_graph(ae, schedule, x_t, timesteps, pred):
+    """Decode the one-step x0 estimate to image space, keeping the graph intact.
+
+    Same formula ``_validate`` uses, but ``ae_decode`` is wrapped in ``no_grad``;
+    for a perceptual *training* term gradients must reach the UNet, so call the
+    AE decoder directly (the AE is frozen, so no AE params are updated -- the
+    gradient just passes through it back to ``pred``).
+    """
+    acp = schedule.alphas_cumprod[timesteps]
+    sqrt_acp = schedule._broadcast(torch.sqrt(acp), x_t)
+    sqrt_one_minus = schedule._broadcast(torch.sqrt(1.0 - acp), x_t)
+    x0_pred = (x_t - sqrt_one_minus * pred) / sqrt_acp
+    return ae.decode(x0_pred)
+
+
+def perceptual_term(perceptual, ae, schedule, x_t, timesteps, pred, ac_img, weight):
+    """Weighted perceptual loss on the in-graph decoded x0 vs the AC image.
+
+    Returns ``(weighted_loss_tensor_or_None, float_value)``. ``None`` weight/loss
+    means "disabled" -- the caller skips adding it (a true no-op).
+    """
+    if perceptual is None or not weight or weight <= 0:
+        return None, 0.0
+    recon = x0_decode_in_graph(ae, schedule, x_t, timesteps, pred)
+    pterm = perceptual(recon, ac_img) * float(weight)
+    return pterm, float(pterm.detach().cpu())
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", required=True, nargs="+", help="One or more dataset roots / patient folders")
@@ -101,6 +131,12 @@ def main():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--latent_size", type=int, default=128, help="Image size of slices fed to the AE encoder")
+    parser.add_argument(
+        "--perceptual_weight",
+        type=float,
+        default=None,
+        help="Override the perceptual-loss weight (0 disables it). Default comes from the config.",
+    )
     parser.add_argument("--save_dir", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -123,6 +159,11 @@ def main():
         "rescale_zero_terminal_snr": False,
         "ema_decay": 0.9999,
         "lr_min_ratio": 0.1,
+        # Perceptual loss on the in-graph decoded x0 estimate. >0 enables it;
+        # 0/disabled is a no-op. Backend is pluggable ("vgg" now, "medical_sam"
+        # later) -- see src/training/utils/perceptual.py.
+        "perceptual_weight": 0.1,
+        "perceptual_backend": "vgg",
         "model": {
             "num_channels": [16, 32, 64],
             "attention_levels": [False, True, True],
@@ -136,6 +177,8 @@ def main():
         config["batch_size"] = args.batch_size
     if args.learning_rate is not None:
         config["learning_rate"] = args.learning_rate
+    if args.perceptual_weight is not None:
+        config["perceptual_weight"] = args.perceptual_weight
 
     resume_path = resolve_resume_path(save_dir, args.resume)
 
@@ -171,6 +214,23 @@ def main():
         device=device,
     )
     snr_gamma = config.get("snr_gamma", 5.0)
+
+    # Pluggable perceptual loss (frozen VGG by default). build_* returns None when
+    # the backend/weights are unavailable, so training proceeds without the term.
+    perceptual_weight = float(config.get("perceptual_weight", 0.0) or 0.0)
+    perceptual = None
+    if perceptual_weight > 0:
+        perceptual = build_perceptual_loss(
+            config.get("perceptual_backend", "vgg"),
+            device=device,
+            weights_path=config.get("perceptual_weights_path"),
+        )
+        if perceptual is None:
+            logger.warning("Perceptual loss requested but backend unavailable; continuing without it.")
+            perceptual_weight = 0.0
+        else:
+            logger.info("Perceptual loss enabled: backend=%s weight=%.4g",
+                        config.get("perceptual_backend", "vgg"), perceptual_weight)
 
     rng = np.random.RandomState(seed)
     batch_size = int(config.get("batch_size", 4))
@@ -242,14 +302,16 @@ def main():
         nac_lat = ae_encode(ae, nac_img)
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss, _, _, _, _ = diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma)
+        mse_loss, x_t, timesteps, pred, _ = diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma)
+        pterm, pval = perceptual_term(perceptual, ae, schedule, x_t, timesteps, pred, ac_img, perceptual_weight)
+        loss = mse_loss if pterm is None else mse_loss + pterm
         loss.backward()
         optimizer.step()
         if lr_scheduler is not None:
             lr_scheduler.step()
         if ema is not None:
             ema.update(raw_model)
-        metrics = {"loss": float(loss.detach().cpu())}
+        metrics = {"loss": float(loss.detach().cpu()), "mse": float(mse_loss.detach().cpu()), "perceptual": pval}
         logger.info("step=%s loss=%.6f", global_step, metrics["loss"])
         metrics_writer.log("train", global_step, metrics, epoch)
 
@@ -292,6 +354,9 @@ def _validate(model, raw_model, ema, ae, schedule, sample_val_pair, n_batches, s
             recon = ae_decode(ae, x0_pred)
             accum["loss"] += float(loss.cpu())
             accum["l1"] += float(torch.mean(torch.abs(recon - ac_img)).cpu())
+            # Image-quality metrics of the decoded prediction vs AC reference.
+            for k, v in image_quality_metrics(recon, ac_img).items():
+                accum[k] = accum.get(k, 0.0) + v
     return {k: v / n for k, v in accum.items()}
 
 
