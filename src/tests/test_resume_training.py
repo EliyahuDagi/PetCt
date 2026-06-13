@@ -68,7 +68,9 @@ class TestResumeTraining(unittest.TestCase):
             res_dir = os.path.join(tmp, "res")
             base = ["--data_dir", "synthetic", "--device", "cpu", "--epochs", "2",
                     "--steps_per_epoch", "4", "--val_every", "2", "--val_batches", "1",
-                    "--batch_size", "2", "--slice_size", "32"]
+                    "--batch_size", "2", "--slice_size", "32",
+                    # Keep the resume test offline/deterministic (no VGG download).
+                    "--perceptual_weight", "0"]
 
             # Reference: one uninterrupted run.
             self._run(base + ["--save_dir", ref_dir])
@@ -80,11 +82,11 @@ class TestResumeTraining(unittest.TestCase):
             orig_step = train_ae2d.train_step
             calls = {"n": 0}
 
-            def crashing(model, batch, optimizer):
+            def crashing(model, batch, optimizer, *args, **kwargs):
                 if calls["n"] == 5:
                     raise KeyboardInterrupt
                 calls["n"] += 1
-                return orig_step(model, batch, optimizer)
+                return orig_step(model, batch, optimizer, *args, **kwargs)
 
             train_ae2d.train_step = crashing
             try:

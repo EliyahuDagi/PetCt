@@ -13,14 +13,16 @@ import numpy as np
 import torch
 
 from src.training.data import (
-    PatientVolumeCache,
+    PrefetchingPatientCache,
     ae_pool_volumes,
     load_patient_volumes,
     make_depth_split,
-    make_patient_split,
+    make_patient_split3,
     sample_slices,
+    write_split_json,
 )
 from src.training.dataset_index import enumerate_patients
+from src.training.utils.augment import build_aug_2d
 from src.training.models.autoencoder2d import build_autoencoder_2d
 from src.training.utils.checkpointing import (
     capture_rng_state,
@@ -31,6 +33,7 @@ from src.training.utils.checkpointing import (
 )
 from src.training.utils.image_metrics import image_quality_metrics
 from src.training.utils.logging import setup_logging
+from src.training.utils.perceptual import build_perceptual_loss
 from src.training.utils.metrics import MetricsWriter
 from src.training.utils.perf import (
     autocast,
@@ -44,7 +47,21 @@ TASK = "ae2d"
 SPATIAL_DIMS = 2
 
 
-def _ae_metrics(model, batch):
+def perceptual_term(perceptual, recon, target, weight):
+    """Weighted perceptual loss on the AE reconstruction vs the target.
+
+    The AE reconstruction is already in-graph (no x0 decode needed like the
+    diffusion stages), so the term applies directly to ``recon`` vs ``target``.
+    Returns ``(weighted_loss_tensor_or_None, float_value)``; ``None`` weight/loss
+    means "disabled" -- the caller skips adding it (a true no-op).
+    """
+    if perceptual is None or not weight or weight <= 0:
+        return None, 0.0
+    pterm = perceptual(recon, target) * float(weight)
+    return pterm, float(pterm.detach().cpu())
+
+
+def _ae_metrics(model, batch, perceptual=None, perceptual_weight=0.0):
     batch = to_input_memory_format(batch)
     with autocast():
         outputs = model(batch)
@@ -54,18 +71,25 @@ def _ae_metrics(model, batch):
         recon_loss = torch.mean(torch.abs(recon - batch))
         kl_loss = torch.mean(0.5 * (z_mu.pow(2) + z_sigma.pow(2) - 1.0 - torch.log(z_sigma.pow(2) + 1.0e-6)))
         loss = recon_loss + (1.0e-6 * kl_loss)
+    # Perceptual term is computed (and back-propagated) on the TRAIN path only;
+    # callers pass perceptual=None for validation so checkpoint selection stays on
+    # the existing recon-based val metric. None weight/loss is a true no-op.
+    pterm, pval = perceptual_term(perceptual, recon, batch, perceptual_weight)
+    if pterm is not None:
+        loss = loss + pterm
     metrics = {
         "loss": float(loss.detach().cpu()),
         "recon_l1": float(recon_loss.detach().cpu()),
         "kl": float(kl_loss.detach().cpu()),
+        "perceptual": pval,
     }
     return loss, metrics, recon
 
 
-def train_step(model, batch, optimizer):
+def train_step(model, batch, optimizer, perceptual=None, perceptual_weight=0.0):
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    loss, metrics, _ = _ae_metrics(model, batch)
+    loss, metrics, _ = _ae_metrics(model, batch, perceptual, perceptual_weight)
     loss.backward()
     optimizer.step()
     return metrics
@@ -93,11 +117,28 @@ def main():
     parser.add_argument("--steps_per_epoch", type=int, default=50)
     parser.add_argument("--val_every", type=int, default=25, help="Validate every N global steps")
     parser.add_argument("--val_fraction", type=float, default=0.2)
+    parser.add_argument("--test_fraction", type=float, default=0.1,
+                        help="By-patient TEST holdout fraction (multi-patient only). "
+                             "Test patients are excluded from BOTH train and val.")
     parser.add_argument("--val_batches", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--slice_size", type=int, default=128)
     parser.add_argument("--modality", choices=["pet", "ct"], default="pet")
+    parser.add_argument(
+        "--perceptual_weight",
+        type=float,
+        default=None,
+        help="Override the perceptual-loss weight (0 disables it). Default comes from the config.",
+    )
+    parser.add_argument("--prefetch", type=int, default=0,
+                        help="Background patient-prefetch depth (0 = synchronous, default). "
+                             ">0 overlaps DICOM I/O with GPU compute via a worker thread.")
+    parser.add_argument("--cache_size", type=int, default=None,
+                        help="Override the resident patient-cache size (default auto).")
+    parser.add_argument("--cache_dir", default=None,
+                        help="SSD pre-cache dir (or $PETCT_CACHE_DIR). Empty/None = pure DICOM "
+                             "(unchanged behavior). Hits skip DICOM; see src.training.precache.")
     parser.add_argument("--save_dir", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -118,6 +159,11 @@ def main():
         # downstream 3D diffusion. The launcher passes no --config, so this in-script
         # default is the source of truth for real runs (ae2d.yaml mirrors it).
         "latent_channels": 8,
+        # Perceptual loss on the AE reconstruction (frozen VGG by default). >0
+        # enables it; 0/disabled is a no-op. Backend is pluggable ("vgg" now,
+        # "medical_sam" later) -- see src/training/utils/perceptual.py.
+        "perceptual_weight": 0.1,
+        "perceptual_backend": "vgg",
         "model": {
             "in_channels": 1,
             "out_channels": 1,
@@ -132,6 +178,8 @@ def main():
         config["batch_size"] = args.batch_size
     if args.learning_rate is not None:
         config["learning_rate"] = args.learning_rate
+    if args.perceptual_weight is not None:
+        config["perceptual_weight"] = args.perceptual_weight
 
     resume_path = resolve_resume_path(save_dir, args.resume)
 
@@ -153,14 +201,37 @@ def main():
     optimizer = torch.optim.Adam(raw_model.parameters(), lr=float(config.get("learning_rate", 1.0e-4)))
     model = maybe_compile(raw_model, logger)
 
+    # Pluggable perceptual loss (frozen VGG by default), applied to the recon vs
+    # target on the TRAIN path only. build_* returns None when the backend/weights
+    # are unavailable, so training proceeds without the term (graceful degradation).
+    perceptual_weight = float(config.get("perceptual_weight", 0.0) or 0.0)
+    perceptual = None
+    if perceptual_weight > 0:
+        perceptual = build_perceptual_loss(
+            config.get("perceptual_backend", "vgg"),
+            device=device,
+            weights_path=config.get("perceptual_weights_path"),
+        )
+        if perceptual is None:
+            logger.warning("Perceptual loss requested but backend unavailable; continuing without it.")
+            perceptual_weight = 0.0
+        else:
+            logger.info("Perceptual loss enabled: backend=%s weight=%.4g",
+                        config.get("perceptual_backend", "vgg"), perceptual_weight)
+
     rng = np.random.RandomState(seed)
     batch_size = int(config.get("batch_size", 4))
+
+    # Geometric-only train augmentation (no-op identity unless config opts in).
+    # Train uses it; validation always passes augment=None for a stable metric.
+    train_aug = build_aug_2d(config.get("augment"))
 
     # Enumerate patients across all roots (missing_ok lets monkeypatched / GUI
     # callers pass non-existent paths). With <=1 enumerated patient we fall back
     # to the legacy single-patient depth split so existing behavior is unchanged.
     patients = enumerate_patients(args.data_dir, missing_ok=True)
     multi_patient = len(patients) > 1
+    cache = None  # set in the multi-patient branch; closed after training
 
     if not multi_patient:
         vols = load_patient_volumes(args.data_dir[0], args.patient_index, device=device)
@@ -173,26 +244,40 @@ def main():
         logger.info("Training on 1 patient (train 1 / val 1) across %d roots.", len(args.data_dir))
 
         def sample_train():
-            return sample_slices(pool_vols, train_pool, batch_size, args.slice_size, rng)
+            return sample_slices(pool_vols, train_pool, batch_size, args.slice_size, rng, augment=train_aug)
 
         def sample_val():
-            return sample_slices(pool_vols, val_pool, batch_size, args.slice_size, rng)
+            return sample_slices(pool_vols, val_pool, batch_size, args.slice_size, rng, augment=None)
     else:
-        cache = PatientVolumeCache(patients, device=device, max_cached=4)
-        train_idx, val_idx = make_patient_split(len(patients), args.val_fraction, seed)
+        train_idx, val_idx, test_idx = make_patient_split3(
+            len(patients), args.val_fraction, args.test_fraction, seed)
         full_pool = np.linspace(0.0, 1.0, num=128, endpoint=False)
         logger.info(
-            "Training on %d patients (train %d / val %d) across %d roots.",
-            len(patients), len(train_idx), len(val_idx), len(args.data_dir),
+            "Training on %d patients (train %d / val %d / test %d) across %d roots. "
+            "Test patients are held out from training entirely.",
+            len(patients), len(train_idx), len(val_idx), len(test_idx), len(args.data_dir),
         )
+        split_path = write_split_json(
+            save_dir, TASK, patients, train_idx, val_idx, test_idx,
+            args.val_fraction, args.test_fraction, seed)
+        if split_path:
+            logger.info("Wrote by-patient split to %s.", split_path)
+        # Opt-in async prefetch: prefetch>0 overlaps the per-patient DICOM read with
+        # GPU compute on a worker thread. prefetch==0 keeps the synchronous LRU path,
+        # so the default run is byte-identical to before.
+        cache_kwargs = {} if args.cache_size is None else {"max_cached": args.cache_size}
+        cache = PrefetchingPatientCache(
+            patients, device=device, prefetch=args.prefetch,
+            train_indices=train_idx, rng=rng, cache_dir=args.cache_dir, **cache_kwargs,
+        ).start()
 
         def _pool_for(idx):
-            vols = cache.get(idx)
-            return ae_pool_volumes(vols, args.modality)
+            return ae_pool_volumes(cache.get(idx), args.modality)
 
-        def _sample_from(indices):
+        def _sample_sync(indices, augment=None):
+            # Original synchronous path (preserved byte-for-byte for prefetch==0):
+            # shuffle a copy of the index list each call and take the first usable.
             pool_vols = []
-            # Try patients until one yields usable volumes (handles unpaired data).
             order = list(indices)
             rng.shuffle(order)
             for idx in order:
@@ -201,13 +286,24 @@ def main():
                     break
             if not pool_vols:
                 raise ValueError("No volumes available for AE training across selected patients.")
-            return sample_slices(pool_vols, full_pool, batch_size, args.slice_size, rng)
+            return sample_slices(pool_vols, full_pool, batch_size, args.slice_size, rng, augment=augment)
 
         def sample_train():
-            return _sample_from(train_idx)
+            if args.prefetch <= 0:
+                return _sample_sync(train_idx, augment=train_aug)
+            # Prefetch path: walk the shuffled-epoch stream; skip empty patients.
+            pool_vols = []
+            for _ in range(max(1, len(train_idx))):
+                _, vols = cache.next_train()
+                pool_vols = ae_pool_volumes(vols, args.modality)
+                if pool_vols:
+                    break
+            if not pool_vols:
+                raise ValueError("No volumes available for AE training across selected patients.")
+            return sample_slices(pool_vols, full_pool, batch_size, args.slice_size, rng, augment=train_aug)
 
         def sample_val():
-            return _sample_from(val_idx)
+            return _sample_sync(val_idx, augment=None)
 
     steps_per_epoch = int(args.steps_per_epoch)
     total_steps = int(args.epochs) * steps_per_epoch
@@ -219,7 +315,7 @@ def main():
     for global_step in range(start_step, total_steps):
         epoch = global_step // max(1, steps_per_epoch)
         batch = sample_train()
-        metrics = train_step(model, batch, optimizer)
+        metrics = train_step(model, batch, optimizer, perceptual, perceptual_weight)
         logger.info("step=%s loss=%.6f recon_l1=%.6f kl=%.6f", global_step, metrics["loss"], metrics["recon_l1"], metrics["kl"])
         metrics_writer.log("train", global_step, metrics, epoch)
 
@@ -237,6 +333,8 @@ def main():
     best_val = min(best_val, final_val["loss"])
     save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, total_steps, int(args.epochs), final_val["loss"], best_val), is_best)
     metrics_writer.close()
+    if cache is not None:
+        cache.close()
     logger.info("Training finished. best_val_loss=%.6f", best_val)
 
 

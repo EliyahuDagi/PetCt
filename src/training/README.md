@@ -49,6 +49,27 @@ the stages fall back to the original within-patient split (a 2D depth-position
 shuffle for `ae2d`/`diff2d`, a contiguous depth band for `ae3d`/`ft3d`), so
 single-patient behavior is unchanged.
 
+#### Async prefetch (opt-in `--prefetch N`)
+
+The per-patient DICOM read is ~5-8 s, so with a pool far larger than the cache the
+GPU stalls on nearly every step. `--prefetch N` (`0` = old synchronous behavior,
+the default) wraps the LRU in a `PrefetchingPatientCache`: a daemon **thread** walks
+a deterministic shuffled-epoch iterator of the train indices and reads the next `N`
+patients on **CPU** while the GPU trains the current batch; the main thread then does
+only the cheap (~ms) H2D copy. Threading (not multiprocessing) is used because
+pydicom/numpy file I/O release the GIL and we avoid pickling / cross-process CUDA
+tensors; worker threads never call CUDA. The worker uses an independent RNG so it
+never races the main-loop `rng`. Validation stays synchronous. `--cache_size`
+overrides the resident cache cap. Bounded by host RAM (~100 MB/patient PET).
+
+#### Paired-pair manifest cache (diffusion stages)
+
+`filter_paired_patients` loads every patient to find NAC/AC pairs (~25 min on the
+full set). `filter_paired_patients_cached` persists the result to a small JSON
+manifest under `outputs/paired_cache/`, keyed by the sorted roots + their mtimes,
+and reuses it on later runs (rebuilding if stale/missing or when `--rescan_pairs`
+is passed). The pairing logic itself is unchanged.
+
 ## Encoder: why a 3D AE
 
 Earlier the 3D diffusion ran on a 2D AE applied slice-by-slice, so the latent had

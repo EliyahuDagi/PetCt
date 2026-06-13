@@ -1,5 +1,10 @@
 seed: 42
 output_dir: outputs/ae3d
+# By-patient holdout fractions (multi-patient runs). Test patients are excluded
+# from BOTH train and val. These mirror the train script CLI defaults
+# (--val_fraction / --test_fraction), which remain the source of truth at runtime.
+val_fraction: 0.2
+test_fraction: 0.1
 volume_manifest: data/training/volumes.jsonl
 batch_size: 1
 num_workers: 2
@@ -22,3 +27,22 @@ model:
 loss:
   recon_l1_weight: 1.0
   kl_weight: 1.0e-6
+# Perceptual loss on the 3D AE reconstruction vs target; 2D backbone run slice-wise
+# on the 3D recon (frozen VGG by default, as ft3d does on its 3D decode). >0 enables;
+# 0 disables (no-op). Backend pluggable: "vgg" / "medical_sam".
+# perceptual_weights_path: optional local VGG16 weights (null/omitted -> torchvision pretrained).
+perceptual_weight: 0.1
+perceptual_backend: vgg
+# Geometric-only 3D data augmentation (no intensity transforms). Disabled by default;
+# layered on top of the existing crop/flip/rot90. Applied to TRAIN crops only.
+augment:
+  enabled: true
+  flip_prob: 0.5             # per spatial axis (D, H, W)
+  rot90_prob: 0.5            # 90-degree rotations in the axial (H-W) plane
+  affine_prob: 0.3           # mild rotate/scale/translate
+  affine_rotate_deg: 7.0
+  affine_scale: 0.1
+  affine_translate: 0.02     # fraction of axis length
+  elastic_prob: 0.0          # very-mild elastic; off by default
+  elastic_sigma_range: [1.0, 2.0]
+  elastic_magnitude_range: [1.0, 2.0]

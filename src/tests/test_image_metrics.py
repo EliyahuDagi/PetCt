@@ -78,7 +78,11 @@ def test_shapes_return_finite_floats():
         gt = builder(seed=3)
         pred = builder(seed=4)
         m = image_quality_metrics(pred, gt)
-        assert set(m) == {"psnr", "ssim", "nrmse", "mae", "rel_bias"}
+        assert set(m) == {
+            "psnr", "ssim", "nrmse", "mae", "rel_bias",
+            "max_rel_error", "voxel_r2", "reg_slope", "reg_intercept",
+            "ba_mean_bias", "ba_loa_lower", "ba_loa_upper",
+        }
         for k, v in m.items():
             assert _finite(v), (k, v)
 

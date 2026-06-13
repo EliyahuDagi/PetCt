@@ -140,7 +140,8 @@ class DiffusionSchedule:
         raise ValueError(f"Unknown spacing {spacing!r}; expected 'linear' or 'karras'.")
 
     @torch.no_grad()
-    def ddim_sample(self, model_fn, shape, device, num_steps=50, eta=0.0, generator=None, spacing="linear"):
+    def ddim_sample(self, model_fn, shape, device, num_steps=50, eta=0.0, generator=None,
+                    spacing="linear", clip_x0=None):
         """Deterministic (eta=0) DDIM sampling from pure noise.
 
         Args:
@@ -151,6 +152,16 @@ class DiffusionSchedule:
             spacing: "linear" (uniform) or "karras" (Karras rho=7 sigma spacing,
                 which concentrates steps at low noise and typically reaches good
                 quality in noticeably fewer steps).
+            clip_x0: if not None, clamp the per-step x0 estimate to
+                ``[-clip_x0, clip_x0]`` (static thresholding). REQUIRED for stable
+                sampling under the cosine schedule, whose terminal
+                ``alphas_cumprod[-1]`` is ~1e-9: the first step's
+                ``x0 = (x - sqrt(1-acp)*eps)/sqrt(acp)`` then divides by ~5e-5, so
+                any eps error is amplified ~10^4x and the trajectory diverges (we
+                observed latent std exploding to ~3e3 and SSIM->0). Latents are
+                normalized to ~unit std, so a few-sigma clamp (e.g. 4.0) bounds x0
+                without distorting in-range values. Default None preserves the
+                original (unclamped) behavior for callers/tests that rely on it.
         Returns the sampled tensor (predicted x0 at the final step).
         """
         x = torch.randn(shape, device=device, generator=generator)
@@ -167,6 +178,8 @@ class DiffusionSchedule:
             sqrt_acp_t = torch.sqrt(acp_t)
             sqrt_one_minus_t = torch.sqrt(1.0 - acp_t)
             x0_pred = (x - sqrt_one_minus_t * eps) / sqrt_acp_t
+            if clip_x0 is not None:
+                x0_pred = x0_pred.clamp(-float(clip_x0), float(clip_x0))
 
             sqrt_acp_prev = torch.sqrt(acp_prev)
             dir_xt = torch.sqrt(1.0 - acp_prev) * eps

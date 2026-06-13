@@ -87,14 +87,18 @@ class TestTrainScriptsCpu(unittest.TestCase):
                       "--batch_size", "2"]
 
             # --- ae2d ---
-            self._run(train_ae2d.main, common + ["--slice_size", "32", "--save_dir", ae_dir])
+            # perceptual_weight 0 keeps the smoke test offline (no VGG download).
+            self._run(train_ae2d.main, common + ["--slice_size", "32", "--save_dir", ae_dir,
+                                                  "--perceptual_weight", "0"])
             self.assertTrue(os.path.exists(ae_ckpt), "ae2d best.pt missing")
             rows = read_metrics(os.path.join(ae_dir, "metrics.jsonl"))
             self.assertTrue(any(r["phase"] == "train" for r in rows))
             self.assertTrue(any(r["phase"] == "val" for r in rows))
 
             # --- ae3d (inflate 2D AE -> 3D AE, fine-tune on volumes) ---
-            self._run(train_ae3d.main, common + ["--crop_size", "16", "--ae2d_ckpt", ae_ckpt, "--save_dir", ae3_dir])
+            # perceptual_weight 0 keeps the smoke test offline (no VGG download).
+            self._run(train_ae3d.main, common + ["--crop_size", "16", "--ae2d_ckpt", ae_ckpt, "--save_dir", ae3_dir,
+                                                  "--perceptual_weight", "0"])
             self.assertTrue(os.path.exists(ae3_ckpt), "ae3d best.pt missing")
             rows = read_metrics(os.path.join(ae3_dir, "metrics.jsonl"))
             self.assertTrue(any(r["phase"] == "train" for r in rows))

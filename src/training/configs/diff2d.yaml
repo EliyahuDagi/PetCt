@@ -1,5 +1,10 @@
 seed: 42
 output_dir: outputs/diff2d
+# By-patient holdout fractions (multi-patient runs). Test patients are excluded
+# from BOTH train and val. These mirror the train script CLI defaults
+# (--val_fraction / --test_fraction), which remain the source of truth at runtime.
+val_fraction: 0.2
+test_fraction: 0.1
 slice_manifest: data/training/slices.jsonl
 batch_size: 16
 num_workers: 4
@@ -8,6 +13,19 @@ max_epochs: 200
 # latent_channels / in_channels(2C) / out_channels(C) are runtime-overridden from
 # the AE checkpoint; mirrored here for clarity (B2: latent_channels 8 -> in 16/out 8).
 latent_channels: 8
+# Classifier-free guidance (InstructPix2Pix-style). During training the NAC
+# conditioning latent is replaced by zeros (the "null" condition) with this
+# per-sample probability, so the UNet learns BOTH the conditional and
+# unconditional score; inference then amplifies the conditional direction with
+# --guidance_scale. 0 disables (plain conditional training). Required because
+# plain channel-concat conditioning is otherwise ignored (see docs/nac_ac_benchmark.md §5).
+cond_dropout_prob: 0.1
+# Stable-Diffusion-style latent normalization: encode multiplies the raw AE latent
+# by this scale, decode divides by it, so diffusion operates on ~unit-std latents
+# (matching the DDIM sampler's N(0,1) start). null = compute it once at the start of
+# training as 1/std over a sample of AC latents and embed it in the checkpoint. Set a
+# positive number to pin the value (e.g. to resume deterministically).
+latent_scale: null
 model:
   spatial_dims: 2
   in_channels: 16
@@ -21,3 +39,13 @@ loss:
 # >0 enables it; 0 disables (no-op). Backend pluggable: "vgg" now, "medical_sam" later.
 perceptual_weight: 0.1
 perceptual_backend: vgg
+# Geometric-only data augmentation (no intensity transforms). Disabled by default.
+# Applied to TRAIN pairs only, with the SAME random geometry on NAC and AC (val clean).
+augment:
+  enabled: true
+  flip_prob: 0.5          # per spatial axis (H, W)
+  rot90_prob: 0.5         # 90-degree rotations in the H-W plane
+  affine_prob: 0.3        # mild rotate/scale/translate
+  affine_rotate_deg: 5.0
+  affine_scale: 0.05
+  affine_translate: 0.02  # fraction of axis length

@@ -352,6 +352,7 @@ class InferenceRunner:
             f"--patient_index {int(patient_index)} "
             f"--slice {int(slice_idx)} "
             f"--ae_ckpt {ae_ckpt} "
+            f"--device {cfg.device} "
         )
         # Only the diffusion tasks consume a separate diffusion checkpoint.
         if task in DIFFUSION_TASKS:

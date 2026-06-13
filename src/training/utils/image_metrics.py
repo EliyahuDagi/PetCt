@@ -10,18 +10,28 @@ No external image deps (no skimage); everything is implemented with
 (upcast to float32 internally).
 
 Metrics provided:
-    psnr            -- peak signal-to-noise ratio (dB), range-normalized.
-    ssim            -- Gaussian-windowed structural similarity (2D/3D).
-    nrmse           -- range-normalized root-mean-square error.
-    mae             -- mean absolute error.
+    psnr               -- peak signal-to-noise ratio (dB), range-normalized.
+    ssim               -- Gaussian-windowed structural similarity (2D/3D).
+    nrmse              -- range-normalized root-mean-square error.
+    mae                -- mean absolute error.
     mean_relative_bias -- normalized-intensity proxy for SUV mean % bias.
+    max_relative_error -- normalized-intensity proxy for lesion SUVmax error.
+    voxel_r2           -- coefficient of determination over foreground voxels.
+    regression_slope   -- least-squares slope (+ intercept) of pred vs gt (fg).
+    bland_altman       -- mean bias + 95% limits of agreement over foreground.
 
-Note on ``mean_relative_bias``: this is a *proxy* for SUV mean bias computed on
-the (arbitrarily scaled) intensities this pipeline carries. A true SUV bias
-measurement needs calibrated SUV units and organ/lesion VOIs, which this
-pipeline does not currently track; ``rel_bias`` only reports the relative
-difference of foreground means and should be read as a directional sanity check,
-not a clinical SUV bias.
+Clinical-tier caveat (the metrics that decide SOTA): all of these are computed
+in this pipeline's *normalized intensity* space, NOT in calibrated SUV. A true
+SUV mean %-bias and lesion SUVmax error require calibrated SUV units plus
+organ/lesion VOIs, which this pipeline does not yet track. So:
+  - ``mean_relative_bias`` is a normalized-intensity *proxy* for SUV mean bias
+    (relative difference of foreground means), a directional sanity check only.
+  - ``max_relative_error`` is a normalized-intensity *proxy* for lesion SUVmax
+    error (relative error of the foreground max), not a true lesion SUVmax error
+    until SUV calibration + lesion VOIs exist.
+  - ``voxel_r2`` / ``regression_slope`` / ``bland_altman`` quantify voxel-wise
+    agreement over foreground; they are scale-aware but still in normalized
+    intensity, so absolute slope/bias should be read in that space.
 """
 
 import torch
@@ -156,16 +166,132 @@ def mean_relative_bias(pred, gt, fg_threshold=None):
     return (pred_mean - gt_mean) / (gt_mean + _EPS)
 
 
+def _foreground_mask(gt, fg_threshold=None):
+    """Boolean foreground mask ``gt > thr`` (thr defaults to 5% of gt.max()).
+
+    Falls back to the whole image when the mask would be empty, matching
+    ``mean_relative_bias``'s behaviour.
+    """
+    if fg_threshold is None:
+        thr = 0.05 * float(gt.max())
+    else:
+        thr = float(fg_threshold)
+    mask = gt > thr
+    if not bool(mask.any()):
+        mask = torch.ones_like(gt, dtype=torch.bool)
+    return mask
+
+
+def max_relative_error(pred, gt, fg_threshold=None):
+    """Relative error of the foreground max: proxy for lesion SUVmax error.
+
+    Computes ``(pred[mask].max() - gt[mask].max()) / (gt[mask].max() + eps)`` over
+    the foreground mask (``gt > 5% of gt.max()`` by default). This is a
+    *normalized-intensity proxy* for lesion SUVmax error -- a true lesion SUVmax
+    error needs calibrated SUV units and lesion VOIs, which are not yet tracked.
+    """
+    pred = _prep(pred)
+    gt = _prep(gt)
+    mask = _foreground_mask(gt, fg_threshold)
+    gt_max = float(gt[mask].max())
+    pred_max = float(pred[mask].max())
+    return (pred_max - gt_max) / (abs(gt_max) + _EPS)
+
+
+def voxel_r2(pred, gt, fg_threshold=None):
+    """Coefficient of determination (R^2) of pred vs gt over foreground voxels.
+
+    R^2 = 1 - SS_res / SS_tot, where SS_res = sum((gt - pred)^2) and
+    SS_tot = sum((gt - mean(gt))^2) over the foreground mask. Returns NaN when the
+    foreground is flat (SS_tot ~ 0), which the eval aggregator filters out.
+    """
+    pred = _prep(pred)
+    gt = _prep(gt)
+    mask = _foreground_mask(gt, fg_threshold)
+    g = gt[mask]
+    p = pred[mask]
+    if g.numel() < 2:
+        return float("nan")
+    ss_tot = torch.sum((g - g.mean()) ** 2)
+    if float(ss_tot) <= _EPS:
+        return float("nan")
+    ss_res = torch.sum((g - p) ** 2)
+    return float(1.0 - ss_res / ss_tot)
+
+
+def regression_slope(pred, gt, fg_threshold=None):
+    """Least-squares slope (+intercept) of pred on gt over foreground voxels.
+
+    Fits ``pred ~ slope * gt + intercept`` over the foreground mask; the ideal
+    correction has slope=1, intercept=0. Returns ``(slope, intercept)`` as a
+    tuple of floats; slope is NaN when gt is flat over the foreground (the eval
+    aggregator filters non-finite values out).
+    """
+    pred = _prep(pred)
+    gt = _prep(gt)
+    mask = _foreground_mask(gt, fg_threshold)
+    g = gt[mask]
+    p = pred[mask]
+    if g.numel() < 2:
+        return float("nan"), float("nan")
+    g_mean = g.mean()
+    p_mean = p.mean()
+    var_g = torch.sum((g - g_mean) ** 2)
+    if float(var_g) <= _EPS:
+        return float("nan"), float("nan")
+    slope = torch.sum((g - g_mean) * (p - p_mean)) / var_g
+    intercept = p_mean - slope * g_mean
+    return float(slope), float(intercept)
+
+
+def bland_altman(pred, gt, fg_threshold=None):
+    """Bland-Altman agreement of pred vs gt over foreground voxels.
+
+    Returns a dict with ``mean_bias`` (mean of pred-gt) and the 95% limits of
+    agreement ``loa_lower`` / ``loa_upper`` = mean_diff +/- 1.96 * SD(diff) over
+    the foreground mask. In this pipeline's normalized-intensity space (proxy for
+    a calibrated-SUV Bland-Altman analysis).
+    """
+    pred = _prep(pred)
+    gt = _prep(gt)
+    mask = _foreground_mask(gt, fg_threshold)
+    diff = pred[mask] - gt[mask]
+    if diff.numel() < 1:
+        return {"mean_bias": float("nan"), "loa_lower": float("nan"), "loa_upper": float("nan")}
+    mean_diff = float(diff.mean())
+    # Population SD (unbiased=False) so a single-voxel mask yields 0, not NaN.
+    sd_diff = float(diff.std(unbiased=False))
+    return {
+        "mean_bias": mean_diff,
+        "loa_lower": mean_diff - 1.96 * sd_diff,
+        "loa_upper": mean_diff + 1.96 * sd_diff,
+    }
+
+
 def image_quality_metrics(pred, gt):
     """Compute all image-quality metrics; return python floats.
 
     Detaches, moves to CPU and upcasts internally, so it is safe to call inside
     a training/validation loop on GPU half-precision tensors.
+
+    Includes both the image tier (psnr/ssim/nrmse/mae) and the clinical-tier
+    proxies (rel_bias/max_rel_error/voxel_r2/regression slope+intercept/
+    Bland-Altman bias + 95% limits of agreement), all in normalized-intensity
+    space -- see the module docstring for the SUV-calibration caveat.
     """
+    slope, intercept = regression_slope(pred, gt)
+    ba = bland_altman(pred, gt)
     return {
         "psnr": psnr(pred, gt),
         "ssim": ssim(pred, gt),
         "nrmse": nrmse(pred, gt),
         "mae": mae(pred, gt),
         "rel_bias": mean_relative_bias(pred, gt),
+        "max_rel_error": max_relative_error(pred, gt),
+        "voxel_r2": voxel_r2(pred, gt),
+        "reg_slope": slope,
+        "reg_intercept": intercept,
+        "ba_mean_bias": ba["mean_bias"],
+        "ba_loa_lower": ba["loa_lower"],
+        "ba_loa_upper": ba["loa_upper"],
     }

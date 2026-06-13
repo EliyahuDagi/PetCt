@@ -1,5 +1,10 @@
 seed: 42
 output_dir: outputs/ae2d
+# By-patient holdout fractions (multi-patient runs). Test patients are excluded
+# from BOTH train and val. These mirror the train script CLI defaults
+# (--val_fraction / --test_fraction), which remain the source of truth at runtime.
+val_fraction: 0.2
+test_fraction: 0.1
 slice_manifest: data/training/slices.jsonl
 batch_size: 16
 num_workers: 4
@@ -17,3 +22,18 @@ model:
 loss:
   recon_l1_weight: 1.0
   kl_weight: 1.0e-6
+# Perceptual loss on the AE reconstruction vs target (frozen VGG by default).
+# >0 enables it; 0 disables (no-op). Backend pluggable: "vgg" now, "medical_sam" later.
+# perceptual_weights_path: optional local VGG16 weights (null/omitted -> torchvision pretrained).
+perceptual_weight: 0.1
+perceptual_backend: vgg
+# Geometric-only data augmentation (no intensity transforms). Disabled by default;
+# set enabled: true to turn it on. Applied to TRAIN slices only (val stays clean).
+augment:
+  enabled: true
+  flip_prob: 0.5          # per spatial axis (H, W)
+  rot90_prob: 0.5         # 90-degree rotations in the H-W plane
+  affine_prob: 0.3        # mild rotate/scale/translate
+  affine_rotate_deg: 5.0
+  affine_scale: 0.05
+  affine_translate: 0.02  # fraction of axis length

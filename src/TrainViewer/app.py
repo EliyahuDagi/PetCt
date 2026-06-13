@@ -332,6 +332,7 @@ def build_app(model=None):
                 slice_slider = gr.Slider(minimum=0, maximum=1, step=1, value=0, label="slice")
                 with gr.Row():
                     run_infer_btn = gr.Button("Run inference", variant="primary")
+                    infer_device = gr.Dropdown(choices=["cuda", "cpu"], value=cfg.device, label="device")
                     infer_status = gr.Textbox(value="idle", label="Status", interactive=False)
                 with gr.Row():
                     vmin_slider = gr.Slider(minimum=0.0, maximum=1.0, value=0.0, label="window min")
@@ -458,8 +459,9 @@ def build_app(model=None):
         load_best_btn.click(on_load_best, inputs=None, outputs=[ckpt_info])
 
         # --- inference (blocking) ---
-        def on_run_inference(infer_dir, ipatient, slice_idx, orient, *form_vals):
+        def on_run_inference(infer_dir, ipatient, slice_idx, orient, idevice, *form_vals):
             _dump_form(*form_vals)
+            cfg.device = idevice  # View-tab device wins over the Train-tab dropdown
             data_dirs = [infer_dir.strip()] if infer_dir and infer_dir.strip() else cfg.data_dirs
             pred, gt, meta, st = controller.run_inference_blocking(
                 data_dirs, _to_int(ipatient, 0), _to_int(slice_idx, 0)
@@ -491,7 +493,7 @@ def build_app(model=None):
 
         run_infer_btn.click(
             on_run_inference,
-            inputs=[infer_data_dir, infer_patient, slice_slider, orient_radio] + _form_inputs,
+            inputs=[infer_data_dir, infer_patient, slice_slider, orient_radio, infer_device] + _form_inputs,
             outputs=[infer_status, slice_slider, vmin_slider, vmax_slider,
                      img_pred, img_gt, img_diff, metrics_md, st_pred, st_gt],
         )

@@ -125,6 +125,26 @@ def run_ae3d(args, device):
     return recon[0, 0], vol[0, 0], vols
 
 
+def _cfg_model_fn(model, cond_lat, guidance):
+    """DDIM ``model_fn`` with classifier-free guidance (zero null condition).
+
+    eps = eps_uncond + w*(eps_cond - eps_uncond); w==1.0 (or <=0) is plain
+    conditional sampling. Only meaningful for cond-dropout-trained checkpoints.
+    """
+    g = float(guidance)
+    if g == 1.0 or g <= 0:
+        def model_fn(x_t, t):
+            return model(torch.cat([x_t, cond_lat], dim=1), t)
+        return model_fn
+    null_lat = torch.zeros_like(cond_lat)
+
+    def model_fn(x_t, t):
+        eps_c = model(torch.cat([x_t, cond_lat], dim=1), t)
+        eps_u = model(torch.cat([x_t, null_lat], dim=1), t)
+        return eps_u + g * (eps_c - eps_u)
+    return model_fn
+
+
 def run_diff2d(args, device):
     ae, _ = _load_model(args.ae_ckpt, build_autoencoder_2d, device, use_ema=args.use_ema)
     model, diff_config = _load_model(args.diff_ckpt, build_diffusion_2d, device, use_ema=args.use_ema)
@@ -133,15 +153,17 @@ def run_diff2d(args, device):
     if vols["pet_nac"] is None or vols["pet_ac"] is None:
         raise ValueError("NAC and AC PET volumes are both required for diff2d inference.")
 
+    # Latent normalization scale embedded in the diffusion config (default 1.0 keeps
+    # OLD checkpoints, which have no latent_scale key, running unchanged).
+    scale = float(diff_config.get("latent_scale", 1.0))
     nac_img = _slice_2d(vols["pet_nac"], args.slice, args.size)
     ac_img = _slice_2d(vols["pet_ac"], args.slice, args.size)
-    nac_lat = ae_encode(ae, nac_img)
+    nac_lat = ae_encode(ae, nac_img, scale=scale)
+    model_fn = _cfg_model_fn(model, nac_lat, getattr(args, "guidance_scale", 1.0))
 
-    def model_fn(x_t, t):
-        return model(torch.cat([x_t, nac_lat], dim=1), t)
-
-    x0 = schedule.ddim_sample(model_fn, nac_lat.shape, device, num_steps=args.ddim_steps, spacing=args.spacing)
-    pred = ae_decode(ae, x0)
+    # x0 is sampled in scaled latent space; ae_decode divides by scale.
+    x0 = schedule.ddim_sample(model_fn, nac_lat.shape, device, num_steps=args.ddim_steps, spacing=args.spacing, clip_x0=getattr(args, "clip_x0", 4.0))
+    pred = ae_decode(ae, x0, scale=scale)
     return pred[0, 0], ac_img[0, 0], vols
 
 
@@ -154,15 +176,17 @@ def run_ft3d(args, device):
     if vols["pet_nac"] is None or vols["pet_ac"] is None:
         raise ValueError("NAC and AC PET volumes are both required for ft3d inference.")
 
+    # Latent normalization scale embedded in the diffusion config (default 1.0 keeps
+    # OLD checkpoints, which have no latent_scale key, running unchanged).
+    scale = float(diff_config.get("latent_scale", 1.0))
     nac_vol = _resize_volume(vols["pet_nac"], args.size)
     ac_vol = _resize_volume(vols["pet_ac"], args.size)
-    nac_lat = ae3d_encode(ae, nac_vol)
+    nac_lat = ae3d_encode(ae, nac_vol, scale=scale)
+    model_fn = _cfg_model_fn(model, nac_lat, getattr(args, "guidance_scale", 1.0))
 
-    def model_fn(x_t, t):
-        return model(torch.cat([x_t, nac_lat], dim=1), t)
-
-    x0 = schedule.ddim_sample(model_fn, nac_lat.shape, device, num_steps=args.ddim_steps, spacing=args.spacing)
-    pred = ae3d_decode(ae, x0)
+    # x0 is sampled in scaled latent space; ae3d_decode divides by scale.
+    x0 = schedule.ddim_sample(model_fn, nac_lat.shape, device, num_steps=args.ddim_steps, spacing=args.spacing, clip_x0=getattr(args, "clip_x0", 4.0))
+    pred = ae3d_decode(ae, x0, scale=scale)
     return pred[0, 0], ac_vol[0, 0], vols
 
 
@@ -188,6 +212,13 @@ def main():
     parser.add_argument("--size", type=int, default=None, help="Input size; defaults per task")
     parser.add_argument("--ddim_steps", type=int, default=25, help="DDIM steps; Karras spacing reaches good quality in fewer steps")
     parser.add_argument("--spacing", choices=["linear", "karras"], default="karras", help="DDIM timestep spacing")
+    parser.add_argument("--clip_x0", type=float, default=4.0,
+                        help="Clamp per-step DDIM x0 estimate to [-clip_x0, clip_x0] (static "
+                             "thresholding); required for stable cosine-schedule sampling.")
+    parser.add_argument("--guidance_scale", type=float, default=1.0,
+                        help="Classifier-free guidance scale (eps_uncond + w*(eps_cond-eps_uncond), "
+                             "zero null condition). 1.0 = plain conditional. For cond-dropout-trained "
+                             "diffusion checkpoints; typical 1.5-3.0.")
     parser.add_argument("--use_ema", dest="use_ema", action="store_true", default=True, help="Use EMA weights if present (default)")
     parser.add_argument("--no_ema", dest="use_ema", action="store_false", help="Use raw (non-EMA) weights")
     parser.add_argument("--out", default=None)
@@ -206,9 +237,13 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     # Resolve the global --patient_index against all roots, then collapse to the
-    # single resolved root path so the runners (and a monkeypatched loader) keep
-    # calling load_patient_volumes(root, local_index). Falls back to the first
-    # root unchanged when enumeration finds nothing (e.g. synthetic test paths).
+    # single resolved PATIENT-FOLDER path so the runners (and a monkeypatched
+    # loader) keep calling load_patient_volumes(path, local_index=0). Note the
+    # collapsed path is a single patient folder, NOT a dataset root:
+    # load_patient_volumes detects this (its children are DICOM series, not
+    # patient folders) and loads it directly instead of re-enumerating one level
+    # too deep. Falls back to the first root unchanged when enumeration finds
+    # nothing (e.g. synthetic test paths).
     patients = enumerate_patients(args.data_dir, missing_ok=True)
     if patients:
         if args.patient_index >= len(patients):

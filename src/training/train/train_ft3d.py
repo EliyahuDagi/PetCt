@@ -15,14 +15,16 @@ import numpy as np
 import torch
 
 from src.training.data import (
-    PatientVolumeCache,
-    filter_paired_patients,
+    PrefetchingPatientCache,
+    filter_paired_patients_cached,
     load_patient_volumes,
-    make_patient_split,
+    make_patient_split3,
     sample_pair_volumes,
     sample_pair_volumes_full,
+    write_split_json,
 )
 from src.training.dataset_index import enumerate_patients
+from src.training.utils.augment import build_aug_3d
 from src.training.models.autoencoder3d import (
     ae3d_decode,
     ae3d_encode,
@@ -80,6 +82,25 @@ def load_frozen_ae(ae_ckpt, device):
     return ae, ae_config
 
 
+def compute_latent_scale(ae, sample_train_pair, n_batches=12, logger=None):
+    """Estimate the Stable-Diffusion-style latent-normalization scale.
+
+    Encodes a sample of AC latents (RAW, scale=1.0) and returns 1/(std + eps) so
+    the scaled latents have ~unit std -- matching the N(0,1) noise the DDIM sampler
+    starts from. Computed once at the start of diffusion training and stored in the
+    config (embedded into the checkpoint) so inference/eval reuse the same value.
+    """
+    samples = []
+    for _ in range(max(1, n_batches)):
+        nac_vol, ac_vol = sample_train_pair()
+        samples.append(ae3d_encode(ae, ac_vol).flatten())
+    std = float(torch.cat(samples).std().cpu())
+    scale = 1.0 / (std + 1e-8)
+    if logger is not None:
+        logger.info("Computed latent_scale=%.6f (AC latent std=%.6f over %d batches)", scale, std, max(1, n_batches))
+    return scale
+
+
 def diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma=None):
     """Predict noise added to the AC latent, conditioned on the NAC latent.
 
@@ -101,22 +122,25 @@ def diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma=None):
     return loss, x_t, timesteps, pred, noise
 
 
-def x0_decode_in_graph(ae, schedule, x_t, timesteps, pred):
+def x0_decode_in_graph(ae, schedule, x_t, timesteps, pred, latent_scale=1.0):
     """Decode the one-step x0 estimate to image space, keeping the graph intact.
 
     Same formula ``_validate`` uses, but ``ae3d_decode`` is wrapped in ``no_grad``;
     for a perceptual *training* term gradients must reach the UNet, so call the 3D
     AE decoder directly (the AE is frozen, so its params are not updated -- the
-    gradient just passes through it back to ``pred``).
+    gradient just passes through it back to ``pred``). ``x0_pred`` lives in scaled
+    latent space, so divide by ``latent_scale`` before decoding (no-op at 1.0).
     """
     acp = schedule.alphas_cumprod[timesteps]
     sqrt_acp = schedule._broadcast(torch.sqrt(acp), x_t)
     sqrt_one_minus = schedule._broadcast(torch.sqrt(1.0 - acp), x_t)
     x0_pred = (x_t - sqrt_one_minus * pred) / sqrt_acp
+    if latent_scale and latent_scale > 0 and latent_scale != 1.0:
+        x0_pred = x0_pred / latent_scale
     return ae.decode(x0_pred)
 
 
-def perceptual_term(perceptual, ae, schedule, x_t, timesteps, pred, ac_vol, weight):
+def perceptual_term(perceptual, ae, schedule, x_t, timesteps, pred, ac_vol, weight, latent_scale=1.0):
     """Weighted perceptual loss on the in-graph decoded 3D x0 vs the AC volume.
 
     The 2D backbone runs slice-wise across the three planes (handled inside the
@@ -125,7 +149,7 @@ def perceptual_term(perceptual, ae, schedule, x_t, timesteps, pred, ac_vol, weig
     """
     if perceptual is None or not weight or weight <= 0:
         return None, 0.0
-    recon = x0_decode_in_graph(ae, schedule, x_t, timesteps, pred)
+    recon = x0_decode_in_graph(ae, schedule, x_t, timesteps, pred, latent_scale)
     pterm = perceptual(recon, ac_vol) * float(weight)
     return pterm, float(pterm.detach().cpu())
 
@@ -140,6 +164,9 @@ def main():
     parser.add_argument("--steps_per_epoch", type=int, default=20)
     parser.add_argument("--val_every", type=int, default=10)
     parser.add_argument("--val_fraction", type=float, default=0.2)
+    parser.add_argument("--test_fraction", type=float, default=0.1,
+                        help="By-patient TEST holdout fraction (multi-patient only). "
+                             "Test patients are excluded from BOTH train and val.")
     parser.add_argument("--val_batches", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
@@ -151,6 +178,16 @@ def main():
         help="Override the perceptual-loss weight (0 disables it). Default comes from the config.",
     )
     parser.add_argument("--inflate_from", default=None, help="Optional 2D diffusion checkpoint to inflate")
+    parser.add_argument("--prefetch", type=int, default=0,
+                        help="Background patient-prefetch depth (0 = synchronous, default). "
+                             ">0 overlaps DICOM I/O with GPU compute via a worker thread.")
+    parser.add_argument("--cache_size", type=int, default=None,
+                        help="Override the resident patient-cache size (default auto).")
+    parser.add_argument("--cache_dir", default=None,
+                        help="SSD pre-cache dir (or $PETCT_CACHE_DIR). Empty/None = pure DICOM "
+                             "(unchanged behavior). Hits skip DICOM; see src.training.precache.")
+    parser.add_argument("--rescan_pairs", action="store_true",
+                        help="Force a fresh NAC/AC pairing scan, ignoring the cached manifest.")
     parser.add_argument("--save_dir", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -257,14 +294,20 @@ def main():
     rng = np.random.RandomState(seed)
     batch_size = int(config.get("batch_size", 1))
 
+    # Geometric-only 3D train augmentation (no-op identity unless config opts in),
+    # layered on top of the existing crop/flip/rot90. The SAME geometry is applied
+    # to NAC and AC (paired). Val passes geo_aug=None for a stable metric.
+    train_aug = build_aug_3d(config.get("augment"))
+
     # Diffusion requires paired NAC+AC. Enumerate across roots, keep only paired
     # patients (logging skips). <=1 paired patient -> legacy within-patient split.
     patients = enumerate_patients(args.data_dir, missing_ok=True)
     if len(patients) > 1:
-        patients = filter_paired_patients(patients, log=logger.info)
+        patients = filter_paired_patients_cached(patients, rescan=args.rescan_pairs, log=logger.info, cache_dir=args.cache_dir)
         if not patients:
             raise ValueError("No paired NAC+AC patients found for ft3d across the given roots.")
     multi_patient = len(patients) > 1
+    cache = None  # set in the multi-patient branch; closed after training
 
     if not multi_patient:
         vols = load_patient_volumes(args.data_dir[0], args.patient_index, device=device)
@@ -273,32 +316,63 @@ def main():
         logger.info("Training on 1 patient (train 1 / val 1) across %d roots.", len(args.data_dir))
 
         def sample_train_pair():
-            return sample_pair_volumes(vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, "train", args.val_fraction, rng)
+            return sample_pair_volumes(vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, "train", args.val_fraction, rng, geo_aug=train_aug)
 
         def sample_val_pair():
-            return sample_pair_volumes(vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, "val", args.val_fraction, rng)
+            return sample_pair_volumes(vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, "val", args.val_fraction, rng, geo_aug=None)
     else:
-        cache = PatientVolumeCache(patients, device=device, max_cached=4)
-        train_idx, val_idx = make_patient_split(len(patients), args.val_fraction, seed)
+        train_idx, val_idx, test_idx = make_patient_split3(
+            len(patients), args.val_fraction, args.test_fraction, seed)
         logger.info(
-            "Training on %d patients (train %d / val %d) across %d roots.",
-            len(patients), len(train_idx), len(val_idx), len(args.data_dir),
+            "Training on %d patients (train %d / val %d / test %d) across %d roots. "
+            "Test patients are held out from training entirely.",
+            len(patients), len(train_idx), len(val_idx), len(test_idx), len(args.data_dir),
         )
+        split_path = write_split_json(
+            save_dir, TASK, patients, train_idx, val_idx, test_idx,
+            args.val_fraction, args.test_fraction, seed)
+        if split_path:
+            logger.info("Wrote by-patient split to %s.", split_path)
+        # Opt-in async prefetch: prefetch>0 overlaps the per-patient DICOM read with
+        # GPU compute. prefetch==0 keeps the synchronous LRU path byte-identical.
+        cache_kwargs = {} if args.cache_size is None else {"max_cached": args.cache_size}
+        cache = PrefetchingPatientCache(
+            patients, device=device, prefetch=args.prefetch,
+            train_indices=train_idx, rng=rng, cache_dir=args.cache_dir, **cache_kwargs,
+        ).start()
 
-        def _sample_from(indices, augment):
+        def _sample_sync(indices, augment, geo_aug=None):
             idx = int(indices[rng.randint(0, len(indices))])
             vols = cache.get(idx)
             return sample_pair_volumes_full(
-                vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, rng, augment=augment
+                vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, rng, augment=augment, geo_aug=geo_aug
             )
 
-        # Train augments (random crop/flip/rotation) so the small paired pool
-        # yields diverse 3D examples; val stays clean for a stable metric.
+        # Train augments (random crop/flip/rotation + optional MONAI geo) so the small
+        # paired pool yields diverse 3D examples; val stays clean for a stable metric.
         def sample_train_pair():
-            return _sample_from(train_idx, True)
+            if args.prefetch <= 0:
+                return _sample_sync(train_idx, True, geo_aug=train_aug)
+            _, vols = cache.next_train()
+            return sample_pair_volumes_full(
+                vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, rng, augment=True, geo_aug=train_aug
+            )
 
         def sample_val_pair():
-            return _sample_from(val_idx, False)
+            return _sample_sync(val_idx, False, geo_aug=None)
+
+    # Latent normalization: scale RAW AE latents to ~unit std so the DDIM sampler's
+    # N(0,1) start matches the latent distribution. A non-null config value pins the
+    # scale (lets the user fix it / resume deterministically); otherwise compute it
+    # once from a sample of AC latents. Stored in config -> embedded in the checkpoint
+    # so inference/eval reuse the exact same scale.
+    cfg_scale = config.get("latent_scale")
+    if cfg_scale is not None and float(cfg_scale) > 0:
+        latent_scale = float(cfg_scale)
+        logger.info("Using configured latent_scale=%.6f", latent_scale)
+    else:
+        latent_scale = compute_latent_scale(ae, sample_train_pair, logger=logger)
+    config["latent_scale"] = float(latent_scale)
 
     steps_per_epoch = int(args.steps_per_epoch)
     total_steps = int(args.epochs) * steps_per_epoch
@@ -322,12 +396,14 @@ def main():
     for global_step in range(start_step, total_steps):
         epoch = global_step // max(1, steps_per_epoch)
         nac_vol, ac_vol = sample_train_pair()
-        ac_lat = ae3d_encode(ae, ac_vol)
-        nac_lat = ae3d_encode(ae, nac_vol)
+        # Both the target AC latent and the NAC conditioning latent live in the SAME
+        # scaled latent space (NAC is channel-concatenated to the noisy AC).
+        ac_lat = ae3d_encode(ae, ac_vol, scale=latent_scale)
+        nac_lat = ae3d_encode(ae, nac_vol, scale=latent_scale)
         model.train()
         optimizer.zero_grad(set_to_none=True)
         mse_loss, x_t, timesteps, pred, _ = diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma)
-        pterm, pval = perceptual_term(perceptual, ae, schedule, x_t, timesteps, pred, ac_vol, perceptual_weight)
+        pterm, pval = perceptual_term(perceptual, ae, schedule, x_t, timesteps, pred, ac_vol, perceptual_weight, latent_scale)
         loss = mse_loss if pterm is None else mse_loss + pterm
         loss.backward()
         optimizer.step()
@@ -340,24 +416,26 @@ def main():
         metrics_writer.log("train", global_step, metrics, epoch)
 
         if args.val_every > 0 and global_step % args.val_every == 0:
-            val_metrics = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma)
+            val_metrics = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma, latent_scale)
             logger.info("VAL step=%s loss=%.6f l1=%.6f", global_step, val_metrics["loss"], val_metrics["l1"])
             metrics_writer.log("val", global_step, val_metrics, epoch)
             is_best = val_metrics["loss"] < best_val
             best_val = min(best_val, val_metrics["loss"])
             save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, global_step + 1, epoch, val_metrics["loss"], best_val, ema), is_best)
 
-    final_val = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma)
+    final_val = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma, latent_scale)
     metrics_writer.log("val", total_steps, final_val, int(args.epochs))
     is_best = final_val["loss"] < best_val
     best_val = min(best_val, final_val["loss"])
     save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, total_steps, int(args.epochs), final_val["loss"], best_val, ema), is_best)
     metrics_writer.close()
+    if cache is not None:
+        cache.close()
     logger.info("Training finished. best_val_loss=%.6f", best_val)
 
 
 @torch.no_grad()
-def _validate(model, raw_model, ema, ae, schedule, sample_val_pair, n_batches, snr_gamma=None):
+def _validate(model, raw_model, ema, ae, schedule, sample_val_pair, n_batches, snr_gamma=None, latent_scale=1.0):
     # Evaluate under the EMA weights when available -- consistently higher quality.
     # The EMA swap targets raw_model (shared params); forward still runs via model.
     ctx = ema.average_parameters(raw_model) if ema is not None else _null_context(raw_model)
@@ -367,14 +445,16 @@ def _validate(model, raw_model, ema, ae, schedule, sample_val_pair, n_batches, s
         n = max(1, n_batches)
         for _ in range(n):
             nac_vol, ac_vol = sample_val_pair()
-            ac_lat = ae3d_encode(ae, ac_vol)
-            nac_lat = ae3d_encode(ae, nac_vol)
+            # Same scaled latent space as training (NAC + AC scaled identically).
+            ac_lat = ae3d_encode(ae, ac_vol, scale=latent_scale)
+            nac_lat = ae3d_encode(ae, nac_vol, scale=latent_scale)
             loss, x_t, timesteps, pred, noise = diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma)
+            # x0_pred is in scaled latent space; ae3d_decode divides by scale.
             acp = schedule.alphas_cumprod[timesteps]
             sqrt_acp = schedule._broadcast(torch.sqrt(acp), x_t)
             sqrt_one_minus = schedule._broadcast(torch.sqrt(1.0 - acp), x_t)
             x0_pred = (x_t - sqrt_one_minus * pred) / sqrt_acp
-            recon = ae3d_decode(ae, x0_pred)
+            recon = ae3d_decode(ae, x0_pred, scale=latent_scale)
             accum["loss"] += float(loss.cpu())
             accum["l1"] += float(torch.mean(torch.abs(recon - ac_vol)).cpu())
             # Image-quality metrics of the decoded 3D prediction vs AC reference.

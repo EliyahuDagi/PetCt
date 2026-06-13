@@ -63,15 +63,29 @@ def build_autoencoder_3d(config):
 
 
 @torch.no_grad()
-def ae3d_encode(model, x):
-    """Encode a volume (B,1,D,H,W) to the latent mean (B,C,d,h,w)."""
+def ae3d_encode(model, x, scale=1.0):
+    """Encode a volume (B,1,D,H,W) to the latent mean (B,C,d,h,w).
+
+    ``scale`` (Stable-Diffusion-style latent normalization): the returned latent is
+    multiplied by ``scale`` so diffusion operates on ~unit-std latents. The default
+    ``scale=1.0`` (or any non-positive value) is an exact no-op, leaving the AE
+    training/reconstruction stages unchanged.
+    """
     out = model.encode(x)
-    if isinstance(out, (tuple, list)):
-        return out[0]
-    return out
+    z = out[0] if isinstance(out, (tuple, list)) else out
+    if scale and scale > 0 and scale != 1.0:
+        z = z * scale
+    return z
 
 
 @torch.no_grad()
-def ae3d_decode(model, z):
-    """Decode a latent volume (B,C,d,h,w) back to image space (B,1,D,H,W)."""
+def ae3d_decode(model, z, scale=1.0):
+    """Decode a latent volume (B,C,d,h,w) back to image space (B,1,D,H,W).
+
+    ``scale`` undoes the encode-time latent normalization: the incoming latent is
+    divided by ``scale`` before decoding. The default ``scale=1.0`` (or any
+    non-positive value) is an exact no-op.
+    """
+    if scale and scale > 0 and scale != 1.0:
+        z = z / scale
     return model.decode(z)
