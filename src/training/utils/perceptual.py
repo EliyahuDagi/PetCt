@@ -14,9 +14,17 @@ Design:
       the 2D backbone slice-wise, averaging -- so one loss object serves diff2d
       (2D) and ft3d (3D).
     * ``VGGPerceptualLoss`` -- torchvision VGG16 feature distance (frozen, eval).
+      Takes decoded IMAGES; 2.5D on volumes (slice-wise, no volumetric context).
+    * ``LatentDecoderPerceptualLoss`` (backend ``"lpl"``) -- distance between the
+      frozen AE decoder's own intermediate features (arXiv 2411.04873). Takes
+      LATENTS, is natively volumetric, needs no external weights, and stops the
+      decoder forward at the deepest tap so the full-resolution tail never runs.
     * ``build_perceptual_loss(name=..., **kw)`` -- factory. Returns ``None`` when
       the requested backend (or its weights) is unavailable, so training proceeds
-      without the term (the train scripts treat ``None`` as a no-op).
+      without the term (the train scripts treat ``None`` as a no-op). The ``"lpl"``
+      backend is exempt: it needs no weights, so it raises rather than returning
+      ``None`` -- a silent no-op there would masquerade as the perceptual arm of an
+      A/B while really training the plain-MSE control.
 
 Gradients: the backbone is eval + ``requires_grad_(False)`` (no parameter grads),
 but it is *not* wrapped in ``no_grad`` -- gradients flow through it back to the
@@ -55,6 +63,10 @@ class PerceptualLoss(nn.Module):
     ``(N,1,H,W)`` or 3D ``(N,1,D,H,W)`` inputs; 3D is reduced to a sampled set of
     2D slices across the three orthogonal planes and averaged.
     """
+
+    # Image-space backends compare DECODED images. The latent-space backend below
+    # overrides this so the train step knows to hand it latents (and skip the decode).
+    consumes_latents = False
 
     def __init__(self, slices_per_plane=4):
         super().__init__()
@@ -130,10 +142,13 @@ class VGGPerceptualLoss(PerceptualLoss):
         # batchnorm-free VGG features are deterministic; grads still flow.
         return super().train(False)
 
-    def _prep(self, x):
-        # 1 channel -> 3, per-sample min-max to [0,1], then ImageNet normalize.
+    def _prep(self, x, ref):
+        # 1 channel -> 3, then ImageNet normalize. The min-max range is taken from
+        # the SHARED reference (the ground-truth target) so pred and target are scaled
+        # by the SAME range -- this keeps the term intensity-AWARE (an intensity-shifted
+        # pred no longer collapses to zero) while still mapping into ~[0,1] for VGG.
         x = x.float()
-        flat = x.flatten(1)
+        flat = ref.float().flatten(1)
         lo = flat.min(dim=1, keepdim=True)[0].view(-1, 1, 1, 1)
         hi = flat.max(dim=1, keepdim=True)[0].view(-1, 1, 1, 1)
         x = (x - lo) / (hi - lo + 1.0e-6)
@@ -141,13 +156,127 @@ class VGGPerceptualLoss(PerceptualLoss):
         return (x - self._mean) / self._std
 
     def _feature_distance_2d(self, pred, target):
-        p = self._prep(pred)
-        t = self._prep(target)
+        # Shared (target-derived) normalization -> intensity sensitivity (FIX A).
+        p = self._prep(pred, target)
+        t = self._prep(target, target)
         dist = pred.new_zeros(())
         for block in self.blocks:
             p = block(p)
             t = block(t)
-            dist = dist + F.l1_loss(p, t)
+            # LPIPS-style unit-normalize each block's features along the CHANNEL dim
+            # before the L1 so per-block distances are scale-stable and the weight is
+            # interpretable/bounded (FIX C). The 1e-10 eps guards near-constant inputs.
+            p_norm = p / (p.norm(dim=1, keepdim=True) + 1.0e-10)
+            t_norm = t / (t.norm(dim=1, keepdim=True) + 1.0e-10)
+            dist = dist + F.l1_loss(p_norm, t_norm)
+        return dist
+
+
+class LatentDecoderPerceptualLoss(nn.Module):
+    """Latent perceptual loss (LPL) on the frozen AE decoder's own features.
+
+    After *Boosting Latent Diffusion with Perceptual Objectives* (arXiv 2411.04873):
+    instead of decoding the latent all the way to pixels and running an external
+    backbone (VGG), compare the **decoder's intermediate features** for the predicted
+    and the true latent. Advantages here:
+
+      * **Natively volumetric.** The VGG path is 2.5D -- a 2D backbone run slice-wise
+        with no volumetric receptive field. These features are whatever the 3D AE
+        already computes, so the term sees real 3D context.
+      * **Much cheaper.** The forward stops at the deepest tap, so the expensive
+        high-resolution tail (final Upsample -> GroupNorm -> output conv, at full
+        64^3) never runs, and there are no 12 slice-wise VGG passes per micro-batch.
+      * **No external weights**, so it cannot silently degrade to a no-op the way a
+        failed VGG/MedicalNet download does.
+
+    IMPORTANT -- this backend consumes **LATENTS**, not images: ``forward(pred_lat,
+    target_lat)`` where both are in *unscaled* latent space (divide by
+    ``latent_scale`` first; a no-op at the flow default of 1.0). Every other backend
+    in this module takes decoded images. The callable contract
+    ``(pred, target) -> scalar`` is otherwise identical.
+
+    Structure it relies on (MONAI ``AutoencoderKL``): ``decode(z)`` is exactly
+    ``decoder(post_quant_conv(z))`` and ``decoder`` holds a single flat
+    ``blocks`` ModuleList, each called as ``blk(h)``.
+    """
+
+    # Signals the train step to pass LATENTS (and skip the pixel decode entirely).
+    consumes_latents = True
+
+    def __init__(self, ae, taps=None, tap_weights=None, n_taps=3):
+        super().__init__()
+        blocks = getattr(getattr(ae, "decoder", None), "blocks", None)
+        if blocks is None or len(blocks) < 3:
+            raise RuntimeError(
+                "LPL needs an AE whose .decoder has a 'blocks' ModuleList "
+                "(MONAI AutoencoderKL); got %r" % type(getattr(ae, "decoder", None)).__name__
+            )
+        # Hold the AE OUTSIDE the module tree (tuple, not attribute assignment) so its
+        # frozen parameters are not registered here -- otherwise they would show up in
+        # .parameters() and could be picked up by the optimizer/EMA/checkpoint.
+        self._ae_ref = (ae,)
+        n = len(blocks)
+        if taps is None:
+            # Auto: evenly spaced interior blocks, stopping BEFORE the last Upsample.
+            # Rationale: the whole point of LPL here is to skip the decoder's
+            # full-resolution tail. For the ae3d_p decoder the blocks are
+            #   0 Conv | 1-5 Res/Attn @16^3 | 6 Up ->32^3 | 7-8 Res | 9 Up ->64^3 |
+            #   10-11 Res @64^3 | 12-13 GroupNorm+outConv
+            # so capping the deepest tap below block 9 means the entire 64^3 stage
+            # never runs. Block 0 is skipped too (a near-linear map of the latent).
+            ups = [i for i, b in enumerate(blocks) if "upsample" in type(b).__name__.lower()]
+            hi = ups[-1] if ups else max(2, n - 2)
+            span = list(range(1, hi)) or [max(0, n - 3)]
+            k = max(1, min(int(n_taps), len(span)))
+            taps = sorted({span[int(round(i * (len(span) - 1) / max(1, k - 1)))] for i in range(k)})
+        taps = sorted({int(t) for t in taps})
+        if any(t < 0 or t >= n for t in taps):
+            raise ValueError("LPL taps %r out of range for %d decoder blocks" % (taps, n))
+        self.taps = taps
+        self.last_tap = max(taps)
+        if tap_weights is None:
+            tap_weights = [1.0] * len(taps)
+        if len(tap_weights) != len(taps):
+            raise ValueError("tap_weights length %d != taps length %d" % (len(tap_weights), len(taps)))
+        self.tap_weights = [float(w) for w in tap_weights]
+        self.eval()
+
+    def train(self, mode=True):
+        # The AE is frozen; stay in eval so decoder norms behave deterministically.
+        return super().train(False)
+
+    @property
+    def ae(self):
+        return self._ae_ref[0]
+
+    def _features(self, z):
+        """Run the decoder only as far as the deepest tap, collecting tap features."""
+        ae = self.ae
+        h = ae.post_quant_conv(z.float())
+        feats = []
+        for i, blk in enumerate(ae.decoder.blocks):
+            h = blk(h)
+            if i in self.taps:
+                feats.append(h)
+            if i >= self.last_tap:
+                break
+        return feats
+
+    def forward(self, pred, target):
+        if pred.shape != target.shape:
+            raise ValueError("LPL: pred/target shape mismatch %s vs %s" % (pred.shape, target.shape))
+        p_feats = self._features(pred)
+        # The target branch is a constant w.r.t. the optimizer -- no graph needed.
+        with torch.no_grad():
+            t_feats = self._features(target)
+        dist = pred.new_zeros((), dtype=torch.float32)
+        for w, p, t in zip(self.tap_weights, p_feats, t_feats):
+            # Per-channel unit-normalize before the distance (same trick as the VGG
+            # path's FIX C) so each tap contributes on a comparable scale and the
+            # configured weight stays interpretable. LPL uses a squared (L2) distance.
+            p_n = p / (p.norm(dim=1, keepdim=True) + 1.0e-10)
+            t_n = t / (t.norm(dim=1, keepdim=True) + 1.0e-10)
+            dist = dist + w * F.mse_loss(p_n, t_n.detach())
         return dist
 
 
@@ -190,11 +319,43 @@ def build_perceptual_loss(name="vgg", device=None, **kwargs):
     unavailable, so training proceeds without the perceptual term and just logs a
     warning. Add new backends here (e.g. ``"medical_sam"``) without touching the
     train scripts -- they only see the returned callable.
+
+    EXCEPTION: the ``"lpl"`` backend RAISES instead of returning ``None``. It needs no
+    downloaded weights, so any failure is a wiring bug, and a silent ``None`` there would
+    quietly turn the perceptual arm of an A/B into the plain-MSE control.
+
+    ``**kwargs`` may contain the union of all backends' options (the caller cannot know
+    which backend the config picks); each branch selects only the keys it accepts.
     """
     name = (name or "vgg").lower()
+
+    # The train scripts pass the UNION of every backend's kwargs (they cannot know which
+    # backend the config selects), so each branch must take only what it accepts. Passing
+    # the union through verbatim made VGG raise TypeError -> silent None -> the perceptual
+    # term vanished while the log still claimed it was enabled. Filter, do not forward.
+    def _only(*names):
+        return {k: v for k, v in kwargs.items() if k in names and v is not None}
+
+    if name == "lpl":
+        # Deliberately NOT wrapped in the try/except-return-None below. LPL needs no
+        # downloaded weights, so a failure here is a genuine wiring bug (wrong AE type,
+        # bad tap indices) -- and a silent None would masquerade as the perceptual arm
+        # of an A/B while actually training the plain-MSE control. Fail loudly instead.
+        # NOTE: consumes LATENTS, not images -- see LatentDecoderPerceptualLoss.
+        lpl_kwargs = _only("ae", "taps", "tap_weights", "n_taps")
+        if "ae" not in lpl_kwargs:
+            raise ValueError("the 'lpl' perceptual backend requires ae=<frozen AutoencoderKL>")
+        loss = LatentDecoderPerceptualLoss(**lpl_kwargs)
+        logger.info("LPL perceptual loss enabled on decoder taps %s (of %d blocks); "
+                    "no external weights, natively volumetric",
+                    loss.taps, len(loss.ae.decoder.blocks))
+        # Not moved to `device`: it registers no parameters of its own and the frozen
+        # AE it borrows already lives on the right device.
+        return loss
+
     try:
         if name == "vgg":
-            loss = VGGPerceptualLoss(**kwargs)
+            loss = VGGPerceptualLoss(**_only("slices_per_plane", "weights_path", "layers"))
         else:
             warnings.warn("unknown perceptual backend %r; perceptual loss disabled" % name)
             return None
