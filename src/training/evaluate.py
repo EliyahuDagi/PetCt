@@ -51,6 +51,7 @@ import argparse
 import json
 import math
 import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -66,7 +67,7 @@ from src.training.models.autoencoder2d import ae_decode, ae_encode, build_autoen
 from src.training.models.autoencoder3d import ae3d_decode, ae3d_encode, build_autoencoder_3d
 from src.training.models.diffusion2d import build_diffusion_2d
 from src.training.models.diffusion3d import build_diffusion_3d
-from src.training.utils.image_metrics import image_quality_metrics
+from src.training.utils.image_metrics import clamp_unit, image_quality_metrics
 # Reuse the exact loaders/helpers inference uses, so eval and the GUI agree.
 from src.training.infer import (
     _load_model,
@@ -74,6 +75,7 @@ from src.training.infer import (
     _schedule_from_config,
     _slice_2d,
 )
+from src.training.utils.translate import sample_nac_to_ac
 
 DEFAULT_SIZE = {"diff2d": 128, "ft3d": 64}
 DEFAULT_AE = {"diff2d": "outputs/ae2d/best.pt", "ft3d": "outputs/ae3d/best.pt"}
@@ -81,7 +83,7 @@ DEFAULT_AE = {"diff2d": "outputs/ae2d/best.pt", "ft3d": "outputs/ae3d/best.pt"}
 # src/training/utils/image_metrics.py for the SUV-calibration caveat).
 METRIC_KEYS = [
     "psnr", "ssim", "nrmse", "mae",
-    "rel_bias", "max_rel_error", "voxel_r2",
+    "rel_bias", "max_rel_error", "p95_rel_error", "hot_band_rel_error", "voxel_r2",
     "reg_slope", "reg_intercept",
     "ba_mean_bias", "ba_loa_lower", "ba_loa_upper",
 ]
@@ -173,29 +175,6 @@ def _slice_indices(z, num_slices):
     return [int(round(x)) for x in np.linspace(0.05 * z, 0.95 * z - 1, num=num_slices)]
 
 
-def _cfg_model_fn(model, cond_lat, guidance):
-    """Build the DDIM ``model_fn(x_t, t)`` with classifier-free guidance.
-
-    With guidance ``w``: eps = eps_uncond + w*(eps_cond - eps_uncond), where the
-    unconditional pass uses a zero (null) conditioning latent -- matching the
-    cond-dropout null used in training. ``w==1.0`` is plain conditional sampling
-    (single pass); ``w<=0`` is treated as 1.0.
-    """
-    g = float(guidance)
-    cat = torch.cat
-    if g == 1.0 or g <= 0:
-        def model_fn(x_t, t):
-            return model(cat([x_t, cond_lat], dim=1), t)
-        return model_fn
-    null_lat = torch.zeros_like(cond_lat)
-
-    def model_fn(x_t, t):
-        eps_c = model(cat([x_t, cond_lat], dim=1), t)
-        eps_u = model(cat([x_t, null_lat], dim=1), t)
-        return eps_u + g * (eps_c - eps_u)
-    return model_fn
-
-
 @torch.no_grad()
 def _eval_diff2d(args, device, candidates):
     ae, _ = _load_model(args.ae_ckpt, build_autoencoder_2d, device, use_ema=args.use_ema)
@@ -203,6 +182,12 @@ def _eval_diff2d(args, device, candidates):
     schedule = _schedule_from_config(diff_config, device)
     # Latent normalization scale from the diffusion config (default 1.0 keeps OLD
     # checkpoints, which have no latent_scale key, running unchanged).
+    if "latent_scale" not in diff_config:
+        warnings.warn(
+            "latent_scale not found in the diffusion config; assuming identity "
+            "scaling (1.0). This is correct only for OLD checkpoints saved before "
+            "latent_scale was recorded."
+        )
     scale = float(diff_config.get("latent_scale", 1.0))
 
     per_patient = []
@@ -218,11 +203,15 @@ def _eval_diff2d(args, device, candidates):
             nac_img = _slice_2d(vols["pet_nac"], s, args.size)
             ac_img = _slice_2d(vols["pet_ac"], s, args.size)
             nac_lat = ae_encode(ae, nac_img, scale=scale)
-            model_fn = _cfg_model_fn(model, nac_lat, args.guidance_scale)
 
+            # Shared flow-vs-epsilon decision (see src/training/utils/translate.py).
             # x0 is sampled in scaled latent space; ae_decode divides by scale.
-            x0 = schedule.ddim_sample(model_fn, nac_lat.shape, device, num_steps=args.ddim_steps, spacing=args.spacing, clip_x0=args.clip_x0)
-            pred = ae_decode(ae, x0, scale=scale)
+            x0 = sample_nac_to_ac(
+                model, schedule, nac_lat, diff_config,
+                num_steps=args.ddim_steps, spacing=args.spacing,
+                guidance_scale=args.guidance_scale, clip_x0=args.clip_x0, tag="diff2d",
+            )
+            pred = clamp_unit(ae_decode(ae, x0, scale=scale), args.clamp_output)
             slice_metrics.append(image_quality_metrics(pred, ac_img))
         if slice_metrics:
             # Per-slice mean, filtering non-finite (voxel_r2 / slope can be NaN on
@@ -232,6 +221,8 @@ def _eval_diff2d(args, device, candidates):
                 vals = [m[k] for m in slice_metrics if math.isfinite(m[k])]
                 agg[k] = float(np.mean(vals)) if vals else float("nan")
             agg["n_slices"] = len(slice_metrics)
+            # See the ft3d branch: identifies the patient so runs can be compared PAIRED.
+            agg["patient"] = str(patient)
             per_patient.append(agg)
             print(f"[diff2d] {len(per_patient)} eval'd (cand {pi+1}) "
                   f"ssim={agg['ssim']:.4f} psnr={agg['psnr']:.2f} nrmse={agg['nrmse']:.4f}")
@@ -245,6 +236,12 @@ def _eval_ft3d(args, device, candidates):
     schedule = _schedule_from_config(diff_config, device)
     # Latent normalization scale from the diffusion config (default 1.0 keeps OLD
     # checkpoints, which have no latent_scale key, running unchanged).
+    if "latent_scale" not in diff_config:
+        warnings.warn(
+            "latent_scale not found in the diffusion config; assuming identity "
+            "scaling (1.0). This is correct only for OLD checkpoints saved before "
+            "latent_scale was recorded."
+        )
     scale = float(diff_config.get("latent_scale", 1.0))
 
     per_patient = []
@@ -257,12 +254,24 @@ def _eval_ft3d(args, device, candidates):
         nac_vol = _resize_volume(vols["pet_nac"], args.size)
         ac_vol = _resize_volume(vols["pet_ac"], args.size)
         nac_lat = ae3d_encode(ae, nac_vol, scale=scale)
-        model_fn = _cfg_model_fn(model, nac_lat, args.guidance_scale)
 
+        # Shared flow-vs-epsilon decision (see src/training/utils/translate.py).
         # x0 is sampled in scaled latent space; ae3d_decode divides by scale.
-        x0 = schedule.ddim_sample(model_fn, nac_lat.shape, device, num_steps=args.ddim_steps, spacing=args.spacing)
-        pred = ae3d_decode(ae, x0, scale=scale)
+        # NOTE: this ft3d eval path historically passed NO clip_x0 to ddim_sample
+        # (unlike infer.run_ft3d which uses 4.0); clip_x0=None preserves that.
+        x0 = sample_nac_to_ac(
+            model, schedule, nac_lat, diff_config,
+            num_steps=args.ddim_steps, spacing=args.spacing,
+            guidance_scale=args.guidance_scale, clip_x0=None, tag="ft3d",
+        )
+        pred = clamp_unit(ae3d_decode(ae, x0, scale=scale), args.clamp_output)
         m = image_quality_metrics(pred, ac_vol)
+        # Record WHICH patient, so two eval runs can be compared PAIRED (same patient,
+        # same AE, same split) instead of by mean. The expected effect of a loss-shaping
+        # arm is ~1%, far below the between-patient SD, so paired is the only sensitive
+        # test -- see scripts/_cmp_eval_paired.py. Non-numeric, and _aggregate iterates
+        # METRIC_KEYS only, so this cannot leak into the summary.
+        m["patient"] = str(patient)
         per_patient.append(m)
         print(f"[ft3d] {len(per_patient)} eval'd (cand {pi+1}) "
               f"ssim={m['ssim']:.4f} psnr={m['psnr']:.2f} nrmse={m['nrmse']:.4f}")
@@ -307,6 +316,13 @@ def main():
                         help="Static thresholding: clamp the per-step DDIM x0 estimate to "
                              "[-clip_x0, clip_x0]. Required for stable sampling under the cosine "
                              "schedule (terminal SNR ~0 otherwise explodes). 0/negative disables.")
+    parser.add_argument("--clamp_output", dest="clamp_output", action="store_true", default=True,
+                        help="Clamp the decoded prediction to the valid [0,1] intensity range "
+                             "(default). normalize_volume clips every GT volume to [0,1], so a "
+                             "prediction outside it is invalid; the AE decoder's linear output "
+                             "conv overshoots at hot-spot edges.")
+    parser.add_argument("--no_clamp_output", dest="clamp_output", action="store_false",
+                        help="Disable the [0,1] clamp -- reproduces pre-clamp numbers.")
     parser.add_argument("--guidance_scale", type=float, default=1.0,
                         help="Classifier-free guidance scale w: eps = eps_uncond + w*(eps_cond-"
                              "eps_uncond), uncond pass uses a zero NAC latent. 1.0 = plain "
@@ -364,13 +380,19 @@ def main():
         "ddim_steps": args.ddim_steps,
         "spacing": args.spacing,
         "clip_x0": args.clip_x0,
+        "clamp_output": args.clamp_output,
         "guidance_scale": args.guidance_scale,
         "use_ema": args.use_ema,
         "ae_ckpt": args.ae_ckpt,
         "diff_ckpt": args.diff_ckpt,
         "note": ("normalized-intensity space (not calibrated SUV); rel_bias is a proxy for "
                  "SUV mean bias and max_rel_error a proxy for lesion SUVmax error; voxel_r2 / "
-                 "reg_slope / Bland-Altman (ba_*) quantify voxel-wise agreement over foreground"),
+                 "reg_slope / Bland-Altman (ba_*) quantify voxel-wise agreement over foreground. "
+                 "max_rel_error is a SINGLE-VOXEL statistic dominated by isolated decoder "
+                 "overshoot, and is ~0 by construction once the prediction is clamped -- "
+                 "prefer p95_rel_error / hot_band_rel_error. NOTE normalize_volume clips at "
+                 "p99, saturating ~3% of foreground at exactly 1.0, so true lesion-SUVmax "
+                 "fidelity is NOT measurable without a non-clipping normalization"),
         "summary": summary,
         "per_patient": per_patient,
     }
