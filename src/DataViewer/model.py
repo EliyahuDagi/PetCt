@@ -342,7 +342,25 @@ class DicomModel:
         return 1.0
 
     def _classify_pet_series(self, ds):
-        """Classify PET series as AC, NAC, or unknown using DICOM tags only."""
+        """Classify PET series as AC, NAC, or unknown using DICOM tags only.
+
+        The DICOM ``CorrectedImage`` tag (0028,0051) is authoritative: it lists
+        the corrections applied to the series. ``ATTN`` present -> attenuation
+        corrected ("ac"); present without ``ATTN`` -> not attenuation corrected
+        ("nac"). Only when the tag is absent do we fall back to the
+        SeriesDescription/ImageType token heuristic (which misses cases like
+        "PET WB-uncorrected" that tokenize to "WB-UNCORRECTED").
+        """
+        corrected = ds.get((0x0028, 0x0051))
+        if corrected is not None and corrected.value:
+            attrs = corrected.value
+            if isinstance(attrs, str):
+                attrs = [attrs]
+            attrs = [str(a).upper() for a in attrs]
+            if "ATTN" in attrs:
+                return "ac"
+            return "nac"
+
         desc = str(getattr(ds, "SeriesDescription", "")).upper()
         img_type = getattr(ds, "ImageType", None)
 

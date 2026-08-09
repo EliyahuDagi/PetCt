@@ -44,8 +44,12 @@ DEFAULT_CACHE_DIR = "/mnt/c/DeepTrainingData/PetCT"
 # transparent loader path so a run can opt in without threading a flag everywhere.
 CACHE_ENV_VAR = "PETCT_CACHE_DIR"
 
-# Bump when the on-disk format changes so stale entries are treated as a miss.
-CACHE_VERSION = 1
+# Bump when the on-disk format changes OR when the upstream loader semantics change
+# so stale entries are treated as a miss. v2: NAC series classifier now reads the
+# DICOM CorrectedImage (0028,0051) tag first (was SeriesDescription/ImageType tokens
+# only), so v1 entries built with the buggy classifier dropped NAC for many
+# ACRIN/TCIA patients and MUST be rebuilt even though the source DICOM is unchanged.
+CACHE_VERSION = 2
 
 _VOLUME_KEYS = ("pet_ac", "pet_nac")
 
