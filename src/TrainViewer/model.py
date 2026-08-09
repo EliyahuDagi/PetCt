@@ -41,6 +41,27 @@ INFER_AE_CKPT = {
 # Tasks whose inference uses a separate diffusion checkpoint.
 DIFFUSION_TASKS = {"diff2d", "ft3d"}
 
+# Flow-model checkpoints live in a SEPARATE outputs dir per diffusion task; the
+# shared AE checkpoints (INFER_AE_CKPT) are reused as-is. infer.py auto-dispatches
+# flow vs epsilon from the checkpoint's embedded prediction_type, so pointing
+# --diff_ckpt at the flow checkpoint (with --task still the base task) is the only
+# difference between an epsilon and a flow inference run.
+FLOW_OUTPUT_DIR = {"diff2d": "diff2d_flow", "ft3d": "ft3d_flow"}
+
+
+def _variant_dir(task, variant="eps"):
+    """Resolve the outputs subdir for a task + model-variant.
+
+    Flow diffusion tasks live in a separate '<task>_flow' dir (see
+    FLOW_OUTPUT_DIR); the epsilon diffusion variant and all AE tasks use the base
+    task name. This is the SINGLE SOURCE OF TRUTH shared by the diffusion
+    checkpoint path, the inference output dir, load_results, and checkpoint
+    reporting so they can never diverge.
+    """
+    if variant == "flow" and task in FLOW_OUTPUT_DIR:
+        return FLOW_OUTPUT_DIR[task]
+    return task
+
 
 def win_to_wsl_path(p):
     """Convert a Windows path to its /mnt WSL form.
@@ -336,14 +357,19 @@ class InferenceRunner:
         self._thread = None
         self.lines = queue.Queue()
 
-    def build_inner(self, task, cfg, data_dirs, patient_index, slice_idx, outputs_root):
+    def build_inner(self, task, cfg, data_dirs, patient_index, slice_idx, outputs_root,
+                    variant="eps", steps=None, guidance=None):
         # Inference resolves a GLOBAL patient_index across all roots. Fall back
         # to the configured train data_dirs when no infer-specific roots given.
         if isinstance(data_dirs, str):
             data_dirs = [data_dirs] if data_dirs.strip() else []
         roots = data_dirs if data_dirs else cfg.data_dirs
         wsl_data = _data_dir_arg(roots)
-        out_dir = f"outputs/infer/{task}"
+        # variant selects the eps vs flow checkpoint/output dir for diffusion tasks;
+        # AE tasks ignore it. --task always stays the BASE task (infer.py accepts
+        # only the four base tasks and dispatches flow vs eps from the checkpoint).
+        subdir = _variant_dir(task, variant)
+        out_dir = f"outputs/infer/{subdir}"
         ae_ckpt = INFER_AE_CKPT.get(task, "outputs/ae2d/best.pt")
         cmd = (
             "python -m src.training.infer "
@@ -354,9 +380,16 @@ class InferenceRunner:
             f"--ae_ckpt {ae_ckpt} "
             f"--device {cfg.device} "
         )
-        # Only the diffusion tasks consume a separate diffusion checkpoint.
+        # Only the diffusion tasks consume a separate diffusion checkpoint; the
+        # flow variant points --diff_ckpt at outputs/<task>_flow/best.pt.
         if task in DIFFUSION_TASKS:
-            cmd += f"--diff_ckpt outputs/{task}/best.pt "
+            cmd += f"--diff_ckpt outputs/{subdir}/best.pt "
+        # Step count feeds the DDIM loop (eps) and the flow ODE alike.
+        if steps is not None:
+            cmd += f"--ddim_steps {int(steps)} "
+        # Guidance is an epsilon-only knob (flow ignores it internally).
+        if variant == "eps" and guidance is not None:
+            cmd += f"--guidance_scale {float(guidance)} "
         cmd += f"--out {out_dir}"
         inner = (
             f"source {bash_quote(cfg.venv_path)}/bin/activate"
@@ -365,8 +398,12 @@ class InferenceRunner:
         )
         return inner
 
-    def build_cmd(self, task, cfg, data_dirs, patient_index, slice_idx, outputs_root):
-        inner = self.build_inner(task, cfg, data_dirs, patient_index, slice_idx, outputs_root)
+    def build_cmd(self, task, cfg, data_dirs, patient_index, slice_idx, outputs_root,
+                  variant="eps", steps=None, guidance=None):
+        inner = self.build_inner(
+            task, cfg, data_dirs, patient_index, slice_idx, outputs_root,
+            variant=variant, steps=steps, guidance=guidance,
+        )
         return ["wsl", "-d", cfg.distro, "bash", "-lc", inner]
 
     def drain_lines(self):
@@ -378,16 +415,23 @@ class InferenceRunner:
                 break
         return out
 
-    def run_async(self, task, cfg, data_dirs, patient_index, slice_idx, outputs_root, on_done):
+    def run_async(self, task, cfg, data_dirs, patient_index, slice_idx, outputs_root, on_done,
+                  variant="eps", steps=None, guidance=None):
         """Run inference on a background thread; call on_done(result, error) when complete.
         result is (pred, gt, meta) on success; error is a string on failure.
+
+        variant/steps/guidance select the eps vs flow checkpoint and sampling
+        controls (see build_inner). load_results reads the matching variant subdir.
         """
         if self._thread is not None and self._thread.is_alive():
             on_done(None, "inference already running")
             return
 
         def _work():
-            cmd = self.build_cmd(task, cfg, data_dirs, patient_index, slice_idx, outputs_root)
+            cmd = self.build_cmd(
+                task, cfg, data_dirs, patient_index, slice_idx, outputs_root,
+                variant=variant, steps=steps, guidance=guidance,
+            )
             self.lines.put("[infer] " + " ".join(cmd))
             try:
                 self.proc = subprocess.Popen(
@@ -414,7 +458,7 @@ class InferenceRunner:
                 on_done(None, f"inference exited with code {code}")
                 return
             try:
-                result = self.load_results(task, outputs_root)
+                result = self.load_results(task, outputs_root, variant=variant)
             except Exception as e:
                 on_done(None, f"failed to load results: {e}")
                 return
@@ -423,13 +467,28 @@ class InferenceRunner:
         self._thread = threading.Thread(target=_work, daemon=True)
         self._thread.start()
 
-    def load_results(self, task, outputs_root):
-        """Load pred.npy, gt.npy and meta.json from outputs/infer/<task>.
-        Returns (pred_array, gt_array, meta_dict). Tolerates a missing meta.json.
+    def load_results(self, task, outputs_root, variant="eps"):
+        """Load pred.npy, gt.npy, the optional nac.npy and meta.json from the
+        variant's infer subdir (outputs/infer/<task> for eps,
+        outputs/infer/<task>_flow for flow).
+
+        Returns (pred_array, gt_array, nac_array_or_None, meta_dict). nac.npy is
+        written by the diffusion tasks (diff2d/ft3d) with the SAME shape and
+        orientation as pred/gt, and is absent for the AE tasks (ae2d/ae3d); a
+        missing (or unreadable) nac.npy yields nac=None so the View tab can hide
+        that panel gracefully. Tolerates a missing meta.json.
         """
-        base = os.path.join(outputs_root, "infer", task)
+        base = os.path.join(outputs_root, "infer", _variant_dir(task, variant))
         pred = np.load(os.path.join(base, "pred.npy"))
         gt = np.load(os.path.join(base, "gt.npy"))
+        # NAC input volume: optional (present for diff2d/ft3d, absent for AE).
+        nac = None
+        nac_path = os.path.join(base, "nac.npy")
+        if os.path.exists(nac_path):
+            try:
+                nac = np.load(nac_path)
+            except (ValueError, OSError):
+                nac = None
         meta_path = os.path.join(base, "meta.json")
         meta = {}
         if os.path.exists(meta_path):
@@ -443,7 +502,7 @@ class InferenceRunner:
             meta["vmin"] = float(np.min(gt)) if gt.size else 0.0
         if "vmax" not in meta or meta.get("vmax") is None:
             meta["vmax"] = float(np.max(gt)) if gt.size else 1.0
-        return pred, gt, meta
+        return pred, gt, nac, meta
 
 
 class SmokeRunner:
@@ -641,9 +700,11 @@ class TrainModel:
         return self.runner.exit_code
 
     # --- inference ---
-    def run_inference(self, task, data_dirs, patient_index, slice_idx, on_done):
+    def run_inference(self, task, data_dirs, patient_index, slice_idx, on_done,
+                      variant="eps", steps=None, guidance=None):
         self.infer_runner.run_async(
-            task, self.config, data_dirs, patient_index, slice_idx, self.outputs_root, on_done
+            task, self.config, data_dirs, patient_index, slice_idx, self.outputs_root, on_done,
+            variant=variant, steps=steps, guidance=guidance,
         )
 
     def drain_infer_lines(self):
@@ -677,6 +738,16 @@ class TrainModel:
     # --- checkpoints ---
     def checkpoint_info(self, task, which="best"):
         return self.checkpoints.info(task, which)
+
+    def diffusion_ckpt_info(self, task, variant="eps"):
+        """Checkpoint info for a task+variant's diffusion best.pt.
+
+        Flow tasks resolve to outputs/<task>_flow/best.pt, epsilon to
+        outputs/<task>/best.pt. Returns the same {present, path, mtime, mtime_str}
+        dict as checkpoint_info; the View tab uses it to report flow-vs-eps
+        checkpoint presence for the active variant.
+        """
+        return self.checkpoints.info(_variant_dir(task, variant), "best")
 
     # --- settings persistence ---
     def save_settings(self):

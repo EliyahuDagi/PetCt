@@ -6,7 +6,7 @@ app.py consumes these return values; the controller itself imports neither
 gradio nor tkinter so it stays unit-testable in isolation.
 """
 
-from src.TrainViewer.model import TASK_DISPLAY_MAP, TASK_KEYS
+from src.TrainViewer.model import TASK_DISPLAY_MAP, TASK_KEYS, DIFFUSION_TASKS
 
 # Label for the auto-follow option in the Run selector (run_id == None). Must
 # match what the UI shows; the UI rebuilds its label->id map from what we send.
@@ -295,19 +295,45 @@ class TrainController:
         return self.tick()
 
     # --- checkpoints ---
-    def refresh_checkpoint(self):
-        """Return the checkpoint label text for the current task."""
+    def refresh_checkpoint(self, variant="eps"):
+        """Return the checkpoint label text for the current task.
+
+        For the NAC->AC diffusion tasks the variant selects the epsilon vs flow
+        checkpoint dir (outputs/<task> vs outputs/<task>_flow) and the label names
+        which one. AE tasks ignore the variant and keep the original wording so
+        existing callers/tests are unaffected.
+        """
+        if self.task in DIFFUSION_TASKS:
+            info = self.model.diffusion_ckpt_info(self.task, variant)
+            kind = "flow" if variant == "flow" else "diffusion (ε)"
+            if info["present"]:
+                return f"{kind} best.pt present (modified {info['mtime_str']})"
+            return f"no {kind} checkpoint yet"
         info = self.model.checkpoint_info(self.task, "best")
         if info["present"]:
             return f"best.pt present (modified {info['mtime_str']})"
         return "no checkpoint yet"
 
+    def checkpoint_present(self, variant="eps"):
+        """True when the checkpoint the next inference run would load exists.
+
+        Diffusion tasks resolve the variant's dir (flow vs eps); other tasks use
+        the base best.pt. Lets the UI block a doomed run with a clear message.
+        """
+        if self.task in DIFFUSION_TASKS:
+            return bool(self.model.diffusion_ckpt_info(self.task, variant)["present"])
+        return bool(self.model.checkpoint_info(self.task, "best")["present"])
+
     # --- inference ---
-    def run_inference_blocking(self, data_dirs, patient_index, slice_idx):
+    def run_inference_blocking(self, data_dirs, patient_index, slice_idx,
+                               variant="eps", steps=None, guidance=None):
         """Run inference and block until it completes.
 
-        Returns (pred, gt, meta, status). On failure pred/gt/meta are None and
-        status is "error: <msg>"; on success status is "done".
+        variant/steps/guidance select the eps vs flow checkpoint and sampling
+        controls (threaded through to model.run_inference / infer.py).
+        Returns (pred, gt, nac, meta, status); nac is the NAC input volume when
+        the task wrote one (diff2d/ft3d) else None. On failure pred/gt/nac/meta
+        are None and status is "error: <msg>"; on success status is "done".
         """
         self.model.save_settings()
 
@@ -321,13 +347,16 @@ class TrainController:
             captured["error"] = error
             done.set()
 
-        self.model.run_inference(self.task, data_dirs, patient_index, slice_idx, _on_done)
+        self.model.run_inference(
+            self.task, data_dirs, patient_index, slice_idx, _on_done,
+            variant=variant, steps=steps, guidance=guidance,
+        )
         done.wait()
 
         if captured["error"] is not None:
-            return None, None, None, f"error: {captured['error']}"
-        pred, gt, meta = captured["result"]
-        return pred, gt, meta, "done"
+            return None, None, None, None, f"error: {captured['error']}"
+        pred, gt, nac, meta = captured["result"]
+        return pred, gt, nac, meta, "done"
 
     # --- shutdown ---
     def on_close(self):
