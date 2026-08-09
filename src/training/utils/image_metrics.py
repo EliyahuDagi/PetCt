@@ -16,9 +16,17 @@ Metrics provided:
     mae                -- mean absolute error.
     mean_relative_bias -- normalized-intensity proxy for SUV mean % bias.
     max_relative_error -- normalized-intensity proxy for lesion SUVmax error.
+    percentile_relative_error -- robust (q-th percentile) variant of the above.
+    hot_band_relative_error   -- mean error over the hottest UNSATURATED band.
     voxel_r2           -- coefficient of determination over foreground voxels.
     regression_slope   -- least-squares slope (+ intercept) of pred vs gt (fg).
     bland_altman       -- mean bias + 95% limits of agreement over foreground.
+
+Also provides :func:`clamp_unit`, the valid-range projection for predictions:
+``normalize_volume`` (src/training/data.py) percentile-normalizes AND CLIPS every
+volume to ``[0, 1]``, so that is the target space by construction. Decoded model
+predictions are unbounded (MONAI's ``AutoencoderKL`` ends in a linear conv, which
+rings above 1.0 at hot-spot edges), so they must be projected back into it.
 
 Clinical-tier caveat (the metrics that decide SOTA): all of these are computed
 in this pipeline's *normalized intensity* space, NOT in calibrated SUV. A true
@@ -43,6 +51,25 @@ _EPS = 1.0e-8
 def _prep(t):
     """Detach, move to CPU, upcast to float32. Accepts any float dtype."""
     return t.detach().to(device="cpu", dtype=torch.float32)
+
+
+def clamp_unit(t, enabled=True):
+    """Project a decoded prediction into the valid ``[0, 1]`` intensity range.
+
+    ``normalize_volume`` (src/training/data.py) percentile-normalizes and then
+    ``np.clip``s every loaded volume to ``[0, 1]``, so ``[0, 1]`` *is* the target
+    space and a ground-truth foreground max is always exactly 1.0. Decoded
+    predictions are unbounded, and the AE decoder's linear output conv overshoots
+    at hot-spot edges -- which `max_relative_error` then reports as a large
+    "lesion SUVmax error" even for a perfect reconstruction of the GT latent.
+
+    Unlike the metric helpers this keeps device/dtype (it runs inside the model
+    path, not the CPU metric path). ``enabled=False`` is an exact no-op so the
+    pre-clamp numbers stay reproducible.
+    """
+    if not enabled:
+        return t
+    return t.clamp(0.0, 1.0)
 
 
 def _data_range(gt, data_range):
@@ -198,6 +225,82 @@ def max_relative_error(pred, gt, fg_threshold=None):
     return (pred_max - gt_max) / (abs(gt_max) + _EPS)
 
 
+def _quantile_1d(flat, q):
+    """q-th percentile (q in [0, 100]) of a 1-D tensor, via kthvalue.
+
+    ``torch.quantile`` refuses inputs above ~16M elements, which a full-resolution
+    volume's foreground can exceed; ``kthvalue`` has no such cap.
+    """
+    n = int(flat.numel())
+    if n < 1:
+        return float("nan")
+    k = int(round(float(q) / 100.0 * n))
+    k = max(1, min(n, k))
+    return float(torch.kthvalue(flat, k).values)
+
+
+def percentile_relative_error(pred, gt, q=95.0, fg_threshold=None):
+    """Relative error of the q-th foreground percentile -- robust high-uptake proxy.
+
+    ``max_relative_error`` compares a SINGLE global maximum voxel, so one spurious hot
+    voxel dominates it (observed swinging 0.035 -> 9.43 across ae2d_p val rows).
+    Comparing the q-th percentile of each volume's foreground is stable instead.
+
+    CHOOSING ``q`` -- READ THIS. ``normalize_volume`` clips at the 99th percentile, so a
+    few percent of every GT volume is pinned at exactly 1.0 (measured: 3.3% of foreground
+    on an ACRIN test patient, making GT p98/p99/p99.9 all exactly 1.0). Any ``q`` at or
+    above that saturation point is therefore CONSTANT at 1.0 for the ground truth and
+    also for any prediction clamped to [0,1] -- the metric reads exactly 0.0 and
+    discriminates nothing. The default ``q=95`` is the highest percentile still safely
+    below saturation (measured GT fg p95 = 0.946, p90 = 0.752).
+
+    Corollary worth stating plainly: true lesion-SUVmax fidelity is NOT measurable in
+    this pipeline, because the preprocessing discards the top ~1% of intensities where
+    lesions live. That needs a non-clipping normalization, not a better metric.
+
+    Returns ``(pred_q - gt_q) / (|gt_q| + eps)``, signed like the max version.
+    """
+    pred = _prep(pred)
+    gt = _prep(gt)
+    mask = _foreground_mask(gt, fg_threshold)
+    g = _quantile_1d(gt[mask].flatten(), q)
+    p = _quantile_1d(pred[mask].flatten(), q)
+    if g != g or p != p:  # NaN guard (empty selection)
+        return float("nan")
+    return (p - g) / (abs(g) + _EPS)
+
+
+def hot_band_relative_error(pred, gt, q_lo=90.0, q_hi=98.0, fg_threshold=None):
+    """Relative error of the mean over the GT's hottest UNSATURATED intensity band.
+
+    Selects voxels whose GT value lies in the ``[q_lo, q_hi]`` foreground-percentile
+    band and compares the prediction's mean there to the GT's mean. This targets the
+    high-uptake tissue that actually carries lesion signal while staying *below* the
+    p99 clipping plateau (see ``percentile_relative_error`` on why anything above it is
+    degenerate: both GT and clamped prediction saturate at 1.0 and the metric reads 0).
+
+    A single-voxel maximum, or a local avg-pooled peak, cannot work here -- the
+    saturated plateau is ~1500 voxels (~11^3) on a 64^3 volume, so it swallows any
+    reasonable pooling window and both maxima come out at exactly 1.0.
+
+    Returns ``(pred_mean - gt_mean) / (|gt_mean| + eps)`` over the band; NaN if empty.
+    """
+    pred = _prep(pred)
+    gt = _prep(gt)
+    fg = _foreground_mask(gt, fg_threshold)
+    g_fg = gt[fg].flatten()
+    if g_fg.numel() < 2:
+        return float("nan")
+    lo = _quantile_1d(g_fg, q_lo)
+    hi = _quantile_1d(g_fg, q_hi)
+    band = fg & (gt >= lo) & (gt <= hi)
+    if not bool(band.any()):
+        return float("nan")
+    g = float(gt[band].mean())
+    p = float(pred[band].mean())
+    return (p - g) / (abs(g) + _EPS)
+
+
 def voxel_r2(pred, gt, fg_threshold=None):
     """Coefficient of determination (R^2) of pred vs gt over foreground voxels.
 
@@ -275,9 +378,16 @@ def image_quality_metrics(pred, gt):
     a training/validation loop on GPU half-precision tensors.
 
     Includes both the image tier (psnr/ssim/nrmse/mae) and the clinical-tier
-    proxies (rel_bias/max_rel_error/voxel_r2/regression slope+intercept/
-    Bland-Altman bias + 95% limits of agreement), all in normalized-intensity
-    space -- see the module docstring for the SUV-calibration caveat.
+    proxies (rel_bias/max_rel_error/p95_rel_error/hot_band_rel_error/voxel_r2/
+    regression slope+intercept/Bland-Altman bias + 95% limits of agreement), all in
+    normalized-intensity space -- see the module docstring for the SUV-calibration
+    caveat.
+
+    Prefer ``p95_rel_error`` / ``hot_band_rel_error`` over ``max_rel_error`` when
+    judging high-uptake fidelity: the latter is a single-voxel statistic dominated by
+    isolated decoder overshoot, and once the prediction is clamped to the valid [0,1]
+    range it is identically ~0 (GT's own max is always exactly 1.0). It is retained
+    only for continuity with the numbers already in docs/nac_ac_benchmark.md.
     """
     slope, intercept = regression_slope(pred, gt)
     ba = bland_altman(pred, gt)
@@ -288,6 +398,8 @@ def image_quality_metrics(pred, gt):
         "mae": mae(pred, gt),
         "rel_bias": mean_relative_bias(pred, gt),
         "max_rel_error": max_relative_error(pred, gt),
+        "p95_rel_error": percentile_relative_error(pred, gt, q=95.0),
+        "hot_band_rel_error": hot_band_relative_error(pred, gt),
         "voxel_r2": voxel_r2(pred, gt),
         "reg_slope": slope,
         "reg_intercept": intercept,
