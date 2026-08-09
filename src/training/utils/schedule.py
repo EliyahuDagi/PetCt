@@ -73,7 +73,14 @@ class EMA:
             if not v.is_floating_point():
                 self.shadow[k] = v.detach().clone()
                 continue
-            self.shadow[k].mul_(d).add_(v.detach(), alpha=1.0 - d)
+            s = self.shadow[k]
+            # On resume the shadow is loaded from a checkpoint on CPU while the model
+            # lives on CUDA; migrate it to the param device once so the in-place EMA
+            # op below doesn't hit a cross-device error. No-op for fresh runs.
+            if s.device != v.device:
+                s = s.to(v.device)
+                self.shadow[k] = s
+            s.mul_(d).add_(v.detach(), alpha=1.0 - d)
 
     def copy_to(self, model):
         model.load_state_dict(self.shadow, strict=False)

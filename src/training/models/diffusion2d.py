@@ -21,6 +21,12 @@ def _resolve_norm_num_groups(num_channels, requested):
 def build_diffusion_2d(config):
     DiffusionModelUNet = _require_monai()
 
+    if isinstance(config, dict) and not config.get("model"):
+        raise ValueError(
+            "build_diffusion_2d: config has no 'model' block; refusing to build a "
+            "default architecture. A checkpoint or config must supply "
+            "model.{in_channels,num_channels,...}."
+        )
     model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
     in_channels = model_cfg.get("in_channels", 4)
     out_channels = model_cfg.get("out_channels", 4)

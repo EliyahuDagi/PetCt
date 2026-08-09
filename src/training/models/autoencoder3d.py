@@ -34,6 +34,12 @@ def _resolve_norm_num_groups(num_channels, requested):
 def build_autoencoder_3d(config):
     AutoencoderKL = _require_monai()
 
+    if isinstance(config, dict) and not config.get("model"):
+        raise ValueError(
+            "build_autoencoder_3d: config has no 'model' block; refusing to build a "
+            "default architecture. A checkpoint or config must supply "
+            "model.{in_channels,block_out_channels,...}."
+        )
     model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
     in_channels = model_cfg.get("in_channels", 1)
     out_channels = model_cfg.get("out_channels", 1)
