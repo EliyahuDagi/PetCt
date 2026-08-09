@@ -1,0 +1,40 @@
+seed: 42
+output_dir: outputs/diff2d_flow_perc
+val_fraction: 0.2
+test_fraction: 0.1
+slice_manifest: data/training/slices.jsonl
+batch_size: 16
+num_workers: 4
+learning_rate: 1.0e-4
+max_epochs: 200
+latent_channels: 8
+# NAC->AC rectified-flow BRIDGE (see diff2d_flow.yaml) + a PERCEPTUAL term.
+prediction_type: flow
+# Flow-mode auto-disabled: cond-dropout (NAC is the trajectory start), latent-scale
+# (no-op on the bridge), Min-SNR weighting.
+cond_dropout_prob: 0.0
+latent_scale: 1.0
+# Perceptual term ON for this ablation: computed on the flow AC estimate
+# (x_t - tau*v) decoded to image space, vs the real AC. VGG first (cheap A/B control);
+# swap to "medical_sam" (MedSAM ViT-B) in the follow-up ablation.
+perceptual_weight: 0.1
+perceptual_backend: vgg
+model:
+  spatial_dims: 2
+  # Flow feeds ONLY x_t (no NAC concat) -> in_channels = C. main() overrides this
+  # from the AE checkpoint via diffusion_in_channels(latent_channels, is_flow=True).
+  in_channels: 8
+  out_channels: 8
+  num_channels: [64, 128, 256]
+  attention_levels: [false, true, true]
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+augment:
+  enabled: true
+  flip_prob: 0.5
+  rot90_prob: 0.5
+  affine_prob: 0.3
+  affine_rotate_deg: 5.0
+  affine_scale: 0.05
+  affine_translate: 0.02

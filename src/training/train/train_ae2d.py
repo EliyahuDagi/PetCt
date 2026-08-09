@@ -8,6 +8,7 @@ saves best/last checkpoints (with config embedded) for the Train Viewer.
 import argparse
 import os
 import random
+import threading
 
 import numpy as np
 import torch
@@ -35,6 +36,7 @@ from src.training.utils.image_metrics import image_quality_metrics
 from src.training.utils.logging import setup_logging
 from src.training.utils.perceptual import build_perceptual_loss
 from src.training.utils.metrics import MetricsWriter
+from src.training.utils.prefetch_batches import BatchPrefetcher
 from src.training.utils.perf import (
     autocast,
     configure_backends,
@@ -134,6 +136,17 @@ def main():
     parser.add_argument("--prefetch", type=int, default=0,
                         help="Background patient-prefetch depth (0 = synchronous, default). "
                              ">0 overlaps DICOM I/O with GPU compute via a worker thread.")
+    parser.add_argument("--loader_workers", type=int, default=0,
+                        help="Background BATCH-prep worker threads (0 = synchronous, default; "
+                             "byte-identical to today). >0 overlaps the CPU-bound slice "
+                             "extraction + per-sample augment with GPU compute. Multi-patient "
+                             "only; makes the data-sampling RNG order nondeterministic (perf path).")
+    parser.add_argument("--patient_reuse", type=int, default=1,
+                        help="Threaded-loader only (--loader_workers>0): draw this many "
+                             "independently-sampled batches from each loaded patient before "
+                             "pulling the next one. Amortizes the multi-MB .npz read + zlib "
+                             "decompress over K steps so step throughput decouples from disk. "
+                             "1 (default) = current behavior, byte-identical.")
     parser.add_argument("--cache_size", type=int, default=None,
                         help="Override the resident patient-cache size (default auto).")
     parser.add_argument("--cache_dir", default=None,
@@ -232,6 +245,7 @@ def main():
     patients = enumerate_patients(args.data_dir, missing_ok=True)
     multi_patient = len(patients) > 1
     cache = None  # set in the multi-patient branch; closed after training
+    prefetcher = None  # set when --loader_workers > 0 (multi-patient); closed at the end
 
     if not multi_patient:
         vols = load_patient_volumes(args.data_dir[0], args.patient_index, device=device)
@@ -266,8 +280,14 @@ def main():
         # GPU compute on a worker thread. prefetch==0 keeps the synchronous LRU path,
         # so the default run is byte-identical to before.
         cache_kwargs = {} if args.cache_size is None else {"max_cached": args.cache_size}
+        # Cache-device selection: with --loader_workers > 0 we keep volumes
+        # CPU-resident so the worker threads slice/interpolate/augment with torch CPU
+        # ops + MONAI (which release the GIL -> true multicore); the main loop then
+        # does one tiny H2D copy of the assembled (~1 MB) batch. With workers == 0 the
+        # cache stays on `device` exactly as today, so the default path is unchanged.
+        cache_device = "cpu" if args.loader_workers > 0 else device
         cache = PrefetchingPatientCache(
-            patients, device=device, prefetch=args.prefetch,
+            patients, device=cache_device, prefetch=args.prefetch,
             train_indices=train_idx, rng=rng, cache_dir=args.cache_dir, **cache_kwargs,
         ).start()
 
@@ -305,6 +325,86 @@ def main():
         def sample_val():
             return _sample_sync(val_idx, augment=None)
 
+        # Opt-in threaded batch prefetcher: when --loader_workers > 0 we move the
+        # CPU-bound batch prep (slice extraction + per-sample augment + interpolate)
+        # onto background worker threads, overlapping it with GPU compute. The
+        # synchronous `batch = sample_train()` path is untouched when workers == 0,
+        # so the default run stays byte-identical to today.
+        #
+        # NOTE: enabling workers makes the data-sampling RNG draw order
+        # nondeterministic relative to the single-thread path. Batches are still
+        # independently sampled and augmented -- we only overlap/parallelize, not
+        # batch the augment. This is an accepted trade-off for a perf-only path.
+        if args.loader_workers > 0:
+            # The cache is CPU-resident in this mode, so workers do their slice +
+            # interpolate + augment entirely on CPU (true multicore). The only shared,
+            # non-reentrant state across workers is the cache cursor advance inside
+            # cache.next_train(); serialize just that with a lock. The volume tensors
+            # are read-only during slicing, so the concurrent CPU work outside the
+            # lock is safe. No worker touches CUDA -- the lone H2D copy is the main
+            # loop's tiny per-batch move.
+            pull_lock = threading.Lock()
+
+            def _pull_train_pool():
+                # Mirror the prefetch-path patient walk, but lock-guard the cursor
+                # advance so concurrent workers don't corrupt cache.next_train().
+                for _ in range(max(1, len(train_idx))):
+                    with pull_lock:
+                        _, vols = cache.next_train()
+                    pool_vols = ae_pool_volumes(vols, args.modality)
+                    if pool_vols:
+                        return pool_vols
+                raise ValueError("No volumes available for AE training across selected patients.")
+
+            patient_reuse = max(1, int(args.patient_reuse))
+
+            def _make_batch(worker_rng, worker_aug, worker_state):
+                # Same work as the prefetch sample_train() path, but with the worker's
+                # OWN rng + augment (no shared, non-thread-safe RandomState / MONAI
+                # Rand*d state) and the lock-guarded patient pull. Returns a CPU batch;
+                # the main loop moves it to `device`.
+                #
+                # Patient reuse: a loaded patient (multi-MB .npz read + zlib decompress)
+                # is held in this worker's private state and reused for `patient_reuse`
+                # batches before the next lock-guarded cache.next_train(). Each of the K
+                # batches is an independent fresh draw of (axis, position) + its own
+                # augment, so augment/sampling semantics are unchanged; we only amortize
+                # the load. reuse==1 pulls a new patient every batch (prior behavior).
+                if worker_state.get("remaining", 0) <= 0:
+                    worker_state["pool"] = _pull_train_pool()
+                    worker_state["remaining"] = patient_reuse
+                worker_state["remaining"] -= 1
+                pool_vols = worker_state["pool"]
+                return sample_slices(
+                    pool_vols, full_pool, batch_size, args.slice_size, worker_rng, augment=worker_aug)
+
+            # Each worker gets a deterministically-seeded RandomState (base seed +
+            # worker index) and its own built augment transform.
+            prefetcher = BatchPrefetcher(
+                make_batch=_make_batch,
+                num_workers=int(args.loader_workers),
+                make_rng=lambda w: np.random.RandomState(seed + 1 + int(w)),
+                make_aug=lambda: build_aug_2d(config.get("augment")),
+            )
+
+    # When the prefetcher is active, pull batches from its queue; otherwise keep the
+    # synchronous per-step sampler. Validation always stays synchronous.
+    if prefetcher is not None:
+        get_train_batch = prefetcher.get
+    else:
+        get_train_batch = sample_train
+
+    # In the threaded path the cache is CPU-resident, so both train batches (from the
+    # workers) and val batches (from synchronous sample_val) arrive on CPU and need a
+    # tiny H2D copy before train_step/eval_step. In the default path batches already
+    # live on `device`, so to_device is a no-op -- this avoids any double-move.
+    cpu_batches = prefetcher is not None
+
+    def to_device(batch):
+        if cpu_batches:
+            return batch.to(device, non_blocking=True)
+        return batch
+
     steps_per_epoch = int(args.steps_per_epoch)
     total_steps = int(args.epochs) * steps_per_epoch
     best_val = float("inf")
@@ -314,34 +414,40 @@ def main():
 
     for global_step in range(start_step, total_steps):
         epoch = global_step // max(1, steps_per_epoch)
-        batch = sample_train()
+        batch = to_device(get_train_batch())
         metrics = train_step(model, batch, optimizer, perceptual, perceptual_weight)
         logger.info("step=%s loss=%.6f recon_l1=%.6f kl=%.6f", global_step, metrics["loss"], metrics["recon_l1"], metrics["kl"])
         metrics_writer.log("train", global_step, metrics, epoch)
 
         if args.val_every > 0 and global_step % args.val_every == 0:
-            val_metrics = _validate(model, sample_val, args.val_batches)
+            val_metrics = _validate(model, sample_val, args.val_batches, to_device)
             logger.info("VAL step=%s loss=%.6f recon_l1=%.6f", global_step, val_metrics["loss"], val_metrics["recon_l1"])
             metrics_writer.log("val", global_step, val_metrics, epoch)
             is_best = val_metrics["loss"] < best_val
             best_val = min(best_val, val_metrics["loss"])
             save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, global_step + 1, epoch, val_metrics["loss"], best_val), is_best)
 
-    final_val = _validate(model, sample_val, args.val_batches)
+    final_val = _validate(model, sample_val, args.val_batches, to_device)
     metrics_writer.log("val", total_steps, final_val, int(args.epochs))
     is_best = final_val["loss"] < best_val
     best_val = min(best_val, final_val["loss"])
     save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, total_steps, int(args.epochs), final_val["loss"], best_val), is_best)
     metrics_writer.close()
+    if prefetcher is not None:
+        prefetcher.close()
     if cache is not None:
         cache.close()
     logger.info("Training finished. best_val_loss=%.6f", best_val)
 
 
-def _validate(model, sample_val, n_batches):
+def _validate(model, sample_val, n_batches, to_device=None):
     accum = {}
     for _ in range(max(1, n_batches)):
         batch = sample_val()
+        # CPU-resident-cache mode: move the val batch to the model's device. Default
+        # mode passes a no-op to_device (batch already on device) -> no double-move.
+        if to_device is not None:
+            batch = to_device(batch)
         m = eval_step(model, batch)
         for k, v in m.items():
             accum[k] = accum.get(k, 0.0) + v
@@ -377,12 +483,23 @@ def _resume(model, optimizer, rng, resume_path, logger):
 
 
 def _load_config(path, fallback):
-    if not path or not os.path.exists(path):
+    # No --config given -> defaults are intended.
+    if not path:
         return _deep_copy_config(fallback)
+    # An EXPLICIT --config that can't be read must FAIL LOUDLY, never silently fall
+    # back to defaults: a silent fallback (e.g. PyYAML missing) once trained many runs
+    # with the wrong config (small default model, prediction_type=epsilon instead of
+    # the requested flow) without any error -- a very costly, hard-to-spot bug.
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"--config path does not exist: {path}")
     try:
         import yaml  # type: ignore
-    except Exception:
-        return _deep_copy_config(fallback)
+    except Exception as exc:
+        raise RuntimeError(
+            f"--config {path} was provided but PyYAML is not importable in this "
+            f"environment, so the config cannot be read. Install it (pip install "
+            f"pyyaml). Refusing to silently fall back to default hyperparameters."
+        ) from exc
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     merged = _deep_copy_config(fallback)

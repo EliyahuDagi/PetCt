@@ -13,6 +13,20 @@ max_epochs: 200
 # latent_channels / in_channels(2C) / out_channels(C) are runtime-overridden from
 # the AE checkpoint; mirrored here for clarity (B2: latent_channels 8 -> in 16/out 8).
 latent_channels: 8
+# Generative formulation:
+#   "epsilon" (default): latent diffusion -- sampling starts from N(0,1) noise with
+#     the NAC latent as a concat condition (uses cond_dropout_prob + latent_scale +
+#     perceptual_weight + the DDIM sampler).
+#   "flow": NAC->AC rectified-flow BRIDGE (I2SB-style) -- the trajectory starts FROM the
+#     NAC latent so the model cannot ignore it (structurally fixes conditioning collapse).
+#     NAC is the bridge ENDPOINT, NOT a concat channel (in_channels = C, not 2C): feeding
+#     it as a channel too would let the net recover AC=(x_t - tau*NAC)/(1-tau) by algebra.
+#     In flow mode cond_dropout_prob, latent_scale and Min-SNR (snr_gamma) are auto-disabled
+#     and guidance_scale is N/A (no null condition); perceptual_weight is NOT disabled in
+#     diff2d (only ft3d zeroes it) -- it applies to the velocity AC estimate (x_t - tau*v).
+#     The flow_sample integrator (linear tau grid, no noise / no clip_x0) is used at inference.
+#     See docs/nac_ac_benchmark.md §6.
+prediction_type: epsilon
 # Classifier-free guidance (InstructPix2Pix-style). During training the NAC
 # conditioning latent is replaced by zeros (the "null" condition) with this
 # per-sample probability, so the UNet learns BOTH the conditional and
@@ -38,6 +52,9 @@ loss:
 # Perceptual loss on the in-graph decoded x0 estimate (frozen VGG by default).
 # >0 enables it; 0 disables (no-op). Backend pluggable: "vgg" now, "medical_sam" later.
 perceptual_weight: 0.1
+# Apply the perceptual term only to low-noise (high-SNR) timesteps t<frac*T, where the
+# one-step x0 estimate is meaningful (t=0 is high SNR here); see PixelGen.
+perceptual_active_frac: 0.7
 perceptual_backend: vgg
 # Geometric-only data augmentation (no intensity transforms). Disabled by default.
 # Applied to TRAIN pairs only, with the SAME random geometry on NAC and AC (val clean).

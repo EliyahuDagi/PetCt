@@ -1,0 +1,65 @@
+seed: 42
+output_dir: outputs/ft3d_flow
+# By-patient holdout fractions (multi-patient runs). Test patients are excluded
+# from BOTH train and val. Mirror the train script CLI defaults at runtime.
+val_fraction: 0.2
+test_fraction: 0.1
+volume_manifest: data/training/volumes.jsonl
+batch_size: 1
+grad_accum_steps: 16
+num_workers: 2
+learning_rate: 5.0e-5
+max_epochs: 150
+# latent_channels / in_channels(C) / out_channels(C) are runtime-overridden from
+# the 3D AE checkpoint; mirrored here for clarity (B2: latent_channels 8 -> in 8/out 8).
+latent_channels: 8
+# NAC->AC rectified-flow BRIDGE: the trajectory starts FROM the NAC latent (not
+# noise), predicting the velocity NAC-AC along x_tau=(1-tau)AC+tau*NAC. This
+# structurally forces the model to use NAC (fixes the conditioning collapse that
+# capped the epsilon+CFG run). 3D port of diff2d_flow; see docs/flow_matching_reference.md
+# §6 and memory diffusion-generation-collapse.
+prediction_type: flow
+# latent_scale is auto-forced to 1.0 in flow mode (a constant scale cancels on the
+# bridge); set here for clarity.
+latent_scale: 1.0
+# perceptual_weight is NOT auto-disabled any more -- it is config-driven in flow mode
+# too, applied to the x_t - tau*v AC estimate at ALL tau. It is 0 HERE only to keep this
+# config the pure-MSE CONTROL arm; see ft3d_flow_lpl.yaml for the perceptual run.
+# (test_ft3d_flow.py::TestFt3dFlowYamlSanity pins this to 0.0.)
+perceptual_weight: 0.0
+# --- Gradient-masked center-freeze warm-start (Make-A-Video / Video-LDM) ---
+# When inflating a 2D diffusion checkpoint (--inflate_from) into this 3D UNet,
+# optionally FREEZE the inflated 2D spatial prior (pin the center depth slice of every
+# inflated conv + requires_grad=False on all other 2D-derived params) and train ONLY
+# the new depth-axis capacity, then optionally release it. OFF by default: with the
+# flag false the training path is byte-identical to before. For a flow->flow inflation
+# the input conv (in_channels = C) inflates too, so the freeze covers the full prior.
+inflate_freeze_backbone: false
+# Optimizer step at which to release the freeze and fine-tune the whole net.
+# 0 = never (stay depth-only for the whole run); N>0 = unfreeze at step N.
+inflate_unfreeze_step: 0
+model:
+  spatial_dims: 3
+  # Flow feeds ONLY x_t (NAC is the bridge endpoint, not a concat channel), so
+  # in_channels = C, not 2C. main() overrides this from the 3D AE checkpoint via
+  # diffusion_in_channels(latent_channels, is_flow=True); mirrored here for clarity.
+  in_channels: 8
+  out_channels: 8
+  num_channels: [64, 128, 256]
+  attention_levels: [false, true, true]
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+# Geometric-only 3D data augmentation (no intensity transforms). Applied to TRAIN
+# pairs only, with the SAME random geometry on NAC and AC (val/test clean).
+augment:
+  enabled: true
+  flip_prob: 0.5             # per spatial axis (D, H, W)
+  rot90_prob: 0.5            # 90-degree rotations in the axial (H-W) plane
+  affine_prob: 0.3           # mild rotate/scale/translate
+  affine_rotate_deg: 7.0
+  affine_scale: 0.1
+  affine_translate: 0.02     # fraction of axis length
+  elastic_prob: 0.0          # very-mild elastic; off by default
+  elastic_sigma_range: [1.0, 2.0]
+  elastic_magnitude_range: [1.0, 2.0]

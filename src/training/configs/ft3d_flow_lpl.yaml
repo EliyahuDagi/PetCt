@@ -1,0 +1,73 @@
+# A/B ARM (ii): 3D flow bridge + LATENT PERCEPTUAL LOSS (LPL).
+#
+# Single-variable change vs ft3d_flow.yaml (the pure-MSE control): perceptual_weight>0
+# with the "lpl" backend. Everything else -- tau distribution, loss weighting, model,
+# augment, LR -- is identical, so a difference is attributable to the perceptual term.
+#
+# Why LPL instead of the 2.5D VGG (per arXiv 2411.04873, "Boosting Latent Diffusion with
+# Perceptual Objectives"): the term is computed on the frozen 3D AE decoder's OWN
+# intermediate features rather than on a full pixel decode fed to an external 2D
+# backbone. That makes it natively volumetric (the VGG path runs a 2D net slice-wise, so
+# it has no volumetric receptive field), needs no downloaded weights, and is ~2.4x faster
+# / ~2.8x lighter on peak VRAM because the decoder forward stops at the deepest tap and
+# never runs the full-resolution 64^3 tail.
+#
+# Where it is applied: the analytic AC estimate x_tau - tau*v, at ALL tau -- NOT only
+# near the endpoint. This matches RFPP's premetric LPIPS(x, x_t - t*v_theta) (arXiv
+# 2405.20320). It is deliberately NOT gated to small tau the way the epsilon path is:
+# d(x_tau - tau*v)/dv = -tau, so the gradient already self-weights toward large tau (the
+# hard NAC end) and vanishes at tau=0 where the estimate is trivially correct.
+seed: 42
+output_dir: outputs/ft3d_flow_lpl
+val_fraction: 0.2
+test_fraction: 0.1
+volume_manifest: data/training/volumes.jsonl
+batch_size: 1
+grad_accum_steps: 16
+num_workers: 2
+learning_rate: 5.0e-5
+max_epochs: 150
+latent_channels: 8
+prediction_type: flow
+latent_scale: 1.0
+# --- the single variable under test ---
+# CALIBRATED, do not guess this (scripts/_diag_lpl_calibrate.py, 2026-08-06). Measured on
+# the TRAINED ft3d_flow_p checkpoint over 6 held-out patients:
+#     mean velocity MSE = 3.01,  mean RAW LPL = 0.00147   -> raw ratio 4.9e-4
+# so the term needs a LARGE weight to matter at all: ~41 for 2% of the MSE, ~103 for 5%,
+# ~205 for 10%. 100 targets ~5% -- visible but non-dominant, deliberately avoiding the
+# earlier VGG mistake where the perceptual term ran 5-7x the recon loss (see memory
+# perceptual-loss-fix). Calibrate against the CONVERGED mse (~3), never the fresh-init
+# value (~35), or the term is negligible for the whole run.
+perceptual_weight: 100.0
+perceptual_backend: lpl
+# null = auto-select interior decoder blocks up to (excluding) the last Upsample, so the
+# taps stay at <=32^3 and the 64^3 stage never runs. For the ae3d_p decoder that is
+# blocks [1, 5, 8] of 14.
+perceptual_taps: null
+# Control-identical (explicit so the A/B is auditable).
+flow_tau_dist: uniform
+flow_loss_weighting: none
+inflate_freeze_backbone: false
+inflate_unfreeze_step: 0
+model:
+  spatial_dims: 3
+  # Flow feeds ONLY x_t -> in_channels = C, not 2C.
+  in_channels: 8
+  out_channels: 8
+  num_channels: [64, 128, 256]
+  attention_levels: [false, true, true]
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+augment:
+  enabled: true
+  flip_prob: 0.5
+  rot90_prob: 0.5
+  affine_prob: 0.3
+  affine_rotate_deg: 7.0
+  affine_scale: 0.1
+  affine_translate: 0.02
+  elastic_prob: 0.0
+  elastic_sigma_range: [1.0, 2.0]
+  elastic_magnitude_range: [1.0, 2.0]

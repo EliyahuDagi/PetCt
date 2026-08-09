@@ -1,0 +1,56 @@
+# A/B ARM (i): 3D flow bridge + U-SHAPED tau SAMPLING (no perceptual term).
+#
+# Single-variable change vs ft3d_flow.yaml (the pure-MSE control): flow_tau_dist.
+#
+# RFPP ("Improving the Training of Rectified Flows", Lee et al., NeurIPS 2024, arXiv
+# 2405.20320) samples the flow timestep from a U-shaped density
+#     p(u) ~ exp(a*u) + exp(-a*u)  on u in [0,1],  a ~ 4
+# because the training loss is LARGE AT BOTH ENDS of the interval and small in the
+# middle, so uniform sampling under-trains the ends. They report a 28% FID reduction over
+# uniform sampling on CIFAR-10. This repo sampled tau uniformly.
+#
+# This arm is separate from the perceptual arms on purpose: it costs nothing extra per
+# step (it is a change of sampling distribution only), so if it helps it should be kept
+# regardless of what the perceptual term does.
+seed: 42
+output_dir: outputs/ft3d_flow_ushaped
+val_fraction: 0.2
+test_fraction: 0.1
+volume_manifest: data/training/volumes.jsonl
+batch_size: 1
+grad_accum_steps: 16
+num_workers: 2
+learning_rate: 5.0e-5
+max_epochs: 150
+latent_channels: 8
+prediction_type: flow
+latent_scale: 1.0
+# No perceptual term in this arm -- isolate the tau distribution.
+perceptual_weight: 0.0
+# --- the single variable under test ---
+flow_tau_dist: ushaped
+flow_tau_a: 4.0
+flow_loss_weighting: none
+inflate_freeze_backbone: false
+inflate_unfreeze_step: 0
+model:
+  spatial_dims: 3
+  # Flow feeds ONLY x_t -> in_channels = C, not 2C.
+  in_channels: 8
+  out_channels: 8
+  num_channels: [64, 128, 256]
+  attention_levels: [false, true, true]
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+augment:
+  enabled: true
+  flip_prob: 0.5
+  rot90_prob: 0.5
+  affine_prob: 0.3
+  affine_rotate_deg: 7.0
+  affine_scale: 0.1
+  affine_translate: 0.02
+  elastic_prob: 0.0
+  elastic_sigma_range: [1.0, 2.0]
+  elastic_magnitude_range: [1.0, 2.0]

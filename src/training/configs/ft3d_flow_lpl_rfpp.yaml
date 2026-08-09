@@ -1,0 +1,80 @@
+# A/B ARM (iii): the full RFPP recipe -- LPL perceptual + (1-tau)-weighted regression
+# + U-shaped tau sampling.
+#
+# This is arms (i) and (ii) combined with RFPP's time weighting, i.e. the closest
+# transcription of their LPIPS-Huber premetric (arXiv 2405.20320) into this bridge:
+#     m = (1-tau)*regression(v_pred, NAC-AC)  +  w*perceptual(AC_est, AC)
+# with AC_est = x_tau - tau*v_pred.
+#
+# The rationale for the (1-tau) factor: the perceptual term's gradient already grows like
+# tau (d(AC_est)/dv = -tau), so down-weighting the regression term toward the source end
+# produces a smooth HAND-OFF -- regression dominates near the AC target, perceptual near
+# the NAC source -- instead of a flat sum in which the perceptual term is diluted ~2x by
+# uniform-tau averaging.
+#
+# Not single-variable by design: run it only after (i) and (ii) have been read, so a
+# combined result can be attributed.
+seed: 42
+output_dir: outputs/ft3d_flow_lpl_rfpp
+val_fraction: 0.2
+test_fraction: 0.1
+volume_manifest: data/training/volumes.jsonl
+# THROUGHPUT (2026-08-06): effective batch is batch_size * grad_accum_steps = 16, the same
+# as ft3d_flow_p's 1 x 16 -- but the split matters enormously for speed. sample_train_pair()
+# pops ONE patient per micro-batch, so 1 x 16 forced 16 patient loads per optimizer step,
+# served by a SINGLE prefetch thread at ~0.18 s each => ~2.9 s of the measured 5.29 s step
+# was data, with the GPU at 26% util / 3.2 GB of 24 GB. 4 x 4 needs only 4 loads per step.
+# Diversity is preserved: sample_pair_volumes_full draws an INDEPENDENT random
+# crop/flip/rotation (+ MONAI geo) per sample, so 4 samples from one patient are 4
+# different augmented crops, not copies.
+# NOTE for attribution: this differs from the ft3d_flow_p baseline in batching as well as
+# the knobs under test. Effective batch is identical, but per-step patient diversity is 4
+# rather than 16. If this arm shows a real effect, re-run a matched-batching control before
+# attributing it to the loss shaping.
+batch_size: 4
+grad_accum_steps: 4
+num_workers: 4
+learning_rate: 5.0e-5
+max_epochs: 150
+latent_channels: 8
+prediction_type: flow
+latent_scale: 1.0
+# Calibrated -- see ft3d_flow_lpl.yaml for the measurement (raw LPL/mse ratio 4.9e-4 on
+# the trained checkpoint, so ~100 puts the term at ~5% of the velocity MSE).
+# NOTE: under `flow_loss_weighting: rfpp` the regression term is scaled by (1-tau) while
+# the raw LPL value GROWS with tau (measured 0.00014 at t=164 -> 0.0033 at t=825), so the
+# effective perceptual share is larger at the NAC end than this nominal 5%. That hand-off
+# is the point of the RFPP recipe, not a miscalibration.
+perceptual_weight: 100.0
+perceptual_backend: lpl
+# null = auto-select interior decoder blocks up to (excluding) the last Upsample, so the
+# taps stay at <=32^3 and the 64^3 stage never runs. For the ae3d_p decoder that is
+# blocks [1, 5, 8] of 14.
+perceptual_taps: null
+# --- RFPP loss shaping (this is what differs from arm ii) ---
+flow_tau_dist: ushaped
+flow_tau_a: 4.0
+flow_loss_weighting: rfpp
+inflate_freeze_backbone: false
+inflate_unfreeze_step: 0
+model:
+  spatial_dims: 3
+  # Flow feeds ONLY x_t -> in_channels = C, not 2C.
+  in_channels: 8
+  out_channels: 8
+  num_channels: [64, 128, 256]
+  attention_levels: [false, true, true]
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+augment:
+  enabled: true
+  flip_prob: 0.5
+  rot90_prob: 0.5
+  affine_prob: 0.3
+  affine_rotate_deg: 7.0
+  affine_scale: 0.1
+  affine_translate: 0.02
+  elastic_prob: 0.0
+  elastic_sigma_range: [1.0, 2.0]
+  elastic_magnitude_range: [1.0, 2.0]

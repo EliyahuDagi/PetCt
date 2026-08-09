@@ -1,0 +1,67 @@
+# FINE-TUNE ABLATION ARM: iw
+#
+# Short fine-tune from the best existing 3D flow model (ft3d_flow_p/best.pt, passed via
+# --init_from) rather than a from-scratch run: it isolates what each loss change DOES to an
+# already-good model, in ~1/20th of the compute.
+#
+# INVARIANTS across every arm (so the ablation is single-variable):
+#   --init_from   outputs/ft3d_flow_p/best.pt     same starting weights
+#   --split_json  outputs/ft3d_flow_p/split.json  same partition -> leak-free paired eval
+#                 (REQUIRED: the same seed does NOT reproduce a split across runs)
+#   batch_size 4 x grad_accum 4                   matched batching, effective batch 16
+#   learning_rate 1e-5                            5x below the 5e-5 the baseline trained at,
+#                                                 because we are refining, not training
+# The 'control' arm changes NOTHING else, so it measures the effect of fine-tuning and
+# batching alone -- without it none of the other arms is attributable.
+#
+# WHAT THIS ABLATION TARGETS: the measured under-dispersion of the baseline --
+#   reg_slope 0.844 (want 1.0), reg_intercept +0.057, hot_band_rel_error -0.10
+# i.e. high uptake is compressed ~16% and hot tissue under-estimated ~10%. This is the
+# MSE optimum (the conditional mean is less extreme than the truth), not a bug, so it can
+# only be fixed by changing the objective. See src/training/utils/quant_losses.py.
+#
+# INTENSITY-WEIGHTED L1: per-voxel weight 1 + lam*(gt/gt_max)^gamma, so hot voxels
+# dominate the objective. Blunter than the slope penalty (it reweights everything) but
+# needs no batch statistics. weight 2.5 = ~5% of the velocity MSE (measured).
+seed: 42
+output_dir: outputs/ft3d_ft_iw
+val_fraction: 0.2
+test_fraction: 0.1
+volume_manifest: data/training/volumes.jsonl
+batch_size: 4
+grad_accum_steps: 4
+num_workers: 4
+learning_rate: 1.0e-5
+max_epochs: 150
+latent_channels: 8
+prediction_type: flow
+latent_scale: 1.0
+inflate_freeze_backbone: false
+inflate_unfreeze_step: 0
+perceptual_weight: 0.0
+quant_loss: intensity_weighted
+quant_weight: 2.5
+quant_lam: 4.0
+quant_gamma: 1.0
+flow_tau_dist: uniform
+flow_loss_weighting: none
+model:
+  spatial_dims: 3
+  in_channels: 8
+  out_channels: 8
+  num_channels: [64, 128, 256]
+  attention_levels: [false, true, true]
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+augment:
+  enabled: true
+  flip_prob: 0.5
+  rot90_prob: 0.5
+  affine_prob: 0.3
+  affine_rotate_deg: 7.0
+  affine_scale: 0.1
+  affine_translate: 0.02
+  elastic_prob: 0.0
+  elastic_sigma_range: [1.0, 2.0]
+  elastic_magnitude_range: [1.0, 2.0]

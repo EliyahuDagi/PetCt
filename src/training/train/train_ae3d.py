@@ -464,12 +464,23 @@ def _resume(model, optimizer, rng, resume_path, logger):
 
 
 def _load_config(path, fallback):
-    if not path or not os.path.exists(path):
+    # No --config given -> defaults are intended.
+    if not path:
         return _deep_copy_config(fallback)
+    # An EXPLICIT --config that can't be read must FAIL LOUDLY, never silently fall
+    # back to defaults: a silent fallback (e.g. PyYAML missing) once trained many runs
+    # with the wrong config (small default model, prediction_type=epsilon instead of
+    # the requested flow) without any error -- a very costly, hard-to-spot bug.
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"--config path does not exist: {path}")
     try:
         import yaml  # type: ignore
-    except Exception:
-        return _deep_copy_config(fallback)
+    except Exception as exc:
+        raise RuntimeError(
+            f"--config {path} was provided but PyYAML is not importable in this "
+            f"environment, so the config cannot be read. Install it (pip install "
+            f"pyyaml). Refusing to silently fall back to default hyperparameters."
+        ) from exc
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     merged = _deep_copy_config(fallback)

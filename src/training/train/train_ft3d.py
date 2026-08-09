@@ -8,6 +8,7 @@ trained 2D diffusion checkpoint. Emits JSONL metrics and best/last checkpoints.
 """
 
 import argparse
+import json
 import os
 import random
 
@@ -31,7 +32,29 @@ from src.training.models.autoencoder3d import (
     build_autoencoder_3d,
 )
 from src.training.models.diffusion3d import build_diffusion_3d
-from src.training.models.inflation import map_state_dict_2d_to_3d
+from src.training.models.inflation import (
+    CenterFreeze,
+    build_center_freeze_plan,
+    map_state_dict_2d_to_3d,
+)
+# Reuse the dimension-agnostic flow/perceptual helpers from the 2D port (the flow math
+# broadcasts to 5-D via schedule._broadcast, the estimate helpers index only shape[0]/
+# ndim, and ae.decode is the same MONAI API for the 3D AE); do NOT duplicate them here.
+# ft3d previously kept its own epsilon-only copies of x0_decode_in_graph/perceptual_term,
+# which is how the flow perceptual path silently never reached 3D.
+from src.training.train.train_diff2d import (
+    _resume_best_val,
+    _selection_metric,
+    diffusion_in_channels,
+    flow_ac_estimate_latent,
+    flow_loss,
+    flow_mode_banner,
+    flow_x0_decode_in_graph,
+    perceptual_term,
+    sample_flow_timesteps,
+    x0_decode_in_graph,
+    x0_estimate_latent,
+)
 from src.training.utils.checkpointing import (
     capture_rng_state,
     load_checkpoint,
@@ -39,9 +62,10 @@ from src.training.utils.checkpointing import (
     restore_rng_state,
     save_training_checkpoint,
 )
-from src.training.utils.image_metrics import image_quality_metrics
+from src.training.utils.image_metrics import clamp_unit, image_quality_metrics
 from src.training.utils.logging import setup_logging
 from src.training.utils.perceptual import build_perceptual_loss
+from src.training.utils.quant_losses import build_quant_loss, latent_occupancy_weight
 from src.training.utils.metrics import MetricsWriter
 from src.training.utils.perf import (
     autocast,
@@ -122,36 +146,74 @@ def diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma=None):
     return loss, x_t, timesteps, pred, noise
 
 
-def x0_decode_in_graph(ae, schedule, x_t, timesteps, pred, latent_scale=1.0):
-    """Decode the one-step x0 estimate to image space, keeping the graph intact.
+def _reuse_split(split_json, patients, logger):
+    """Map an existing ``split.json``'s patient PATHS onto indices into ``patients``.
 
-    Same formula ``_validate`` uses, but ``ae3d_decode`` is wrapped in ``no_grad``;
-    for a perceptual *training* term gradients must reach the UNet, so call the 3D
-    AE decoder directly (the AE is frozen, so its params are not updated -- the
-    gradient just passes through it back to ``pred``). ``x0_pred`` lives in scaled
-    latent space, so divide by ``latent_scale`` before decoding (no-op at 1.0).
+    Returns ``(train_idx, val_idx, test_idx)``. Raises if the file is unusable or if any
+    TEST patient is missing from the current enumeration -- silently dropping test
+    patients would make the run's numbers incomparable to the split it claims to reuse,
+    which is the whole point of passing this flag.
+
+    Patients present now but absent from the split file are dropped from training with a
+    warning (they were not part of the original partition, so training on them could leak
+    into that split's test set).
     """
-    acp = schedule.alphas_cumprod[timesteps]
-    sqrt_acp = schedule._broadcast(torch.sqrt(acp), x_t)
-    sqrt_one_minus = schedule._broadcast(torch.sqrt(1.0 - acp), x_t)
-    x0_pred = (x_t - sqrt_one_minus * pred) / sqrt_acp
-    if latent_scale and latent_scale > 0 and latent_scale != 1.0:
-        x0_pred = x0_pred / latent_scale
-    return ae.decode(x0_pred)
+    with open(split_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or not all(k in data for k in ("train", "val", "test")):
+        raise ValueError(f"{split_json} is not a split.json (need train/val/test lists)")
+    pos = {str(p): i for i, p in enumerate(patients)}
+    out, missing = [], {}
+    for key in ("train", "val", "test"):
+        idx, miss = [], []
+        for p in data[key]:
+            i = pos.get(str(p))
+            (idx.append(i) if i is not None else miss.append(str(p)))
+        out.append(idx)
+        missing[key] = miss
+    if missing["test"]:
+        raise ValueError(
+            f"{len(missing['test'])} TEST patient(s) from {split_json} are not present under "
+            f"the given --data_dir roots; refusing to reuse a split whose held-out set cannot "
+            f"be reproduced. First missing: {missing['test'][0]}")
+    for key in ("train", "val"):
+        if missing[key]:
+            logger.warning("%d %s patient(s) from %s are absent now and will be skipped.",
+                           len(missing[key]), key, split_json)
+    extra = len(patients) - sum(len(i) for i in out)
+    if extra > 0:
+        logger.warning(
+            "%d enumerated patient(s) are NOT in %s and are excluded from training "
+            "(training on them could leak into that split's test set).", extra, split_json)
+    return out[0], out[1], out[2]
 
 
-def perceptual_term(perceptual, ae, schedule, x_t, timesteps, pred, ac_vol, weight, latent_scale=1.0):
-    """Weighted perceptual loss on the in-graph decoded 3D x0 vs the AC volume.
+def _init_weights_from(model, ckpt_path, logger):
+    """Load MODEL WEIGHTS ONLY from a 3D diffusion checkpoint (fine-tune init).
 
-    The 2D backbone runs slice-wise across the three planes (handled inside the
-    PerceptualLoss). Returns ``(weighted_loss_tensor_or_None, float_value)``;
-    ``None`` means disabled and the caller skips it.
+    Unlike ``--resume`` this deliberately does NOT restore the optimizer, LR schedule,
+    global step, EMA or ``best_val`` -- the point is to start a SHORT new run from an
+    already-good model with a fresh (typically much smaller) LR schedule. Unlike
+    ``--inflate_from`` the checkpoint is already 3D, so no inflation happens.
+
+    Prefers the EMA shadow weights when present (that is what eval loads, so it is the
+    model whose quality the fine-tune is starting from).
     """
-    if perceptual is None or not weight or weight <= 0:
-        return None, 0.0
-    recon = x0_decode_in_graph(ae, schedule, x_t, timesteps, pred, latent_scale)
-    pterm = perceptual(recon, ac_vol) * float(weight)
-    return pterm, float(pterm.detach().cpu())
+    state = load_checkpoint(ckpt_path)
+    ema_state = state.get("ema")
+    sd = None
+    if isinstance(ema_state, dict):
+        sd = ema_state.get("shadow")
+    src = "EMA shadow" if sd else "raw model"
+    sd = sd or state.get("model", state)
+    incompatible = model.load_state_dict(sd, strict=False)
+    missing = len(getattr(incompatible, "missing_keys", []) or [])
+    unexpected = len(getattr(incompatible, "unexpected_keys", []) or [])
+    logger.info("Initialized weights from %s (%s): %d missing, %d unexpected key(s).",
+                ckpt_path, src, missing, unexpected)
+    if missing or unexpected:
+        logger.warning("Weight init was PARTIAL -- architecture mismatch with %s?", ckpt_path)
+    return state.get("config", {})
 
 
 def main():
@@ -178,6 +240,17 @@ def main():
         help="Override the perceptual-loss weight (0 disables it). Default comes from the config.",
     )
     parser.add_argument("--inflate_from", default=None, help="Optional 2D diffusion checkpoint to inflate")
+    parser.add_argument("--init_from", default=None,
+                        help="Fine-tune init: load MODEL WEIGHTS ONLY from an existing 3D "
+                             "checkpoint (prefers its EMA shadow). Unlike --resume this keeps a "
+                             "fresh optimizer/LR schedule/step/best_val, and unlike "
+                             "--inflate_from the source is already 3D.")
+    parser.add_argument("--split_json", default=None,
+                        help="Reuse the by-patient partition from an existing split.json "
+                             "instead of deriving one. REQUIRED for a valid A/B: the same "
+                             "seed+fractions do NOT reproduce a partition across runs (the "
+                             "enumerated patient order is not stable), so independently "
+                             "trained runs otherwise leak each other's test patients.")
     parser.add_argument("--prefetch", type=int, default=0,
                         help="Background patient-prefetch depth (0 = synchronous, default). "
                              ">0 overlaps DICOM I/O with GPU compute via a worker thread.")
@@ -203,18 +276,69 @@ def main():
         "seed": 42,
         "output_dir": "outputs/ft3d",
         "batch_size": 1,
+        # micro-batches accumulated per optimizer step; effective batch = batch_size * grad_accum_steps
+        "grad_accum_steps": 1,
         "learning_rate": 1.0e-4,
         "latent_channels": 4,
+        # "epsilon": standard latent diffusion (start sampling from N(0,1), NAC as a
+        # concat condition). "flow": NAC->AC rectified-flow bridge (start sampling FROM
+        # the NAC latent so the model cannot ignore it; see flow_loss / flow_sample).
+        "prediction_type": "epsilon",
         "noise_schedule": "cosine",
         "snr_gamma": 5.0,
         "rescale_zero_terminal_snr": False,
         "ema_decay": 0.9999,
         "lr_min_ratio": 0.1,
+        # --- Gradient-masked center-freeze warm-start (Make-A-Video / Video-LDM) ---
+        # When inflating a 2D diffusion checkpoint (--inflate_from) into this 3D UNet,
+        # optionally FREEZE the inflated 2D spatial prior and train ONLY the new
+        # depth-axis capacity, then optionally release it. OFF by default -- with the
+        # flag off the code path is byte-identical to before. See
+        # models/inflation.build_center_freeze_plan / CenterFreeze.
+        #   True: pin the center depth slice of every inflated 3D conv (the 2D prior)
+        #   via a gradient mask, and freeze every other 2D-derived param
+        #   (norms/biases/time-embed/attention/1x1x1 convs) with requires_grad=False;
+        #   only the zero-initialized off-center depth taps (and any genuinely-fresh
+        #   params) train. Requires an actual inflation to have happened.
+        "inflate_freeze_backbone": False,
+        #   Optimizer step at which to release the freeze and fine-tune the whole net.
+        #   0 = never unfreeze (stay depth-only for the entire run); N>0 = unfreeze at
+        #   step N. Resume re-establishes the freeze from the checkpoint-embedded plan.
+        "inflate_unfreeze_step": 0,
         # Perceptual loss on the in-graph decoded x0 estimate (2D backbone run
         # slice-wise on the 3D decode). >0 enables it; 0/disabled is a no-op.
         # Backend is pluggable ("vgg" now, "medical_sam" later).
         "perceptual_weight": 0.1,
+        # Apply perceptual only to the low-noise (high-SNR) timesteps where the one-step
+        # x0 estimate is meaningful; see PixelGen.
+        "perceptual_active_frac": 0.7,
         "perceptual_backend": "vgg",
+        # "lpl" backend only: decoder block indices to tap (null = auto-select interior
+        # blocks up to the last Upsample, so the full-resolution tail never runs).
+        "perceptual_taps": None,
+        # Clamp the decoded validation prediction to the valid [0,1] range so the
+        # in-training monitor matches the (clamped) eval path. normalize_volume clips
+        # every GT volume to [0,1]; the AE decoder's linear output conv overshoots.
+        "clamp_output": True,
+        # Flow-only knobs (inert in epsilon mode). See sample_flow_timesteps / flow_loss.
+        # "uniform" + "none" reproduce the original flow behaviour exactly.
+        "flow_tau_dist": "uniform",     # uniform | ushaped  (RFPP U-shaped density)
+        "flow_tau_a": 4.0,              # ushaped sharpness
+        "flow_loss_weighting": "none",  # none | rfpp        ((1-tau)-weighted MSE)
+        # Quantitative-fidelity term (flow only), off by default.
+        # quant_loss: none | slope | intensity_weighted | expectile
+        "quant_loss": "none",
+        "quant_weight": 0.0,
+        "quant_variance_weight": None,  # slope: adds (std(pred)/std(gt)-1)^2
+        "quant_lam": None,              # intensity_weighted: weight = 1 + lam*(gt/max)^gamma
+        "quant_gamma": None,
+        "quant_q": None,                # expectile: q>0.5 penalizes under-prediction more
+        # Spatial rebalancing of the velocity MSE: weight for latent positions holding NO
+        # anatomy. 1.0 = off (uniform mean, the original behaviour); 0.1 = air counts 10%.
+        # Value-INDEPENDENT (a foreground gate, not an intensity ramp), so unlike
+        # intensity weighting it cannot encourage saturation.
+        "bg_weight": 1.0,
+        "bg_fg_threshold": None,
         "model": {
             "num_channels": [16, 32, 48],
             "attention_levels": [False, False, True],
@@ -247,8 +371,14 @@ def main():
     ae, ae_config = load_frozen_ae(args.ae_ckpt, device)
     latent_channels = int(ae_config.get("latent_channels", config.get("latent_channels", 4)))
     config["latent_channels"] = latent_channels
+    prediction_type = str(config.get("prediction_type", "epsilon")).lower()
+    is_flow = prediction_type == "flow"
+    # Channel layout (see diffusion_in_channels): epsilon conditions by concatenation
+    # so input is [noisy_AC | NAC] (2C); the flow bridge feeds ONLY the interpolant
+    # x_t (C) because the trajectory already starts FROM NAC -- concatenating NAC too
+    # would let the net recover AC=(x_t - tau*NAC)/(1-tau) by algebra for tau<1.
     model_cfg = dict(config.get("model", {}))
-    model_cfg["in_channels"] = 2 * latent_channels
+    model_cfg["in_channels"] = diffusion_in_channels(latent_channels, is_flow)
     model_cfg["out_channels"] = latent_channels
     config["model"] = model_cfg
 
@@ -263,31 +393,134 @@ def main():
         device=device,
     )
     snr_gamma = config.get("snr_gamma", 5.0)
+    if is_flow:
+        logger.info(flow_mode_banner(include_cond_dropout=False))
 
-    # Pluggable perceptual loss (frozen VGG by default), run slice-wise on the 3D
-    # decode. build_* returns None when the backend/weights are unavailable.
+    # Pluggable perceptual loss. Config-driven in BOTH modes (it used to be force-zeroed
+    # in flow mode, which is why the flow perceptual term never reached 3D): epsilon uses
+    # the one-step x0 estimate (gated to low-noise t), flow uses the velocity AC estimate
+    # x_t - tau*v at ALL tau. Backend "vgg" runs a 2D backbone slice-wise on the decoded
+    # volume; "lpl" compares the frozen 3D decoder's own features and skips the decode.
     perceptual_weight = float(config.get("perceptual_weight", 0.0) or 0.0)
+    perceptual_active_frac = float(config.get("perceptual_active_frac", 0.7))
+    clamp_output = bool(config.get("clamp_output", True))
     perceptual = None
     if perceptual_weight > 0:
         perceptual = build_perceptual_loss(
             config.get("perceptual_backend", "vgg"),
             device=device,
             weights_path=config.get("perceptual_weights_path"),
+            # "lpl" taps the frozen AE decoder's own features (ignored by other backends).
+            ae=ae,
+            taps=config.get("perceptual_taps"),
         )
         if perceptual is None:
             logger.warning("Perceptual loss requested but backend unavailable; continuing without it.")
             perceptual_weight = 0.0
         else:
-            logger.info("Perceptual loss enabled: backend=%s weight=%.4g",
-                        config.get("perceptual_backend", "vgg"), perceptual_weight)
+            logger.info("Perceptual loss enabled: backend=%s weight=%.4g space=%s",
+                        config.get("perceptual_backend", "vgg"), perceptual_weight,
+                        "latent" if getattr(perceptual, "consumes_latents", False) else "image")
+
+    # Flow-bridge loss shaping (inert in epsilon mode).
+    flow_tau_dist = str(config.get("flow_tau_dist", "uniform") or "uniform")
+    flow_tau_a = float(config.get("flow_tau_a", 4.0))
+    flow_loss_weighting = str(config.get("flow_loss_weighting", "none") or "none")
+    if is_flow and (flow_tau_dist != "uniform" or flow_loss_weighting != "none"):
+        logger.info("Flow loss shaping: tau_dist=%s (a=%.3g) loss_weighting=%s "
+                    "(RFPP, arXiv 2405.20320)", flow_tau_dist, flow_tau_a, flow_loss_weighting)
+
+    # Quantitative-fidelity term: attacks the measured under-dispersion (reg_slope 0.844,
+    # hot_band_rel_error -0.10) that plain MSE is *guaranteed* to produce, since its optimum
+    # is the conditional mean. See src/training/utils/quant_losses.py.
+    bg_weight = float(config.get("bg_weight", 1.0) if config.get("bg_weight") is not None else 1.0)
+    bg_fg_threshold = config.get("bg_fg_threshold")
+    if is_flow and bg_weight < 1.0:
+        logger.info("Background down-weighting ENABLED: empty latent positions weighted %.3g "
+                    "(mask from GT anatomy, intensity-independent)", bg_weight)
+    quant_weight = float(config.get("quant_weight", 0.0) or 0.0)
+    quant_loss = None
+    if quant_weight > 0:
+        quant_loss = build_quant_loss(
+            config.get("quant_loss"),
+            fg_threshold=config.get("quant_fg_threshold"),
+            **{k: config.get(f"quant_{k}") for k in ("variance_weight", "lam", "gamma", "q")},
+        )
+    if quant_loss is None and quant_weight > 0:
+        logger.warning("quant_weight=%.4g but quant_loss is 'none' -- no term applied.", quant_weight)
+    elif quant_loss is not None:
+        if not is_flow:
+            raise ValueError(
+                "quant_loss is implemented for prediction_type=flow only: it acts on the "
+                "decoded AC estimate, and the epsilon one-step x0 estimate is meaningless "
+                "at high noise.")
+        logger.info("Quantitative-fidelity loss enabled: %s weight=%.4g (on the decoded "
+                    "x_t - tau*v AC estimate, foreground-masked)",
+                    config.get("quant_loss"), quant_weight)
 
     # Inflation seeds the 3D weights; a --resume checkpoint (loaded below) takes
     # precedence and fully overwrites them, so skip the inflation work when resuming.
     # Inflate before compiling.
+    inflated = False
+    missing = []
     if resume_path is None and args.inflate_from and os.path.exists(args.inflate_from):
         state = load_checkpoint(args.inflate_from)
+        # Inflation only carries over Conv weights whose in/out-channel counts match
+        # (see map_state_dict_2d_to_3d). The input conv channel count is mode-dependent
+        # (flow=C vs epsilon=2C), so inflating ACROSS a prediction_type switch leaves the
+        # input conv shape-mismatched -> it silently falls back to fresh init. Warn loudly
+        # and recommend inflating flow->flow (or epsilon->epsilon) only.
+        ckpt_pt = str((state.get("config") or {}).get("prediction_type", "epsilon")).lower()
+        if ckpt_pt != prediction_type:
+            logger.warning(
+                "Inflation prediction_type mismatch (2D checkpoint=%s, ft3d config=%s): the input conv "
+                "channel count differs (flow=C vs epsilon=2C), so the input conv will NOT inflate and "
+                "falls back to fresh init. Inflate flow->flow (or epsilon->epsilon) for a full warm-start.",
+                ckpt_pt, prediction_type)
         missing = inflate_and_load(raw_model, state.get("model", state))
+        inflated = True
         logger.info("Inflated from 2D checkpoint %s, missing keys: %s", args.inflate_from, len(missing))
+    elif resume_path is None and args.init_from:
+        # Fine-tune init from an existing 3D checkpoint (weights only). Mutually exclusive
+        # with --inflate_from in practice: the source is already 3D, so nothing to inflate.
+        if not os.path.exists(args.init_from):
+            raise FileNotFoundError(f"--init_from checkpoint not found: {args.init_from}")
+        src_cfg = _init_weights_from(raw_model, args.init_from, logger)
+        src_pt = str((src_cfg or {}).get("prediction_type", "epsilon")).lower()
+        if src_pt != prediction_type:
+            raise ValueError(
+                f"--init_from prediction_type mismatch: checkpoint is {src_pt!r} but this "
+                f"config is {prediction_type!r}. The input conv channel count differs "
+                f"(flow=C vs epsilon=2C), so the weights are not transferable.")
+
+    # Gradient-masked center-freeze warm-start (Make-A-Video / Video-LDM). OFF by
+    # default; nothing below touches the model unless inflate_freeze_backbone is set.
+    # Applied to raw_model BEFORE maybe_compile so the first (lazy) compile captures
+    # the frozen requires_grad state. The optimizer keeps ALL params (frozen ones are
+    # skipped by Adam while their grad is None, and resume after unfreeze picks them up).
+    freeze_backbone = bool(config.get("inflate_freeze_backbone", False))
+    unfreeze_step = int(config.get("inflate_unfreeze_step", 0) or 0)
+    center_freeze = None
+    freeze_active = False
+    if freeze_backbone and resume_path is None:
+        if inflated:
+            plan = build_center_freeze_plan(raw_model, missing)
+            # Embed the plan in the config so it rides along in every checkpoint and
+            # --resume can rebuild the freeze structurally (no 2D checkpoint needed).
+            config["inflate_freeze_plan"] = plan
+            center_freeze = CenterFreeze()
+            summary = center_freeze.apply(raw_model, plan)
+            freeze_active = True
+            logger.info(
+                "Center-freeze warm-start: masked=%d frozen=%d fresh=%d trainable_tensors=%d; "
+                "unfreeze at step=%s",
+                summary["n_masked"], summary["n_frozen"], summary["n_fresh"], summary["n_trainable"],
+                unfreeze_step if unfreeze_step > 0 else "never",
+            )
+        else:
+            logger.warning(
+                "inflate_freeze_backbone is set but no inflation happened (pass a valid "
+                "--inflate_from 2D checkpoint); training WITHOUT the freeze.")
 
     model = maybe_compile(raw_model, logger)
 
@@ -321,12 +554,21 @@ def main():
         def sample_val_pair():
             return sample_pair_volumes(vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, "val", args.val_fraction, rng, geo_aug=None)
     else:
-        train_idx, val_idx, test_idx = make_patient_split3(
-            len(patients), args.val_fraction, args.test_fraction, seed)
+        if args.split_json:
+            # REUSE an existing partition instead of deriving a new one. This is required
+            # for any A/B: make_patient_split3 is deterministic in INDICES, but those index
+            # the enumerated paired-patient list, whose ORDER is not stable across runs --
+            # so two runs with the SAME seed and fractions can (and did) land on different
+            # partitions, leaking 17/41 test patients into the other's training set.
+            train_idx, val_idx, test_idx = _reuse_split(args.split_json, patients, logger)
+        else:
+            train_idx, val_idx, test_idx = make_patient_split3(
+                len(patients), args.val_fraction, args.test_fraction, seed)
         logger.info(
             "Training on %d patients (train %d / val %d / test %d) across %d roots. "
-            "Test patients are held out from training entirely.",
+            "Test patients are held out from training entirely.%s",
             len(patients), len(train_idx), len(val_idx), len(test_idx), len(args.data_dir),
+            f" Split REUSED from {args.split_json}." if args.split_json else "",
         )
         split_path = write_split_json(
             save_dir, TASK, patients, train_idx, val_idx, test_idx,
@@ -366,16 +608,34 @@ def main():
     # scale (lets the user fix it / resume deterministically); otherwise compute it
     # once from a sample of AC latents. Stored in config -> embedded in the checkpoint
     # so inference/eval reuse the exact same scale.
-    cfg_scale = config.get("latent_scale")
-    if cfg_scale is not None and float(cfg_scale) > 0:
-        latent_scale = float(cfg_scale)
-        logger.info("Using configured latent_scale=%.6f", latent_scale)
+    if is_flow:
+        # The bridge interpolates between the AC and NAC latents directly; a constant
+        # global scale cancels out of the trajectory direction, so unit-variance
+        # normalization is unnecessary. Force 1.0 (a no-op in ae3d_encode/ae3d_decode) and
+        # skip compute_latent_scale -- also avoids shifting the RNG sample sequence.
+        latent_scale = 1.0
+        logger.info("Flow mode: latent_scale forced to 1.0 (no-op for the bridge).")
     else:
-        latent_scale = compute_latent_scale(ae, sample_train_pair, logger=logger)
+        cfg_scale = config.get("latent_scale")
+        if cfg_scale is not None and float(cfg_scale) > 0:
+            latent_scale = float(cfg_scale)
+            logger.info("Using configured latent_scale=%.6f", latent_scale)
+        else:
+            latent_scale = compute_latent_scale(ae, sample_train_pair, logger=logger)
     config["latent_scale"] = float(latent_scale)
 
     steps_per_epoch = int(args.steps_per_epoch)
     total_steps = int(args.epochs) * steps_per_epoch
+
+    # Gradient accumulation: each global_step runs `grad_accum` micro-batches, each
+    # with its own sampled pair + backward, then ONE optimizer step. So global_step
+    # counts OPTIMIZER steps (lr schedule / val cadence / checkpoint step-counting are
+    # unchanged) while the effective batch = batch_size * grad_accum. Default 1 is a
+    # no-op (e.g. diff2d, which has no grad_accum_steps key, is unaffected).
+    grad_accum = max(1, int(config.get("grad_accum_steps", 1)))
+    if grad_accum > 1:
+        logger.info("Gradient accumulation: %d micro-batches/step (effective batch=%d).",
+                    grad_accum, batch_size * grad_accum)
 
     ema_decay = float(config.get("ema_decay", 0.0))
     # EMA tracks the raw (uncompiled) weights so its shadow keys stay prefix-free.
@@ -387,47 +647,125 @@ def main():
     best_val = float("inf")
     start_step = 0
     if resume_path is not None:
-        start_step, best_val = _resume(raw_model, optimizer, rng, resume_path, logger, ema)
+        start_step, best_val, resume_freeze_plan = _resume(
+            raw_model, optimizer, rng, resume_path, logger, ema, prediction_type)
         # Fast-forward the LR schedule so the resumed LR matches an uninterrupted run.
         if lr_scheduler is not None:
             for _ in range(start_step):
                 lr_scheduler.step()
+        # Inflation is skipped on resume, so re-establish the freeze from the plan that
+        # was embedded in the CHECKPOINT'S config (structural -> no 2D checkpoint needed).
+        # Applied to raw_model before the loop; skipped entirely if already past the
+        # unfreeze step. Everything here is a no-op unless inflate_freeze_backbone is set.
+        if freeze_backbone:
+            if resume_freeze_plan is None:
+                logger.warning(
+                    "inflate_freeze_backbone is set but the resume checkpoint has no "
+                    "inflate_freeze_plan; continuing WITHOUT the freeze.")
+            else:
+                # Keep the plan embedded so subsequent checkpoints from this resumed run
+                # retain it (the current run's config came from YAML, not the checkpoint).
+                config["inflate_freeze_plan"] = resume_freeze_plan
+                if unfreeze_step > 0 and start_step >= unfreeze_step:
+                    logger.info(
+                        "Resume at step=%d is past inflate_unfreeze_step=%d; backbone already "
+                        "released, no freeze re-applied.", start_step, unfreeze_step)
+                else:
+                    center_freeze = CenterFreeze()
+                    summary = center_freeze.apply(raw_model, resume_freeze_plan)
+                    freeze_active = True
+                    logger.info(
+                        "Re-applied center-freeze on resume: masked=%d frozen=%d fresh=%d "
+                        "trainable_tensors=%d; unfreeze at step=%s (resumed at step=%d).",
+                        summary["n_masked"], summary["n_frozen"], summary["n_fresh"],
+                        summary["n_trainable"],
+                        unfreeze_step if unfreeze_step > 0 else "never", start_step)
 
     for global_step in range(start_step, total_steps):
+        # Release the center-freeze at the configured optimizer step and fine-tune the
+        # whole net (Make-A-Video / Video-LDM stage 2). No-op unless a freeze is active.
+        if freeze_active and unfreeze_step > 0 and global_step == unfreeze_step:
+            center_freeze.unfreeze()
+            freeze_active = False
+            logger.info("Unfroze backbone at step=%d; fine-tuning the full net.", global_step)
         epoch = global_step // max(1, steps_per_epoch)
-        nac_vol, ac_vol = sample_train_pair()
-        # Both the target AC latent and the NAC conditioning latent live in the SAME
-        # scaled latent space (NAC is channel-concatenated to the noisy AC).
-        ac_lat = ae3d_encode(ae, ac_vol, scale=latent_scale)
-        nac_lat = ae3d_encode(ae, nac_vol, scale=latent_scale)
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        mse_loss, x_t, timesteps, pred, _ = diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma)
-        pterm, pval = perceptual_term(perceptual, ae, schedule, x_t, timesteps, pred, ac_vol, perceptual_weight, latent_scale)
-        loss = mse_loss if pterm is None else mse_loss + pterm
-        loss.backward()
+        # Accumulate float metrics over the micro-batches and report their MEAN, so the
+        # logged values reflect the full effective batch (not just the last micro-batch).
+        loss_sum = mse_sum = pval_sum = qval_sum = 0.0
+        for _ in range(grad_accum):
+            nac_vol, ac_vol = sample_train_pair()
+            # Both the target AC latent and the NAC conditioning latent live in the SAME
+            # scaled latent space (NAC is channel-concatenated to the noisy AC).
+            ac_lat = ae3d_encode(ae, ac_vol, scale=latent_scale)
+            nac_lat = ae3d_encode(ae, nac_vol, scale=latent_scale)
+            if is_flow:
+                # Spatial rebalancing of the velocity MSE (bg_weight<1 only). The mask comes
+                # from the GT volumes, never from the prediction, and depends only on WHERE
+                # anatomy is -- not on how bright it is -- so it cannot reward saturation.
+                wmap = latent_occupancy_weight(
+                    [ac_vol, nac_vol], ac_lat.shape[2:],
+                    bg_weight=bg_weight, fg_threshold=bg_fg_threshold,
+                )
+                mse_loss, x_t, timesteps, pred, _ = flow_loss(
+                    model, schedule, ac_lat, nac_lat,
+                    tau_dist=flow_tau_dist, tau_a=flow_tau_a,
+                    loss_weighting=flow_loss_weighting, weight_map=wmap,
+                )
+            else:
+                mse_loss, x_t, timesteps, pred, _ = diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma)
+            # Keyword args deliberately: the shared signature has `is_flow` before
+            # `perceptual_active_frac`, so positional calls would silently mis-bind.
+            pterm, pval = perceptual_term(
+                perceptual, ae, schedule, x_t, timesteps, pred, ac_vol, perceptual_weight,
+                latent_scale=latent_scale, is_flow=is_flow,
+                perceptual_active_frac=perceptual_active_frac, ac_lat=ac_lat,
+            )
+            loss = mse_loss if pterm is None else mse_loss + pterm
+            # Quantitative-fidelity term (under-dispersion / hot-tissue bias). Needs IMAGE
+            # space, so it pays for a decode of the in-graph AC estimate -- unlike the LPL
+            # perceptual term, which works on latents. Flow only: the epsilon one-step x0
+            # estimate is meaningless at high noise, and these are statistics of the whole
+            # image rather than a per-voxel distance.
+            qval = 0.0
+            if quant_loss is not None and is_flow:
+                q_est = flow_x0_decode_in_graph(ae, schedule, x_t, timesteps, pred, latent_scale)
+                qterm = quant_loss(q_est, ac_vol) * quant_weight
+                loss = loss + qterm
+                qval = float(qterm.detach().cpu())
+            # Scale by 1/grad_accum so the summed gradients equal the mean over micro-batches.
+            (loss / grad_accum).backward()
+            loss_sum += float(loss.detach().cpu())
+            mse_sum += float(mse_loss.detach().cpu())
+            pval_sum += pval
+            qval_sum += qval
         optimizer.step()
         if lr_scheduler is not None:
             lr_scheduler.step()
         if ema is not None:
             ema.update(raw_model)
-        metrics = {"loss": float(loss.detach().cpu()), "mse": float(mse_loss.detach().cpu()), "perceptual": pval}
+        metrics = {"loss": loss_sum / grad_accum, "mse": mse_sum / grad_accum,
+                   "perceptual": pval_sum / grad_accum, "quant": qval_sum / grad_accum}
         logger.info("step=%s loss=%.6f", global_step, metrics["loss"])
         metrics_writer.log("train", global_step, metrics, epoch)
 
         if args.val_every > 0 and global_step % args.val_every == 0:
-            val_metrics = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma, latent_scale)
+            val_metrics = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma, latent_scale, is_flow, clamp_output)
             logger.info("VAL step=%s loss=%.6f l1=%.6f", global_step, val_metrics["loss"], val_metrics["l1"])
             metrics_writer.log("val", global_step, val_metrics, epoch)
-            is_best = val_metrics["loss"] < best_val
-            best_val = min(best_val, val_metrics["loss"])
-            save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, global_step + 1, epoch, val_metrics["loss"], best_val, ema), is_best)
+            # Flow selects on the honest-rollout L1, not the (shortcut-prone) velocity loss.
+            sel = _selection_metric(val_metrics, is_flow)
+            is_best = sel < best_val
+            best_val = min(best_val, sel)
+            save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, global_step + 1, epoch, sel, best_val, ema), is_best)
 
-    final_val = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma, latent_scale)
+    final_val = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma, latent_scale, is_flow, clamp_output)
     metrics_writer.log("val", total_steps, final_val, int(args.epochs))
-    is_best = final_val["loss"] < best_val
-    best_val = min(best_val, final_val["loss"])
-    save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, total_steps, int(args.epochs), final_val["loss"], best_val, ema), is_best)
+    sel = _selection_metric(final_val, is_flow)
+    is_best = sel < best_val
+    best_val = min(best_val, sel)
+    save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, total_steps, int(args.epochs), sel, best_val, ema), is_best)
     metrics_writer.close()
     if cache is not None:
         cache.close()
@@ -435,7 +773,8 @@ def main():
 
 
 @torch.no_grad()
-def _validate(model, raw_model, ema, ae, schedule, sample_val_pair, n_batches, snr_gamma=None, latent_scale=1.0):
+def _validate(model, raw_model, ema, ae, schedule, sample_val_pair, n_batches, snr_gamma=None,
+              latent_scale=1.0, is_flow=False, clamp_output=True):
     # Evaluate under the EMA weights when available -- consistently higher quality.
     # The EMA swap targets raw_model (shared params); forward still runs via model.
     ctx = ema.average_parameters(raw_model) if ema is not None else _null_context(raw_model)
@@ -448,14 +787,30 @@ def _validate(model, raw_model, ema, ae, schedule, sample_val_pair, n_batches, s
             # Same scaled latent space as training (NAC + AC scaled identically).
             ac_lat = ae3d_encode(ae, ac_vol, scale=latent_scale)
             nac_lat = ae3d_encode(ae, nac_vol, scale=latent_scale)
-            loss, x_t, timesteps, pred, noise = diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma)
-            # x0_pred is in scaled latent space; ae3d_decode divides by scale.
-            acp = schedule.alphas_cumprod[timesteps]
-            sqrt_acp = schedule._broadcast(torch.sqrt(acp), x_t)
-            sqrt_one_minus = schedule._broadcast(torch.sqrt(1.0 - acp), x_t)
-            x0_pred = (x_t - sqrt_one_minus * pred) / sqrt_acp
-            recon = ae3d_decode(ae, x0_pred, scale=latent_scale)
+            if is_flow:
+                # Deliberately the UNSHAPED loss (uniform tau, no (1-tau) weighting): the
+                # reported val `loss` must stay comparable across A/B arms that differ in
+                # exactly those knobs. Model selection uses the rollout `l1` regardless.
+                loss, _, _, _, _ = flow_loss(model, schedule, ac_lat, nac_lat)
+                # HONEST generation metric: a real short rollout FROM the NAC latent
+                # (not the old one-step proxy, which leaked the real AC via x_t and
+                # masked the conditioning collapse). Only NAC information enters here.
+                # No concat -- matches flow_loss (in_channels = C); NAC enters only as x_init.
+                flow_model_fn = lambda x, t: model(to_input_memory_format(x), t)
+                ac_pred_lat = schedule.flow_sample(flow_model_fn, nac_lat, num_steps=8, spacing="linear")
+                recon = clamp_unit(ae3d_decode(ae, ac_pred_lat, scale=latent_scale), clamp_output)
+            else:
+                loss, x_t, timesteps, pred, noise = diffusion_loss(model, schedule, ac_lat, nac_lat, snr_gamma)
+                # x0_pred is in scaled latent space; ae3d_decode divides by scale.
+                acp = schedule.alphas_cumprod[timesteps]
+                sqrt_acp = schedule._broadcast(torch.sqrt(acp), x_t)
+                sqrt_one_minus = schedule._broadcast(torch.sqrt(1.0 - acp), x_t)
+                x0_pred = (x_t - sqrt_one_minus * pred) / sqrt_acp
+                recon = clamp_unit(ae3d_decode(ae, x0_pred, scale=latent_scale), clamp_output)
             accum["loss"] += float(loss.cpu())
+            # ft3d is whole-volume (batch ~= 1), so compute l1 and the image-quality
+            # metrics directly on the 3D volume (no per-slice loop -- that was a 2D-only
+            # detail to match the per-slice diff2d eval path).
             accum["l1"] += float(torch.mean(torch.abs(recon - ac_vol)).cpu())
             # Image-quality metrics of the decoded 3D prediction vs AC reference.
             for k, v in image_quality_metrics(recon, ac_vol).items():
@@ -494,8 +849,13 @@ def _checkpoint_state(model, optimizer, rng, config, step, epoch, val_loss, best
     return state
 
 
-def _resume(model, optimizer, rng, resume_path, logger, ema=None):
-    """Restore model/optimizer/RNG (and EMA) from a checkpoint; return (start_step, best_val)."""
+def _resume(model, optimizer, rng, resume_path, logger, ema=None, prediction_type="epsilon"):
+    """Restore model/optimizer/RNG (and EMA) from a checkpoint.
+
+    Returns ``(start_step, best_val, freeze_plan)`` where ``freeze_plan`` is the
+    center-freeze plan embedded in the checkpoint's stored config (or ``None`` for
+    checkpoints written without one), so the caller can re-establish the freeze.
+    """
     state = load_checkpoint(resume_path)
     model.load_state_dict(state["model"])
     if state.get("optimizer") is not None:
@@ -503,19 +863,38 @@ def _resume(model, optimizer, rng, resume_path, logger, ema=None):
     if ema is not None and state.get("ema") is not None:
         ema.load_state_dict(state["ema"])
     restore_rng_state(state.get("rng"), rng)
-    best_val = float(state.get("best_val", float("inf")))
+    stored_best = float(state.get("best_val", float("inf")))
+    ckpt_config = state.get("config") or {}
+    ckpt_pt = str(ckpt_config.get("prediction_type", "epsilon")).lower()
+    best_val = _resume_best_val(stored_best, ckpt_pt, prediction_type)
+    if best_val != stored_best:
+        logger.warning("Resume prediction_type mismatch (checkpoint=%s, config=%s): reset best_val "
+                       "%.6f -> inf (selection-metric scale differs between modes).",
+                       ckpt_pt, prediction_type, stored_best)
     start_step = int(state.get("step", 0))  # "step" = number of steps already completed
+    freeze_plan = ckpt_config.get("inflate_freeze_plan")
     logger.info("Resumed from %s at step=%s best_val=%.6f", resume_path, start_step, best_val)
-    return start_step, best_val
+    return start_step, best_val, freeze_plan
 
 
 def _load_config(path, fallback):
-    if not path or not os.path.exists(path):
+    # No --config given -> defaults are intended.
+    if not path:
         return _deep_copy_config(fallback)
+    # An EXPLICIT --config that can't be read must FAIL LOUDLY, never silently fall
+    # back to defaults: a silent fallback (e.g. PyYAML missing) once trained many runs
+    # with the wrong config (small default model, prediction_type=epsilon instead of
+    # the requested flow) without any error -- a very costly, hard-to-spot bug.
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"--config path does not exist: {path}")
     try:
         import yaml  # type: ignore
-    except Exception:
-        return _deep_copy_config(fallback)
+    except Exception as exc:
+        raise RuntimeError(
+            f"--config {path} was provided but PyYAML is not importable in this "
+            f"environment, so the config cannot be read. Install it (pip install "
+            f"pyyaml). Refusing to silently fall back to default hyperparameters."
+        ) from exc
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     merged = _deep_copy_config(fallback)

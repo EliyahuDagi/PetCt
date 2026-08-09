@@ -1,0 +1,51 @@
+seed: 42
+output_dir: outputs/diff2d_flow
+# By-patient holdout fractions (multi-patient runs). Test patients are excluded
+# from BOTH train and val. Mirror the train script CLI defaults at runtime.
+val_fraction: 0.2
+test_fraction: 0.1
+slice_manifest: data/training/slices.jsonl
+batch_size: 16
+num_workers: 4
+learning_rate: 1.0e-4
+max_epochs: 200
+# latent_channels / in_channels(2C) / out_channels(C) are runtime-overridden from
+# the AE checkpoint; mirrored here for clarity (B2: latent_channels 8 -> in 16/out 8).
+latent_channels: 8
+# NAC->AC rectified-flow BRIDGE: the trajectory starts FROM the NAC latent (not
+# noise), predicting the velocity NAC-AC along x_tau=(1-tau)AC+tau*NAC. This
+# structurally forces the model to use NAC (fixes the conditioning collapse that
+# capped the epsilon+CFG run at ~0.36 SSIM / negative voxel_r2). See
+# docs/nac_ac_benchmark.md §6 and memory diffusion-generation-collapse.
+prediction_type: flow
+# In flow mode these are auto-disabled in train_diff2d (set here for clarity):
+#  - no classifier-free guidance (NAC is the trajectory start, not a droppable cond)
+#  - latent_scale is a no-op on the bridge (constant scale cancels)
+# perceptual_weight is NOT auto-disabled in diff2d: the flow branch now applies the
+# perceptual term to the velocity-based AC estimate (x_t - tau*v). It is set to 0 here
+# only to keep this config a pure-MSE control; see diff2d_flow_perc.yaml for the 0.1 run.
+cond_dropout_prob: 0.0
+latent_scale: 1.0
+perceptual_weight: 0.0
+model:
+  spatial_dims: 2
+  # Flow feeds ONLY x_t (NAC is the bridge endpoint, not a concat channel), so
+  # in_channels = C, not 2C. main() overrides this from the AE checkpoint via
+  # diffusion_in_channels(latent_channels, is_flow=True); mirrored here for clarity.
+  in_channels: 8
+  out_channels: 8
+  num_channels: [64, 128, 256]
+  attention_levels: [false, true, true]
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+# Geometric-only data augmentation (no intensity transforms). Applied to TRAIN
+# pairs only, with the SAME random geometry on NAC and AC (val/test clean).
+augment:
+  enabled: true
+  flip_prob: 0.5
+  rot90_prob: 0.5
+  affine_prob: 0.3
+  affine_rotate_deg: 5.0
+  affine_scale: 0.05
+  affine_translate: 0.02

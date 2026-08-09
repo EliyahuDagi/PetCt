@@ -20,6 +20,16 @@ latent_channels: 8
 # training as 1/std over a sample of AC latents and embed it in the checkpoint. Set a
 # positive number to pin the value (e.g. to resume deterministically).
 latent_scale: null
+# --- Gradient-masked center-freeze warm-start (Make-A-Video / Video-LDM) ---
+# When inflating a 2D diffusion checkpoint (--inflate_from) into this 3D UNet,
+# optionally FREEZE the inflated 2D spatial prior (pin the center depth slice of every
+# inflated conv + requires_grad=False on all other 2D-derived params) and train ONLY
+# the new depth-axis capacity, then optionally release it. OFF by default: with the
+# flag false the training path is byte-identical to before.
+inflate_freeze_backbone: false
+# Optimizer step at which to release the freeze and fine-tune the whole net.
+# 0 = never (stay depth-only for the whole run); N>0 = unfreeze at step N.
+inflate_unfreeze_step: 0
 model:
   spatial_dims: 3
   in_channels: 16
@@ -33,6 +43,9 @@ loss:
 # on the 3D decode (frozen VGG by default). Reconciles the old perceptual_l1_weight
 # stub. >0 enables; 0 disables (no-op). Backend pluggable: "vgg" / "medical_sam".
 perceptual_weight: 0.1
+# Apply the perceptual term only to low-noise (high-SNR) timesteps t<frac*T, where the
+# one-step x0 estimate is meaningful (t=0 is high SNR here); see PixelGen.
+perceptual_active_frac: 0.7
 perceptual_backend: vgg
 # Geometric-only 3D data augmentation (no intensity transforms). Disabled by default;
 # layered on top of the existing crop/flip/rot90. Applied to TRAIN pairs only, with
