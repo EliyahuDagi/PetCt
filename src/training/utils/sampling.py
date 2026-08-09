@@ -185,3 +185,55 @@ class DiffusionSchedule:
             dir_xt = torch.sqrt(1.0 - acp_prev) * eps
             x = sqrt_acp_prev * x0_pred + dir_xt
         return x
+
+    @torch.no_grad()
+    def flow_sample(self, model_fn, x_init, num_steps=8, spacing="linear"):
+        """Deterministic rectified-flow (NAC->AC bridge) sampling, starting FROM x_init.
+
+        Unlike ``ddim_sample`` (which starts from pure Gaussian noise), the bridge
+        trajectory begins at the source latent ``x_init`` (the NAC latent) and is
+        transported to the target (AC) along the linear path
+        ``x_tau = (1 - tau) * AC + tau * NAC`` with the constant velocity field
+        ``v = NAC - AC`` (``dx_tau/dtau``). With ``tau = t / (T - 1)`` the network
+        predicts ``v`` and we integrate tau from 1 (NAC) down to 0 (AC) by Euler:
+
+            x <- x + (tau_prev - tau) * v        # (tau_prev - tau) < 0 -> moves NAC->AC
+
+        With a perfect (constant) velocity the step coefficients telescope to
+        ``tau_final - tau_init = -1`` and ``x_final = NAC - (NAC - AC) = AC`` exactly,
+        for ANY ``num_steps``. There is no division by ``sqrt(acp)`` (so the cosine
+        terminal-SNR explosion that afflicts ``ddim_sample`` cannot occur) and no
+        ``clip_x0`` is needed.
+
+        Args:
+            model_fn: callable (x_t, t_batch) -> predicted velocity, same shape as x_t.
+            x_init: source latent to start from (the scaled NAC latent), shape
+                (B, C, H, W) or (B, C, D, H, W). NOT random noise.
+            num_steps: number of Euler steps (a near-constant learned field needs few).
+            spacing: integer-timestep grid; only "linear" (uniform tau) is meaningful
+                for a constant-velocity bridge. "karras" (an SNR/sigma notion) has no
+                analog here -- it is accepted for call-site symmetry but behaves as a
+                non-uniform tau grid, which is not recommended.
+        Returns the transported tensor at tau=0 (the predicted AC latent).
+        """
+        T = self.num_train_timesteps
+        if T < 2:
+            raise ValueError("flow_sample requires num_train_timesteps >= 2.")
+        denom = float(T - 1)
+        # Strip a MONAI MetaTensor to a plain tensor: a MetaTensor flowing through a
+        # torch.compile'd UNet trips an aot_autograd detach-dispatch error. Keeping x
+        # plain here also keeps every subsequent rollout step (x = x + dt*v) plain.
+        x = x_init.as_tensor() if hasattr(x_init, "as_tensor") else x_init
+        device = x.device
+        batch = x_init.shape[0]
+        step_indices = self._timesteps_for_spacing(num_steps, spacing)
+        for i, t in enumerate(step_indices):
+            t_batch = torch.full((batch,), int(t), device=device, dtype=torch.long)
+            v = model_fn(x, t_batch)
+            # Force the final step to land exactly at tau=0 (=AC), even if the grid
+            # (e.g. "karras") does not end at index 0.
+            t_prev = step_indices[i + 1] if i + 1 < len(step_indices) else 0
+            tau = int(t) / denom
+            tau_prev = int(t_prev) / denom
+            x = x + (tau_prev - tau) * v
+        return x

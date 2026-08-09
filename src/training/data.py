@@ -747,6 +747,13 @@ def _slice_at(volume, t, size, axis=0):
     return sl.squeeze(0)  # (1,size,size)
 
 
+def _strip_meta(t):
+    """MONAI dict transforms return MetaTensor; convert back to a plain
+    torch.Tensor so downstream torch.compile/AOTAutograd can trace it
+    (it can't dispatch aten.detach on a MetaTensor). No-op for plain tensors."""
+    return t.as_tensor() if hasattr(t, "as_tensor") else t
+
+
 def _apply_aug_single(augment, tensor, key="img"):
     """Apply a built geometric augment callable to one channel-first tensor.
 
@@ -756,7 +763,7 @@ def _apply_aug_single(augment, tensor, key="img"):
     """
     if augment is None:
         return tensor
-    return augment({key: tensor})[key]
+    return _strip_meta(augment({key: tensor})[key])
 
 
 def _apply_aug_pair(augment, a, b, keys=("nac", "ac")):
@@ -769,7 +776,7 @@ def _apply_aug_pair(augment, a, b, keys=("nac", "ac")):
     if augment is None:
         return a, b
     out = augment({keys[0]: a, keys[1]: b})
-    return out[keys[0]], out[keys[1]]
+    return _strip_meta(out[keys[0]]), _strip_meta(out[keys[1]])
 
 
 def sample_slices(volumes, pool, batch_size, size, rng, augment=None):
@@ -795,7 +802,7 @@ def sample_slices(volumes, pool, batch_size, size, rng, augment=None):
     return torch.stack(out, dim=0)
 
 
-def sample_pairs(nac, ac, pool, batch_size, size, rng, augment=None):
+def sample_pairs(nac, ac, pool, batch_size, size, rng, augment=None, axis=None):
     """Sample paired (NAC, AC) 2D slices at matching plane + normalized position.
 
     Each sample picks one orthogonal plane (XY / XZ / YZ) and one normalized
@@ -805,15 +812,20 @@ def sample_pairs(nac, ac, pool, batch_size, size, rng, augment=None):
     ``augment`` (optional built geometric transform) is applied with a SINGLE
     random draw shared across the NAC and AC halves so the pair stays
     spatially corresponding; ``None`` (default) is current behavior.
+
+    ``axis`` (default ``None``) selects the orthogonal plane: ``None`` picks a
+    random plane per sample (current training behavior); an int 0/1/2 forces
+    axial/coronal/sagittal. Used to make the flow VALIDATION sample axial-only so
+    it matches the evaluate.py axial path (avoids an inflated val monitor).
     """
     if nac is None or ac is None:
         raise ValueError("Both NAC and AC volumes are required for NAC->AC training.")
     nac_b, ac_b = [], []
     for _ in range(batch_size):
-        axis = int(rng.randint(0, 3))  # same plane for both halves of the pair
+        ax = int(rng.randint(0, 3)) if axis is None else int(axis)  # same plane for both halves
         t = float(pool[rng.randint(0, len(pool))])
-        n_sl = _slice_at(nac, t, size, axis)
-        a_sl = _slice_at(ac, t, size, axis)
+        n_sl = _slice_at(nac, t, size, ax)
+        a_sl = _slice_at(ac, t, size, ax)
         n_sl, a_sl = _apply_aug_pair(augment, n_sl, a_sl)
         nac_b.append(n_sl)
         ac_b.append(a_sl)
