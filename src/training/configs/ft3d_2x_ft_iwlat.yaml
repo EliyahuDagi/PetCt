@@ -1,0 +1,70 @@
+# FINE-TUNE ARM: iwlat on the 2x chain -- PET-value weighting at 128^3
+#
+# Same change as ft3d_ft_iwlat.yaml (read its header for the what/why and the measured
+# gradient-share table), applied to the OTHER trained flow model: ft3d_2x/best.pt, the 128^3
+# run on the 16-channel 3D AE (ae3d_2x2). Init with --init_from outputs/ft3d_2x/best.pt and
+# the shared outputs/ft3d_flow_p/split.json -- the split ft3d_2x itself trained on -- so the
+# arm is paired against outputs/eval/ft3d_2x/test_s16.json.
+#
+# WHY BOTH BASES: they fail differently. At s16 on the same 41 patients,
+#   ft3d_flow_p (64^3) : psnr 25.45  voxel_r2 0.699  reg_slope 0.842  hot_band -0.100
+#   ft3d_2x    (128^3) : psnr 21.44  voxel_r2 0.356  reg_slope 0.665  hot_band -0.166
+# The 2x chain is currently the WORSE model (it has 4x the voxels to place and, at 15k
+# steps, is very likely undertrained rather than mis-objectived) but it is the one with the
+# resolution to represent a small hot lesion at all -- so it has the most to gain if the
+# loss stops spending 80% of itself on air, and the most to lose to hallucination.
+#
+# One 16^3 latent cell covers an 8^3 image block here (vs 4^3 at 64^3), so avg-pooling
+# dilutes a small lesion twice as hard. The measured gradient shares barely moved
+# (hot 11.9% vs 12.1% at 64^3), so this stays on avg for comparability; iw_pool: max is the
+# knob to try if lesion contrast is the thing that ends up limiting.
+seed: 42
+output_dir: outputs/ft3d_2x_ft_iwlat
+val_fraction: 0.2
+test_fraction: 0.1
+volume_manifest: data/training/volumes.jsonl
+batch_size: 4
+grad_accum_steps: 4
+num_workers: 2
+learning_rate: 5.0e-5
+max_epochs: 150
+latent_channels: 16
+prediction_type: flow
+latent_scale: 1.0
+inflate_freeze_backbone: false
+inflate_unfreeze_step: 0
+perceptual_weight: 0.0
+quant_loss: none
+quant_weight: 0.0
+# --- the arm itself (see ft3d_ft_iwlat.yaml for the rationale behind each value) ---
+latent_weight: intensity
+bg_weight: 0.1
+iw_source: ac
+iw_gamma: 1.0
+iw_percentile: 99.0
+iw_clip: 1.0
+iw_pool: avg
+flow_tau_dist: uniform
+flow_loss_weighting: none
+model:
+  spatial_dims: 3
+  # Flow feeds ONLY x_t, so in_channels = C (16 here), not 2C; main() re-derives both from
+  # the 3D AE checkpoint at runtime -- mirrored here for clarity.
+  in_channels: 16
+  out_channels: 16
+  num_channels: [64, 128, 256]
+  attention_levels: [false, true, true]
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+augment:
+  enabled: true
+  flip_prob: 0.5
+  rot90_prob: 0.5
+  affine_prob: 0.3
+  affine_rotate_deg: 7.0
+  affine_scale: 0.1
+  affine_translate: 0.02
+  elastic_prob: 0.0
+  elastic_sigma_range: [1.0, 2.0]
+  elastic_magnitude_range: [1.0, 2.0]

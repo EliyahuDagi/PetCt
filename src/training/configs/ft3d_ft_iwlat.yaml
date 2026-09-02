@@ -1,0 +1,99 @@
+# FINE-TUNE ARM: iwlat -- PET-VALUE weighting of the LATENT velocity MSE
+#
+# Fine-tunes the best 3D flow model (ft3d_flow_p/best.pt via --init_from) on the SAME
+# partition (ft3d_flow_p/split.json), so the result is paired per patient against the
+# baseline's outputs/eval/ft3d_flow_p/test_s16_clamped.json.
+#
+# WHAT IT CHANGES: every position of the flow loss `mean((v_pred - v_target)^2)` is
+# weighted by how much PET uptake the GT holds there,
+#
+#     w = 0.1 + 0.9 * clamp(ac / q, 0, 1) ^ 1.0        (q = p99 of the AC foreground)
+#
+# pooled onto the 16^3 LATENT grid and normalized by its mean (so the loss scale, and
+# hence the effective LR, is unchanged -- only the balance moves).
+#
+# WHY THE LATENT AND NOT THE DECODE: the existing `iw` arm (quant_loss:
+# intensity_weighted) makes the same "hot voxels count more" statement but must decode the
+# in-graph AC estimate at full resolution every step to say it. The PET value is a property
+# of the TARGET, which is known in image space regardless of where the loss lives, so the
+# weight can simply be pooled onto the latent grid the loss already uses -- no decode, no
+# extra memory. Cost: the weight is a block average (one 16^3 cell covers a 4^3 image
+# block), not per-voxel.
+#
+# WHY A PERCENTILE AND NOT THE MAX: dividing by the max lets a single hot voxel (bladder,
+# injection site) shrink every other weight toward the floor. q is the p99 of the
+# foreground, and both the foreground threshold and q are percentile-based, so a 50x spike
+# does not move them (verified in test_quant_losses.py). On the CURRENT data this is
+# insurance rather than a live fix: normalize_volume already clips at p99, so the measured
+# fg-p99 is exactly 1.0 = the max.
+#
+# MEASURED, before any GPU time (scripts/_diag_intensity_weight.py, 6 held-out patients,
+# share of the velocity-MSE gradient by GT-uptake band):
+#
+#                        air    cold     mid     hot
+#   today (plain mean)  80.6%   10.8%    6.2%    2.4%
+#   bg_weight 0.1 gate  60.3%   21.6%   12.9%    5.2%
+#   THIS ARM            53.1%   16.5%   18.4%   12.1%      <- hot band gets 5x the gradient
+#
+# gamma 1.0 / p99 / avg-pool / source=ac was picked from that table: gamma 2 buys no extra
+# hot share but pushes air back up to 64%, source=union dilutes the hot band to 9.4% (NAC's
+# bright skin is not the target), and max-pool trades hot share for cold.
+#
+# TARGET: the under-dispersion of the baseline -- reg_slope 0.842 (want 1.0), intercept
+# +0.059, hot_band_rel_error -0.100. Unlike bg_weight this IS intensity-monotone, so it can
+# reward pushing values up: judge it on hallucinated uptake (visual triplets, unclamped
+# max_rel_error) too, not only on the bias metrics.
+#
+# RECIPE differs from the earlier six-arm ablation ON PURPOSE. That ablation ran 1500 steps
+# at lr 1e-5 and was INERT: every arm landed within 0.005 of the baseline's reg_slope
+# (0.8420 -> 0.8420..0.8465) and 0.02 dB of its PSNR. This arm therefore trains 4x longer at
+# the baseline's own 5e-5, and scripts/_ft_iwlat.sh runs a MATCHED control at the same
+# LR/steps so the difference stays attributable.
+seed: 42
+output_dir: outputs/ft3d_ft_iwlat
+val_fraction: 0.2
+test_fraction: 0.1
+volume_manifest: data/training/volumes.jsonl
+batch_size: 4
+grad_accum_steps: 4
+num_workers: 4
+learning_rate: 5.0e-5
+max_epochs: 150
+latent_channels: 8
+prediction_type: flow
+latent_scale: 1.0
+inflate_freeze_backbone: false
+inflate_unfreeze_step: 0
+perceptual_weight: 0.0
+quant_loss: none
+quant_weight: 0.0
+# --- the arm itself ---
+latent_weight: intensity   # none | occupancy (the old bg_weight gate) | intensity
+bg_weight: 0.1             # floor: what a pure-air latent position is worth
+iw_source: ac              # ac | nac | union -- whose PET value sets the weight
+iw_gamma: 1.0              # >1 concentrates on the hottest tissue, <1 flattens
+iw_percentile: 99.0        # foreground percentile used as the normalizer q
+iw_clip: 1.0               # cap on ac/q, so no position can ever run away
+iw_pool: avg               # avg | max pooling of the GT map onto the latent grid
+flow_tau_dist: uniform
+flow_loss_weighting: none
+model:
+  spatial_dims: 3
+  in_channels: 8
+  out_channels: 8
+  num_channels: [64, 128, 256]
+  attention_levels: [false, true, true]
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+augment:
+  enabled: true
+  flip_prob: 0.5
+  rot90_prob: 0.5
+  affine_prob: 0.3
+  affine_rotate_deg: 7.0
+  affine_scale: 0.1
+  affine_translate: 0.02
+  elastic_prob: 0.0
+  elastic_sigma_range: [1.0, 2.0]
+  elastic_magnitude_range: [1.0, 2.0]

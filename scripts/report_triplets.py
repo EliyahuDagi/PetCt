@@ -720,7 +720,24 @@ def _load_cohort(path):
         raise SystemExit(f"--cohort_json not found: {p}")
     meta = json.loads(p.read_text(encoding="utf-8"))
     return {"n": meta["n_patients_evaluated"], "summary": meta["summary"],
-            "per_patient": meta["per_patient"]}
+            "per_patient": [_cohort_row(r) for r in meta["per_patient"]]}
+
+
+def _cohort_row(row):
+    """Normalize one cohort row to this report's shape: pid/path/name/dataset/metrics.
+
+    Accepts BOTH this report's own metrics.json (already nested under "metrics") and an
+    ``src.training.evaluate`` result, whose rows are flat metric keys plus "patient".
+    Reusing the eval json matters: it is the same 41-patient run the arm is judged on, so
+    --pick_n spans the distribution the numbers actually came from, and no separate
+    full-split report has to be rendered first just to choose a subset.
+    """
+    if "metrics" in row:
+        return row
+    path = row.get("patient") or row.get("path") or ""
+    metrics = {k: v for k, v in row.items() if k not in ("patient", "path")}
+    return {"pid": Path(path).name, "path": str(path), "name": Path(path).name,
+            "dataset": Path(path).parent.name, "metrics": metrics}
 
 
 def _pick_spread(cohort, n_pick, metric):

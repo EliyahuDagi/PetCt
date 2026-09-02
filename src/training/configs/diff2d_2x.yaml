@@ -1,0 +1,57 @@
+# ===== 2x CHAIN (diff2d_2x) =====
+# Full retrain at the configuration the measurements support:
+#   * 3D at 128^3 (native->64^3->native loses 6.1% of hot-tissue signal; 128^3 loses 2.4%).
+#     Measured against NATIVE truth, the 128^3 AE cut p95 error 0.057->0.025 and hot-band
+#     0.068->0.047 vs the 64^3 AE -- >6x the dynamic-range gain the entire loss-engineering
+#     ablation achieved (+0.029 slope vs +0.0045).
+#   * latent_channels 16 (was 8). The 128^3 AE reached only 30.45 dB against a 37.92 dB
+#     resolution ceiling -- it gave up 7.48 dB, versus 1.74 dB for the 64^3 AE. Resolution
+#     is no longer the bottleneck; the 16^3x8 latent is. Doubling CHANNELS (not the spatial
+#     grid) buys capacity while the flow UNet cost grows ~linearly instead of ~8x.
+#   * 3D keeps a 16^3 latent grid via the AE's extra level, so ft3d stays affordable.
+# Warm-started from the previous chain via --init_from (weights only, strict=False: the
+# latent/quant convs change shape at 8->16 and are re-initialised, everything else carries
+# over), which is why the step budgets below are well under the originals.
+seed: 42
+output_dir: outputs/diff2d_2x
+val_fraction: 0.2
+test_fraction: 0.1
+slice_manifest: data/training/slices.jsonl
+batch_size: 16
+num_workers: 4
+learning_rate: 1.0e-4
+max_epochs: 200
+latent_channels: 16
+# NAC->AC rectified-flow BRIDGE (see diff2d_flow.yaml) + a PERCEPTUAL term.
+prediction_type: flow
+# Flow-mode auto-disabled: cond-dropout (NAC is the trajectory start), latent-scale
+# (no-op on the bridge), Min-SNR weighting.
+cond_dropout_prob: 0.0
+latent_scale: 1.0
+# Perceptual term ON for this ablation: computed on the flow AC estimate
+# (x_t - tau*v) decoded to image space, vs the real AC. VGG first (cheap A/B control);
+# swap to "medical_sam" (MedSAM ViT-B) in the follow-up ablation.
+# Perceptual OFF: the 8-arm fine-tune ablation found the LPL and VGG perceptual arms inert
+# (and the RFPP-weighted combination actively harmful, -1.0 dB). It was inherited from
+# diff2d_flow_perc.yaml; keeping it would only cost time.
+perceptual_weight: 0.0
+perceptual_backend: vgg
+model:
+  spatial_dims: 2
+  # Flow feeds ONLY x_t (no NAC concat) -> in_channels = C. main() overrides this
+  # from the AE checkpoint via diffusion_in_channels(latent_channels, is_flow=True).
+  in_channels: 16
+  out_channels: 16
+  num_channels: [64, 128, 256]
+  attention_levels: [false, true, true]
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+augment:
+  enabled: true
+  flip_prob: 0.5
+  rot90_prob: 0.5
+  affine_prob: 0.3
+  affine_rotate_deg: 5.0
+  affine_scale: 0.05
+  affine_translate: 0.02

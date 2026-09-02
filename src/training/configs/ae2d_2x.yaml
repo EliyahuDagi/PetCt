@@ -1,0 +1,53 @@
+# ===== 2x CHAIN (ae2d_2x) =====
+# Full retrain at the configuration the measurements support:
+#   * 3D at 128^3 (native->64^3->native loses 6.1% of hot-tissue signal; 128^3 loses 2.4%).
+#     Measured against NATIVE truth, the 128^3 AE cut p95 error 0.057->0.025 and hot-band
+#     0.068->0.047 vs the 64^3 AE -- >6x the dynamic-range gain the entire loss-engineering
+#     ablation achieved (+0.029 slope vs +0.0045).
+#   * latent_channels 16 (was 8). The 128^3 AE reached only 30.45 dB against a 37.92 dB
+#     resolution ceiling -- it gave up 7.48 dB, versus 1.74 dB for the 64^3 AE. Resolution
+#     is no longer the bottleneck; the 16^3x8 latent is. Doubling CHANNELS (not the spatial
+#     grid) buys capacity while the flow UNet cost grows ~linearly instead of ~8x.
+#   * 3D keeps a 16^3 latent grid via the AE's extra level, so ft3d stays affordable.
+# Warm-started from the previous chain via --init_from (weights only, strict=False: the
+# latent/quant convs change shape at 8->16 and are re-initialised, everything else carries
+# over), which is why the step budgets below are well under the originals.
+seed: 42
+output_dir: outputs/ae2d_2x
+# By-patient holdout fractions (multi-patient runs). Test patients are excluded
+# from BOTH train and val. These mirror the train script CLI defaults
+# (--val_fraction / --test_fraction), which remain the source of truth at runtime.
+val_fraction: 0.2
+test_fraction: 0.1
+slice_manifest: data/training/slices.jsonl
+batch_size: 16
+num_workers: 4
+learning_rate: 1.0e-4
+max_epochs: 100
+# Source of truth for latent_channels: ae3d/diff2d/ft3d derive this from the AE
+# checkpoint at runtime (the values mirrored in their configs are informational).
+latent_channels: 16
+model:
+  spatial_dims: 2
+  in_channels: 1   # IMAGE channels (grayscale PET), not latent
+  out_channels: 1  # IMAGE channels, not latent
+  block_out_channels: [64, 128, 256]
+  num_res_blocks: 2
+loss:
+  recon_l1_weight: 1.0
+  kl_weight: 1.0e-6
+# Perceptual loss on the AE reconstruction vs target (frozen VGG by default).
+# >0 enables it; 0 disables (no-op). Backend pluggable: "vgg" now, "medical_sam" later.
+# perceptual_weights_path: optional local VGG16 weights (null/omitted -> torchvision pretrained).
+perceptual_weight: 0.1
+perceptual_backend: vgg
+# Geometric-only data augmentation (no intensity transforms). Disabled by default;
+# set enabled: true to turn it on. Applied to TRAIN slices only (val stays clean).
+augment:
+  enabled: true
+  flip_prob: 0.5          # per spatial axis (H, W)
+  rot90_prob: 0.5         # 90-degree rotations in the H-W plane
+  affine_prob: 0.3        # mild rotate/scale/translate
+  affine_rotate_deg: 5.0
+  affine_scale: 0.05
+  affine_translate: 0.02  # fraction of axis length
