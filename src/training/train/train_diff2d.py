@@ -27,6 +27,7 @@ from src.training.utils.augment import build_aug_2d
 from src.training.models.autoencoder2d import ae_decode, ae_encode, build_autoencoder_2d
 from src.training.models.diffusion2d import build_diffusion_2d
 from src.training.utils.checkpointing import (
+    init_weights_from,
     capture_rng_state,
     load_checkpoint,
     resolve_resume_path,
@@ -36,6 +37,7 @@ from src.training.utils.checkpointing import (
 from src.training.utils.image_metrics import clamp_unit, image_quality_metrics
 from src.training.utils.logging import setup_logging
 from src.training.utils.perceptual import build_perceptual_loss
+from src.training.utils.quant_losses import build_latent_weight
 from src.training.utils.metrics import MetricsWriter
 from src.training.utils.perf import (
     autocast,
@@ -458,6 +460,12 @@ def main():
     parser.add_argument("--save_dir", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--init_from", default=None,
+        help="Warm start: load MODEL WEIGHTS ONLY from an existing diff2d checkpoint "
+             "(strict=False; survives a latent_channels change, which alters the in/out "
+             "convs). Unlike --resume it keeps a fresh optimizer/LR/step.",
+    )
+    parser.add_argument(
         "--resume",
         nargs="?",
         const="auto",
@@ -506,6 +514,18 @@ def main():
         "flow_tau_dist": "uniform",     # uniform | ushaped  (RFPP U-shaped density)
         "flow_tau_a": 4.0,              # ushaped sharpness
         "flow_loss_weighting": "none",  # none | rfpp        ((1-tau)-weighted MSE)
+        # Spatial weight map on the velocity MSE (flow only), floored at bg_weight:
+        #   "occupancy" -- binary anatomy gate, value-independent
+        #   "intensity" -- ramps with the GT PET value (see quant_losses)
+        #   "none"      -- off. bg_weight=1.0 makes any mode a no-op, which is the default.
+        "latent_weight": "occupancy",
+        "bg_weight": 1.0,
+        "bg_fg_threshold": None,
+        "iw_source": "ac",       # ac | nac | union -- whose PET value sets the weight
+        "iw_gamma": 1.0,         # >1 concentrates on the hottest tissue, <1 flattens
+        "iw_percentile": 99.0,   # foreground percentile used as the normalizer
+        "iw_clip": 1.0,          # cap on pet/q before the ramp (1.0 = no runaway weights)
+        "iw_pool": "avg",        # avg | max pooling of the GT map onto the latent grid
         "model": {
             "num_channels": [16, 32, 64],
             "attention_levels": [False, True, True],
@@ -552,6 +572,13 @@ def main():
     # raw_model owns the weights (EMA / state_dict / resume); model is the
     # (optionally) compiled forward handle. They share parameters.
     raw_model = build_model(config).to(device)
+    # Warm start (weights only) BEFORE compile, so the compiled graph captures the loaded
+    # weights. Skipped when --resume is active: a resume fully restores this run's own
+    # state and must take precedence over an external initializer.
+    if resume_path is None and args.init_from:
+        if not os.path.exists(args.init_from):
+            raise FileNotFoundError(f"--init_from checkpoint not found: {args.init_from}")
+        init_weights_from(raw_model, args.init_from, logger, label=TASK)
     raw_model = to_model_memory_format(raw_model, SPATIAL_DIMS)
     optimizer = torch.optim.Adam(raw_model.parameters(), lr=float(config.get("learning_rate", 1.0e-4)))
     model = maybe_compile(raw_model, logger)
@@ -600,6 +627,25 @@ def main():
     if is_flow and (flow_tau_dist != "uniform" or flow_loss_weighting != "none"):
         logger.info("Flow loss shaping: tau_dist=%s (a=%.3g) loss_weighting=%s "
                     "(RFPP, arXiv 2405.20320)", flow_tau_dist, flow_tau_a, flow_loss_weighting)
+    # Per-position weighting of the velocity MSE, built from the GT slices (never from the
+    # prediction): "occupancy" gates on WHERE anatomy is, "intensity" ramps with HOW HOT it
+    # is. Floored at bg_weight, so the 1.0 default leaves the plain mean untouched.
+    bg_weight = float(config.get("bg_weight", 1.0) if config.get("bg_weight") is not None else 1.0)
+    latent_weight_mode = str(config.get("latent_weight", "occupancy") or "occupancy")
+    latent_weight_fn = None
+    if is_flow and bg_weight < 1.0:
+        latent_weight_fn = build_latent_weight(
+            latent_weight_mode, bg_weight=bg_weight,
+            fg_threshold=config.get("bg_fg_threshold"),
+            source=config.get("iw_source", "ac"), gamma=float(config.get("iw_gamma", 1.0)),
+            percentile=float(config.get("iw_percentile", 99.0)),
+            clip=float(config.get("iw_clip", 1.0)), pool=config.get("iw_pool", "avg"),
+        )
+        logger.info("Latent velocity-MSE weighting: mode=%s floor=%.3g source=%s gamma=%.3g "
+                    "percentile=%.4g clip=%.3g pool=%s", latent_weight_mode, bg_weight,
+                    config.get("iw_source", "ac"), float(config.get("iw_gamma", 1.0)),
+                    float(config.get("iw_percentile", 99.0)), float(config.get("iw_clip", 1.0)),
+                    config.get("iw_pool", "avg"))
 
     rng = np.random.RandomState(seed)
     batch_size = int(config.get("batch_size", 4))
@@ -742,9 +788,12 @@ def main():
         model.train()
         optimizer.zero_grad(set_to_none=True)
         if is_flow:
+            wmap = (None if latent_weight_fn is None
+                    else latent_weight_fn(ac_img, nac_img, ac_lat.shape[2:]))
             mse_loss, x_t, timesteps, pred, _ = flow_loss(
                 model, schedule, ac_lat, nac_lat,
                 tau_dist=flow_tau_dist, tau_a=flow_tau_a, loss_weighting=flow_loss_weighting,
+                weight_map=wmap,
             )
         else:
             # CFG: drop the conditioning on a fraction of samples so the UNet learns the

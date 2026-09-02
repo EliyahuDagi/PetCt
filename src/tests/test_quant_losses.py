@@ -337,3 +337,212 @@ class TestFlowLossWeightMapIsNoOp(unittest.TestCase):
         b, *_ = flow_loss(m, self.sched, self.ac, nac, weight_map=w)
         self.assertLess(float(b), float(a),
                         "down-weighting the high-error region must reduce the loss")
+
+
+class TestLatentIntensityWeight(unittest.TestCase):
+    """PET-value weighting of the LATENT velocity MSE (the cheap sibling of the iw arm)."""
+
+    def _vol(self, size=8, body=0.3, hot=1.0):
+        """A dim 'body' block with a small hot lesion inside it; the rest is air."""
+        v = torch.zeros(2, 1, size, size, size)
+        v[:, :, 2:6, 2:6, 2:6] = body
+        v[:, :, 4:5, 4:5, 4:5] = hot
+        return v
+
+    def test_disabled_returns_none(self):
+        from src.training.utils.quant_losses import latent_intensity_weight
+        v = self._vol()
+        for floor in (None, 1.0, 1.5):
+            self.assertIsNone(latent_intensity_weight([v], (4, 4, 4), floor=floor))
+
+    def test_shape_and_range(self):
+        from src.training.utils.quant_losses import latent_intensity_weight
+        w = latent_intensity_weight([self._vol()], (4, 4, 4), floor=0.1)
+        self.assertEqual(tuple(w.shape), (2, 1, 4, 4, 4))
+        self.assertGreaterEqual(float(w.min()), 0.1 - 1e-6)
+        self.assertLessEqual(float(w.max()), 1.0 + 1e-6)
+
+    def test_air_gets_the_floor_and_hot_tissue_more(self):
+        from src.training.utils.quant_losses import latent_intensity_weight
+        w = latent_intensity_weight([self._vol()], (4, 4, 4), floor=0.1)[0, 0]
+        self.assertAlmostEqual(float(w[0, 0, 0]), 0.1, places=5)     # corner = pure air
+        self.assertGreater(float(w[2, 2, 2]), float(w[1, 1, 1]))     # lesion cell > body cell
+
+    def test_weight_RISES_with_brightness(self):
+        """The defining difference from the occupancy weight, which ignores intensity."""
+        from src.training.utils.quant_losses import (
+            latent_intensity_weight,
+            latent_occupancy_weight,
+        )
+        dim = torch.zeros(1, 1, 8, 8, 8)
+        dim[:, :, 2:6, 2:6, 2:6] = 0.2
+        dim[:, :, 2:3, 2:3, 2:3] = 1.0          # one hot corner fixes the normalizer
+        bright = dim.clone()
+        bright[:, :, 4:6, 4:6, 4:6] = 1.0       # brighten part of the SAME anatomy
+
+        cell = (slice(None), slice(None), slice(2, 3), slice(2, 3), slice(2, 3))
+        a = latent_intensity_weight([dim], (4, 4, 4), floor=0.1)[cell]
+        b = latent_intensity_weight([bright], (4, 4, 4), floor=0.1)[cell]
+        self.assertGreater(float(b), float(a))
+        # ...whereas the occupancy weight is unchanged: same anatomy, same mask.
+        oa = latent_occupancy_weight([dim], (4, 4, 4), bg_weight=0.1)[cell]
+        ob = latent_occupancy_weight([bright], (4, 4, 4), bg_weight=0.1)[cell]
+        self.assertAlmostEqual(float(oa), float(ob), places=6)
+
+    def test_a_single_outlier_does_not_collapse_the_rest(self):
+        """The point of the percentile normalizer: one runaway voxel must not zero the map.
+
+        With a max-normalizer a lone voxel 50x the tissue level would divide every other
+        weight down to the floor. The p99-of-foreground scale is unmoved by it.
+        """
+        from src.training.utils.quant_losses import latent_intensity_weight
+        clean = torch.zeros(1, 1, 16, 16, 16)
+        clean[:, :, 4:12, 4:12, 4:12] = 0.4
+        spiked = clean.clone()
+        spiked[:, :, 0, 0, 0] = 50.0            # an injection-site / decoder-spike outlier
+
+        kw = dict(floor=0.1, percentile=99.0)
+        a = latent_intensity_weight([clean], (4, 4, 4), **kw)
+        b = latent_intensity_weight([spiked], (4, 4, 4), **kw)
+        body = (slice(None), slice(None), slice(1, 3), slice(1, 3), slice(1, 3))
+        self.assertGreater(float(b[body].mean()), 0.9 * float(a[body].mean()))
+
+        # A pure max-normalizer (percentile=100) is exactly the failure mode being avoided.
+        c = latent_intensity_weight([spiked], (4, 4, 4), floor=0.1, percentile=100.0)
+        self.assertLess(float(c[body].mean()), 0.2 * float(a[body].mean()))
+
+    def test_clip_bounds_the_ramp(self):
+        from src.training.utils.quant_losses import latent_intensity_weight
+        v = torch.zeros(1, 1, 16, 16, 16)
+        v[:, :, 4:12, 4:12, 4:12] = 0.3         # 512 foreground voxels set the p99...
+        v[:, :, 8, 8, 8] = 3.0                  # ...so this one is 10x above it
+        w = latent_intensity_weight([v], (16, 16, 16), floor=0.0, clip=1.0)
+        self.assertLessEqual(float(w.max()), 1.0 + 1e-6)
+        w2 = latent_intensity_weight([v], (16, 16, 16), floor=0.0, clip=4.0)
+        self.assertAlmostEqual(float(w2.max()), 4.0, places=4)
+
+    def test_gamma_concentrates_on_the_hottest(self):
+        from src.training.utils.quant_losses import latent_intensity_weight
+        v = self._vol()
+        lo = latent_intensity_weight([v], (4, 4, 4), floor=0.0, gamma=1.0)
+        hi = latent_intensity_weight([v], (4, 4, 4), floor=0.0, gamma=3.0)
+        # gamma>1 pushes mid-uptake weights down relative to the peak.
+        self.assertLess(float(hi.mean()) / float(hi.max()), float(lo.mean()) / float(lo.max()))
+
+    def test_max_pool_preserves_a_small_lesion(self):
+        from src.training.utils.quant_losses import latent_intensity_weight
+        v = torch.zeros(1, 1, 8, 8, 8)
+        v[:, :, 2:6, 2:6, 2:6] = 0.1
+        v[:, :, 4, 4, 4] = 1.0                  # one hot voxel inside a 2^3 latent block
+        avg = latent_intensity_weight([v], (4, 4, 4), floor=0.0, pool="avg")
+        mx = latent_intensity_weight([v], (4, 4, 4), floor=0.0, pool="max")
+        self.assertAlmostEqual(float(mx[0, 0, 2, 2, 2]), 1.0, places=5)
+        self.assertLess(float(avg[0, 0, 2, 2, 2]), 0.5)
+
+    def test_works_in_2d(self):
+        from src.training.utils.quant_losses import latent_intensity_weight
+        v = torch.zeros(3, 1, 16, 16)
+        v[:, :, 4:12, 4:12] = 0.5
+        w = latent_intensity_weight([v], (4, 4), floor=0.1)
+        self.assertEqual(tuple(w.shape), (3, 1, 4, 4))
+
+    def test_per_sample_normalization(self):
+        """A dim patient and a bright one must get the SAME map -- the scale is per-sample."""
+        from src.training.utils.quant_losses import latent_intensity_weight
+        v = torch.zeros(2, 1, 8, 8, 8)
+        v[0, :, 2:6, 2:6, 2:6] = 0.2
+        v[1, :, 2:6, 2:6, 2:6] = 0.9            # same anatomy, 4.5x brighter
+        w = latent_intensity_weight([v], (4, 4, 4), floor=0.1)
+        self.assertTrue(torch.allclose(w[0], w[1], atol=1e-5))
+
+    def test_all_zero_volume_is_safe(self):
+        from src.training.utils.quant_losses import latent_intensity_weight
+        w = latent_intensity_weight([torch.zeros(1, 1, 8, 8, 8)], (4, 4, 4), floor=0.1)
+        self.assertTrue(torch.isfinite(w).all())
+        self.assertAlmostEqual(float(w.max()), 0.1, places=5)
+
+    def test_no_gradient_reaches_the_weight(self):
+        """The map is built from GT only; it must never be a path the model can optimize."""
+        from src.training.utils.quant_losses import latent_intensity_weight
+        v = self._vol().requires_grad_(True)
+        w = latent_intensity_weight([v], (4, 4, 4), floor=0.1)
+        self.assertFalse(w.requires_grad)
+
+    def test_bad_args_raise(self):
+        from src.training.utils.quant_losses import latent_intensity_weight
+        v = self._vol()
+        with self.assertRaises(ValueError):
+            latent_intensity_weight([v], (4, 4, 4), floor=-0.1)
+        with self.assertRaises(ValueError):
+            latent_intensity_weight([v], (4, 4, 4), clip=0.0)
+        with self.assertRaises(ValueError):
+            latent_intensity_weight([v], (4, 4, 4), gamma=0.0)
+        with self.assertRaises(ValueError):
+            latent_intensity_weight([v], (4, 4, 4), pool="median")
+
+
+class TestBuildLatentWeight(unittest.TestCase):
+    """The config-driven factory the train scripts call."""
+
+    def setUp(self):
+        self.ac = torch.zeros(1, 1, 8, 8, 8)
+        self.ac[:, :, 2:6, 2:6, 2:6] = 1.0          # AC anatomy on the left-ish block
+        self.nac = torch.zeros(1, 1, 8, 8, 8)
+        self.nac[:, :, 2:6, 2:6, 6:8] = 1.0         # NAC anatomy somewhere else
+
+    def test_none_disables(self):
+        from src.training.utils.quant_losses import build_latent_weight
+        self.assertIsNone(build_latent_weight("none"))
+        self.assertIsNone(build_latent_weight(None))
+
+    def test_unknown_raises(self):
+        from src.training.utils.quant_losses import build_latent_weight
+        with self.assertRaises(ValueError):
+            build_latent_weight("brightness")
+
+    def test_occupancy_default_is_the_previous_behaviour(self):
+        from src.training.utils.quant_losses import (
+            build_latent_weight,
+            latent_occupancy_weight,
+        )
+        fn = build_latent_weight("occupancy", bg_weight=0.1)
+        got = fn(self.ac, self.nac, (4, 4, 4))
+        want = latent_occupancy_weight([self.ac, self.nac], (4, 4, 4), bg_weight=0.1)
+        self.assertTrue(torch.allclose(got, want))
+
+    def test_occupancy_off_at_unit_weight(self):
+        from src.training.utils.quant_losses import build_latent_weight
+        self.assertIsNone(build_latent_weight("occupancy", bg_weight=1.0)(self.ac, self.nac, (4, 4, 4)))
+
+    def test_source_selects_the_volume(self):
+        from src.training.utils.quant_losses import build_latent_weight
+        kw = dict(bg_weight=0.1)
+        w_ac = build_latent_weight("intensity", source="ac", **kw)(self.ac, self.nac, (4, 4, 4))
+        w_nac = build_latent_weight("intensity", source="nac", **kw)(self.ac, self.nac, (4, 4, 4))
+        w_u = build_latent_weight("intensity", source="union", **kw)(self.ac, self.nac, (4, 4, 4))
+        self.assertFalse(torch.allclose(w_ac, w_nac))
+        self.assertGreater(float(w_u.mean()), float(w_ac.mean()))
+        self.assertGreater(float(w_u.mean()), float(w_nac.mean()))
+
+    def test_unknown_source_raises(self):
+        from src.training.utils.quant_losses import build_latent_weight
+        with self.assertRaises(ValueError):
+            build_latent_weight("intensity", source="both")
+
+    def test_intensity_map_is_usable_by_flow_loss(self):
+        """End-to-end shape contract: the map must broadcast over the latent channel dim."""
+        from src.training.train.train_diff2d import flow_loss
+        from src.training.utils.quant_losses import build_latent_weight
+        from src.training.utils.sampling import DiffusionSchedule
+
+        class _Const(torch.nn.Module):
+            def forward(self, x, t):
+                return torch.zeros_like(x)
+
+        sched = DiffusionSchedule(num_train_timesteps=50)
+        ac_lat = torch.zeros(1, 3, 4, 4, 4)
+        nac_lat = torch.ones(1, 3, 4, 4, 4)
+        w = build_latent_weight("intensity", bg_weight=0.1)(self.ac, self.nac, ac_lat.shape[2:])
+        self.assertEqual(tuple(w.shape), (1, 1, 4, 4, 4))
+        loss, *_ = flow_loss(_Const(), sched, ac_lat, nac_lat, weight_map=w)
+        self.assertTrue(torch.isfinite(loss))

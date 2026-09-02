@@ -56,6 +56,7 @@ from src.training.train.train_diff2d import (
     x0_estimate_latent,
 )
 from src.training.utils.checkpointing import (
+    init_weights_from,
     capture_rng_state,
     load_checkpoint,
     resolve_resume_path,
@@ -65,7 +66,7 @@ from src.training.utils.checkpointing import (
 from src.training.utils.image_metrics import clamp_unit, image_quality_metrics
 from src.training.utils.logging import setup_logging
 from src.training.utils.perceptual import build_perceptual_loss
-from src.training.utils.quant_losses import build_quant_loss, latent_occupancy_weight
+from src.training.utils.quant_losses import build_latent_weight, build_quant_loss
 from src.training.utils.metrics import MetricsWriter
 from src.training.utils.perf import (
     autocast,
@@ -186,34 +187,6 @@ def _reuse_split(split_json, patients, logger):
             "%d enumerated patient(s) are NOT in %s and are excluded from training "
             "(training on them could leak into that split's test set).", extra, split_json)
     return out[0], out[1], out[2]
-
-
-def _init_weights_from(model, ckpt_path, logger):
-    """Load MODEL WEIGHTS ONLY from a 3D diffusion checkpoint (fine-tune init).
-
-    Unlike ``--resume`` this deliberately does NOT restore the optimizer, LR schedule,
-    global step, EMA or ``best_val`` -- the point is to start a SHORT new run from an
-    already-good model with a fresh (typically much smaller) LR schedule. Unlike
-    ``--inflate_from`` the checkpoint is already 3D, so no inflation happens.
-
-    Prefers the EMA shadow weights when present (that is what eval loads, so it is the
-    model whose quality the fine-tune is starting from).
-    """
-    state = load_checkpoint(ckpt_path)
-    ema_state = state.get("ema")
-    sd = None
-    if isinstance(ema_state, dict):
-        sd = ema_state.get("shadow")
-    src = "EMA shadow" if sd else "raw model"
-    sd = sd or state.get("model", state)
-    incompatible = model.load_state_dict(sd, strict=False)
-    missing = len(getattr(incompatible, "missing_keys", []) or [])
-    unexpected = len(getattr(incompatible, "unexpected_keys", []) or [])
-    logger.info("Initialized weights from %s (%s): %d missing, %d unexpected key(s).",
-                ckpt_path, src, missing, unexpected)
-    if missing or unexpected:
-        logger.warning("Weight init was PARTIAL -- architecture mismatch with %s?", ckpt_path)
-    return state.get("config", {})
 
 
 def main():
@@ -339,6 +312,21 @@ def main():
         # intensity weighting it cannot encourage saturation.
         "bg_weight": 1.0,
         "bg_fg_threshold": None,
+        # Which spatial weight map that floor belongs to (flow only):
+        #   "occupancy" -- binary anatomy gate, value-independent (the original behaviour)
+        #   "intensity" -- ramps with the GT PET value, w = bg + (1-bg)*(pet/q)^gamma with
+        #                  q an outlier-resistant percentile of the foreground, so a single
+        #                  saturated voxel cannot shrink every other weight. Evaluated on
+        #                  the SMALL latent grid (a pooled GT map), NOT on a full-resolution
+        #                  decode -- contrast quant_loss: intensity_weighted, which pays for
+        #                  the decode. Intensity-monotone => can reward hallucinated uptake.
+        #   "none"      -- off
+        "latent_weight": "occupancy",
+        "iw_source": "ac",       # ac | nac | union -- whose PET value sets the weight
+        "iw_gamma": 1.0,         # >1 concentrates on the hottest tissue, <1 flattens
+        "iw_percentile": 99.0,   # foreground percentile used as the normalizer
+        "iw_clip": 1.0,          # cap on pet/q before the ramp (1.0 = no runaway weights)
+        "iw_pool": "avg",        # avg | max pooling of the GT map onto the latent grid
         "model": {
             "num_channels": [16, 32, 48],
             "attention_levels": [False, False, True],
@@ -435,9 +423,28 @@ def main():
     # is the conditional mean. See src/training/utils/quant_losses.py.
     bg_weight = float(config.get("bg_weight", 1.0) if config.get("bg_weight") is not None else 1.0)
     bg_fg_threshold = config.get("bg_fg_threshold")
-    if is_flow and bg_weight < 1.0:
+    # Spatial weight map on the velocity MSE: "occupancy" (binary anatomy gate, the
+    # original bg_weight behaviour) or "intensity" (ramps with the GT PET value). Both
+    # floor at bg_weight, so bg_weight=1.0 leaves either one a no-op.
+    latent_weight_mode = str(config.get("latent_weight", "occupancy") or "occupancy")
+    latent_weight_fn = build_latent_weight(
+        latent_weight_mode, bg_weight=bg_weight, fg_threshold=bg_fg_threshold,
+        source=config.get("iw_source", "ac"), gamma=float(config.get("iw_gamma", 1.0)),
+        percentile=float(config.get("iw_percentile", 99.0)),
+        clip=float(config.get("iw_clip", 1.0)), pool=config.get("iw_pool", "avg"),
+    )
+    if is_flow and bg_weight < 1.0 and latent_weight_mode == "occupancy":
         logger.info("Background down-weighting ENABLED: empty latent positions weighted %.3g "
                     "(mask from GT anatomy, intensity-independent)", bg_weight)
+    elif is_flow and bg_weight < 1.0 and latent_weight_mode == "intensity":
+        logger.info("PET-VALUE weighting of the latent velocity MSE ENABLED: w = %.3g + "
+                    "%.3g*(pet/p%.4g)^%.3g clipped at %.3g, %s-pooled to the latent grid, "
+                    "source=%s. Intensity-MONOTONE: watch for hallucinated uptake.",
+                    bg_weight, 1.0 - bg_weight, float(config.get("iw_percentile", 99.0)),
+                    float(config.get("iw_gamma", 1.0)), float(config.get("iw_clip", 1.0)),
+                    config.get("iw_pool", "avg"), config.get("iw_source", "ac"))
+    elif latent_weight_mode != "none" and bg_weight >= 1.0:
+        latent_weight_fn = None  # floor 1.0 -> uniform weights; keep the original path.
     quant_weight = float(config.get("quant_weight", 0.0) or 0.0)
     quant_loss = None
     if quant_weight > 0:
@@ -485,7 +492,7 @@ def main():
         # with --inflate_from in practice: the source is already 3D, so nothing to inflate.
         if not os.path.exists(args.init_from):
             raise FileNotFoundError(f"--init_from checkpoint not found: {args.init_from}")
-        src_cfg = _init_weights_from(raw_model, args.init_from, logger)
+        src_cfg, _n, _s = init_weights_from(raw_model, args.init_from, logger, label='ft3d')
         src_pt = str((src_cfg or {}).get("prediction_type", "epsilon")).lower()
         if src_pt != prediction_type:
             raise ValueError(
@@ -701,13 +708,12 @@ def main():
             ac_lat = ae3d_encode(ae, ac_vol, scale=latent_scale)
             nac_lat = ae3d_encode(ae, nac_vol, scale=latent_scale)
             if is_flow:
-                # Spatial rebalancing of the velocity MSE (bg_weight<1 only). The mask comes
-                # from the GT volumes, never from the prediction, and depends only on WHERE
-                # anatomy is -- not on how bright it is -- so it cannot reward saturation.
-                wmap = latent_occupancy_weight(
-                    [ac_vol, nac_vol], ac_lat.shape[2:],
-                    bg_weight=bg_weight, fg_threshold=bg_fg_threshold,
-                )
+                # Spatial re-weighting of the velocity MSE, built from the GT volumes and
+                # never from the prediction (see quant_losses.build_latent_weight). Either
+                # WHERE anatomy is ("occupancy", intensity-independent) or HOW HOT it is
+                # ("intensity"); None when disabled, which keeps the plain mean.
+                wmap = (None if latent_weight_fn is None
+                        else latent_weight_fn(ac_vol, nac_vol, ac_lat.shape[2:]))
                 mse_loss, x_t, timesteps, pred, _ = flow_loss(
                     model, schedule, ac_lat, nac_lat,
                     tau_dist=flow_tau_dist, tau_a=flow_tau_a,

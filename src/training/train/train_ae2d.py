@@ -26,6 +26,7 @@ from src.training.dataset_index import enumerate_patients
 from src.training.utils.augment import build_aug_2d
 from src.training.models.autoencoder2d import build_autoencoder_2d
 from src.training.utils.checkpointing import (
+    init_weights_from,
     capture_rng_state,
     load_checkpoint,
     resolve_resume_path,
@@ -155,6 +156,12 @@ def main():
     parser.add_argument("--save_dir", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--init_from", default=None,
+        help="Warm start: load MODEL WEIGHTS ONLY from an existing ae2d checkpoint "
+             "(strict=False, so it survives an architecture change such as "
+             "latent_channels 8->16). Unlike --resume it keeps a fresh optimizer/LR/step.",
+    )
+    parser.add_argument(
         "--resume",
         nargs="?",
         const="auto",
@@ -210,6 +217,13 @@ def main():
     # raw_model owns the weights (state_dict / resume); model is the (optionally)
     # compiled handle used only for the forward pass. They share parameters.
     raw_model = build_model(config).to(device)
+    # Warm start (weights only) BEFORE compile, so the compiled graph captures the loaded
+    # weights. Skipped when --resume is active: a resume fully restores this run's own
+    # state and must take precedence over an external initializer.
+    if resume_path is None and args.init_from:
+        if not os.path.exists(args.init_from):
+            raise FileNotFoundError(f"--init_from checkpoint not found: {args.init_from}")
+        init_weights_from(raw_model, args.init_from, logger, label=TASK)
     raw_model = to_model_memory_format(raw_model, SPATIAL_DIMS)
     optimizer = torch.optim.Adam(raw_model.parameters(), lr=float(config.get("learning_rate", 1.0e-4)))
     model = maybe_compile(raw_model, logger)

@@ -265,6 +265,49 @@ class TestFt3dFlowAndGradAccum(unittest.TestCase):
                             "no val row with 'l1' written")
 
 
+    def test_latent_intensity_weight_reaches_flow_loss(self):
+        """`latent_weight: intensity` must hand flow_loss a real per-position weight map --
+        and the DEFAULT config must still hand it None (the plain-mean path)."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            ae3_ckpt = self._bootstrap_ae3d(tmp)
+            seen = []
+            orig = train_ft3d.flow_loss
+
+            def spy(*a, **kw):
+                seen.append(kw.get("weight_map"))
+                return orig(*a, **kw)
+
+            def run(save_dir, **cfg_kv):
+                cfg = self._write_config(tmp, prediction_type="flow", latent_scale=1.0,
+                                         **cfg_kv)
+                train_ft3d.flow_loss = spy
+                try:
+                    self._run(train_ft3d.main,
+                              ["--data_dir", "synthetic", "--device", "cpu", "--epochs", "1",
+                               "--steps_per_epoch", "1", "--val_every", "1",
+                               "--val_batches", "1", "--latent_size", "16",
+                               "--ae_ckpt", ae3_ckpt, "--config", cfg,
+                               "--save_dir", os.path.join(tmp, save_dir)])
+                finally:
+                    train_ft3d.flow_loss = orig
+
+            run("ft3d_iwlat", latent_weight="intensity", bg_weight=0.1,
+                iw_gamma=1.0, iw_percentile=99.0, iw_source="ac")
+            self.assertTrue(seen, "flow_loss was never called")
+            w = seen[0]
+            self.assertIsNotNone(w, "latent_weight: intensity passed no weight map")
+            self.assertEqual(int(w.shape[1]), 1, "weight must broadcast over latent channels")
+            self.assertGreaterEqual(float(w.min()), 0.1 - 1e-6)
+            self.assertLessEqual(float(w.max()), 1.0 + 1e-6)
+            self.assertGreater(float(w.max()), float(w.min()), "weight map is constant")
+
+            # Regression guard: without the knob the original unweighted path must run.
+            seen.clear()
+            run("ft3d_plain")
+            self.assertTrue(seen)
+            self.assertIsNone(seen[0], "default config must not weight the velocity MSE")
+
+
 class TestFt3dFlowYamlSanity(unittest.TestCase):
     """ft3d_flow.yaml config sanity (no torch needed)."""
 
@@ -277,6 +320,35 @@ class TestFt3dFlowYamlSanity(unittest.TestCase):
         self.assertEqual(float(cfg.get("latent_scale")), 1.0)
         self.assertEqual(float(cfg.get("perceptual_weight")), 0.0)
         self.assertEqual(int(cfg["model"]["spatial_dims"]), 3)
+
+    def test_iwlat_arm_yaml_fields(self):
+        """Both PET-value-weighting arms: the knob is set, and nothing else is on.
+
+        A typo here costs a multi-hour run that silently trains the control, which is
+        exactly how an ablation arm becomes worthless.
+        """
+        import yaml
+        for name, channels in (("ft3d_ft_iwlat", 8), ("ft3d_2x_ft_iwlat", 16)):
+            with self.subTest(config=name):
+                path = os.path.join(ROOT, "src", "training", "configs", name + ".yaml")
+                with open(path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f)
+                self.assertEqual(str(cfg.get("prediction_type")).lower(), "flow")
+                self.assertEqual(str(cfg.get("latent_weight")), "intensity")
+                self.assertLess(float(cfg.get("bg_weight")), 1.0)
+                self.assertIn(str(cfg.get("iw_source")), ("ac", "nac", "union"))
+                self.assertIn(str(cfg.get("iw_pool")), ("avg", "max"))
+                self.assertGreater(float(cfg.get("iw_gamma")), 0.0)
+                self.assertGreater(float(cfg.get("iw_clip")), 0.0)
+                self.assertGreater(float(cfg.get("iw_percentile")), 0.0)
+                self.assertLessEqual(float(cfg.get("iw_percentile")), 100.0)
+                # Single-variable: no other loss term rides along.
+                self.assertEqual(float(cfg.get("perceptual_weight")), 0.0)
+                self.assertEqual(float(cfg.get("quant_weight")), 0.0)
+                self.assertEqual(str(cfg.get("quant_loss")), "none")
+                self.assertEqual(str(cfg.get("flow_loss_weighting")), "none")
+                self.assertEqual(int(cfg["model"]["in_channels"]), channels)
+                self.assertEqual(int(cfg["model"]["out_channels"]), channels)
 
 
 if __name__ == "__main__":

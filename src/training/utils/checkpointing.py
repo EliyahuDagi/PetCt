@@ -83,3 +83,50 @@ def resolve_resume_path(save_dir, resume):
     else:
         path = Path(resume)
     return path if path.exists() else None
+
+
+def init_weights_from(model, ckpt_path, logger=None, label="checkpoint"):
+    """Load MODEL WEIGHTS ONLY from a checkpoint -- a warm start, not a resume.
+
+    Deliberately does NOT restore the optimizer, LR schedule, global step, EMA or
+    ``best_val``: the point is to start a SHORT run from an already-good model with a
+    fresh (usually smaller) LR schedule. ``--resume`` is the opposite -- it continues an
+    interrupted run of the SAME architecture and would fail across a config change.
+
+    Loads with ``strict=False`` on purpose, so a warm start survives an architecture
+    change: raising ``latent_channels`` 8 -> 16 leaves the latent/quant convs
+    shape-mismatched while every other block still transfers. Shape-mismatched entries are
+    dropped (PyTorch would otherwise raise) and reported, so a partial transfer is visible
+    rather than silent.
+
+    Prefers the EMA shadow weights when present -- that is what evaluation loads, so it is
+    the model whose measured quality the warm start actually inherits.
+
+    Returns ``(config_of_source_checkpoint, n_loaded, n_skipped)``.
+    """
+    state = load_checkpoint(ckpt_path)
+    ema_state = state.get("ema")
+    src_sd = ema_state.get("shadow") if isinstance(ema_state, dict) else None
+    src_name = "EMA shadow" if src_sd else "raw model"
+    src_sd = src_sd or state.get("model", state)
+
+    own = model.state_dict()
+    keep, skipped = {}, []
+    for k, v in src_sd.items():
+        if k in own and hasattr(v, "shape") and own[k].shape == v.shape:
+            keep[k] = v
+        else:
+            skipped.append(k)
+    model.load_state_dict(keep, strict=False)
+
+    msg = ("Warm-started from %s (%s, %s): %d tensors loaded, %d skipped "
+           "(shape/name mismatch).")
+    args = (ckpt_path, label, src_name, len(keep), len(skipped))
+    if logger is not None:
+        logger.info(msg, *args)
+        if skipped:
+            logger.info("  skipped (expected across an architecture change): %s%s",
+                        ", ".join(skipped[:6]), " ..." if len(skipped) > 6 else "")
+        if not keep:
+            logger.warning("  NOTHING transferred -- is %s the right architecture?", ckpt_path)
+    return state.get("config", {}), len(keep), len(skipped)
