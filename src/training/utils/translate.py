@@ -48,6 +48,7 @@ def sample_nac_to_ac(
     guidance_scale,
     clip_x0,
     tag="diff",
+    model_fn_wrapper=None,
 ):
     """Sample the AC latent from the NAC conditioning latent (x0 in scaled latent space).
 
@@ -63,6 +64,12 @@ def sample_nac_to_ac(
       * "epsilon" (default / old checkpoints): DDIM from noise with the CFG
         ``model_fn`` and static-thresholding ``clip_x0``.
 
+    ``model_fn_wrapper`` (flow only, optional) takes the plain ``model_fn(x, t)`` and
+    returns a replacement. Slab-mode ft3d passes a wrapper that runs the UNet on
+    overlapping depth windows and blends the velocities, so a whole native-depth
+    volume can be sampled with a model trained on short slabs. ``None`` keeps the
+    plain call.
+
     Dimension-agnostic: the same helper serves both diff2d (2D) and ft3d (3D).
     """
     is_flow = str(diff_config.get("prediction_type", "epsilon")).lower() == "flow"
@@ -71,6 +78,8 @@ def sample_nac_to_ac(
             print(f"[{tag}] guidance_scale={guidance_scale} ignored in flow mode "
                   f"(no null condition is trained).")
         flow_model_fn = lambda x, t: model(x, t)
+        if model_fn_wrapper is not None:
+            flow_model_fn = model_fn_wrapper(flow_model_fn)
         return schedule.flow_sample(flow_model_fn, cond_lat, num_steps=num_steps, spacing="linear")
     model_fn = cfg_model_fn(model, cond_lat, guidance_scale)
     return schedule.ddim_sample(
