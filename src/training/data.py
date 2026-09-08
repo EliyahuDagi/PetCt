@@ -710,6 +710,74 @@ def write_split_json(save_dir, task, patient_paths, train_idx, val_idx, test_idx
     return path
 
 
+def reuse_split_json(split_json, patients, logger, extra_to_train=False):
+    """Map an existing ``split.json``'s patient PATHS onto indices into ``patients``.
+
+    Returns ``(train_idx, val_idx, test_idx)``. Use it whenever a run must not touch
+    another run's held-out patients: the same seed and fractions do NOT reproduce a
+    partition across runs (the enumerated patient order is not stable), so two runs that
+    only agree on the numbers can, and did, train on each other's test patients.
+
+    Raises if the file is unusable or if any TEST patient is missing from the current
+    enumeration -- silently dropping test patients would make this run's numbers
+    incomparable to the split it claims to reuse, which is the whole point of the flag.
+    Patients listed under train/val but absent now are dropped with a warning.
+
+    ``extra_to_train`` decides what happens to patients that are enumerated now but
+    appear nowhere in the split file:
+
+    * ``False`` (default): they are excluded from the run entirely, with a warning.
+      Training on them could leak into that split's test set.
+    * ``True``: they are appended to the TRAIN indices, with an information log saying
+      how many. This is for the autoencoder, which pools single volumes and therefore
+      sees patients a paired (non-attenuation-corrected + attenuation-corrected)
+      diffusion split could never have listed. Such a patient cannot be one of that
+      split's test patients -- it was not in its enumeration at all -- so it is safe to
+      train on.
+
+    ``logger`` may be ``None``, in which case nothing is logged.
+    """
+    log_info = getattr(logger, "info", None) or (lambda *a, **k: None)
+    log_warn = getattr(logger, "warning", None) or (lambda *a, **k: None)
+    with open(split_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or not all(k in data for k in ("train", "val", "test")):
+        raise ValueError(f"{split_json} is not a split.json (need train/val/test lists)")
+    pos = {str(p): i for i, p in enumerate(patients)}
+    out, missing = [], {}
+    for key in ("train", "val", "test"):
+        idx, miss = [], []
+        for p in data[key]:
+            i = pos.get(str(p))
+            (idx.append(i) if i is not None else miss.append(str(p)))
+        out.append(idx)
+        missing[key] = miss
+    if missing["test"]:
+        raise ValueError(
+            f"{len(missing['test'])} TEST patient(s) from {split_json} are not present under "
+            f"the given --data_dir roots; refusing to reuse a split whose held-out set cannot "
+            f"be reproduced. First missing: {missing['test'][0]}")
+    for key in ("train", "val"):
+        if missing[key]:
+            log_warn("%d %s patient(s) from %s are absent now and will be skipped.",
+                     len(missing[key]), key, split_json)
+    listed = {i for idx in out for i in idx}
+    extra = [i for i in range(len(patients)) if i not in listed]
+    if extra:
+        if extra_to_train:
+            out[0] = list(out[0]) + extra
+            log_info(
+                "%d enumerated patient(s) are NOT in %s and were added to TRAINING "
+                "(they are absent from that split entirely, so they cannot be its test "
+                "patients).", len(extra), split_json)
+        else:
+            log_warn(
+                "%d enumerated patient(s) are NOT in %s and are excluded from training "
+                "(training on them could leak into that split's test set).",
+                len(extra), split_json)
+    return out[0], out[1], out[2]
+
+
 def make_depth_split(seed, val_fraction, num_positions=128):
     """Split a grid of normalized depth positions into (train, val) pools.
 
@@ -833,15 +901,22 @@ def sample_pairs(nac, ac, pool, batch_size, size, rng, augment=None, axis=None):
 
 
 def _resize_volume(volume, size):
-    """Resize a (Z,Y,X) tensor to a (size,size,size) cube -> (1,size,size,size).
+    """Resize a (Z,Y,X) tensor with trilinear interpolation.
 
-    Follow-up for anisotropic crops: accept ``size`` as a (dz,dy,dx) tuple and
-    pass it straight to ``F.interpolate(size=...)`` (samplers would thread the
-    tuple through). Cube-only for now per the B2 config.
+    ``size`` is either an int (cube: output ``(1, size, size, size)``, the original
+    behaviour) or a 3-tuple ``(dz, dy, dx)`` giving the output depth, rows and
+    columns (output ``(1, dz, dy, dx)``). The tuple form is what slab mode uses to
+    resize in-plane while keeping the native slice count.
     """
+    if isinstance(size, (tuple, list)):
+        if len(size) != 3:
+            raise ValueError("size tuple must be (dz, dy, dx); got %r" % (size,))
+        target = tuple(int(s) for s in size)
+    else:
+        target = (int(size), int(size), int(size))
     vol = volume.unsqueeze(0).unsqueeze(0)  # (1,1,Z,Y,X)
-    vol = F.interpolate(vol, size=(size, size, size), mode="trilinear", align_corners=False)
-    return vol.squeeze(0)  # (1,size,size,size)
+    vol = F.interpolate(vol, size=target, mode="trilinear", align_corners=False)
+    return vol.squeeze(0)  # (1,dz,dy,dx)
 
 
 def _rand_crop_window(rng, min_frac=0.7):
@@ -893,14 +968,12 @@ def apply_volume_aug(volume, size, params):
     return v
 
 
-def _band_crop(volume, size, phase, val_fraction):
-    """Resize the train/val depth band of a (Z,Y,X) volume to a size^3 cube.
+def _band_range(z_dim, phase, val_fraction):
+    """Depth index range ``[z0, z1)`` of the train or val band of a ``z_dim``-slice volume.
 
-    For the common single-patient case we reserve the top ``val_fraction`` of the
-    depth axis for validation and the remainder for training, so the two bands
-    never overlap. Returns (1, size, size, size).
+    Single-patient fallback: the top ``val_fraction`` of the depth axis is kept for
+    validation and the rest is used for training, so the two bands never overlap.
     """
-    z_dim = volume.shape[0]
     split = int(round(z_dim * (1.0 - float(val_fraction))))
     split = min(max(split, 1), z_dim - 1)
     if phase == "val":
@@ -909,6 +982,15 @@ def _band_crop(volume, size, phase, val_fraction):
         z0, z1 = 0, split
     if z1 - z0 < 1:
         z0, z1 = 0, z_dim
+    return z0, z1
+
+
+def _band_crop(volume, size, phase, val_fraction):
+    """Resize the train/val depth band of a (Z,Y,X) volume to a size^3 cube.
+
+    Band arithmetic lives in :func:`_band_range`. Returns (1, size, size, size).
+    """
+    z0, z1 = _band_range(volume.shape[0], phase, val_fraction)
     return _resize_volume(volume[z0:z1, :, :], size)
 
 
@@ -1012,3 +1094,202 @@ def sample_volumes(volumes, batch_size, size, phase, val_fraction, rng, geo_aug=
         for _ in range(batch_size)
     ]
     return torch.stack(out, dim=0)
+
+
+# --- Slab mode: native depth, resized in-plane only ---------------------------------
+# The cube samplers above squeeze a whole patient into a size^3 cube, which also
+# resamples the depth axis. Slab mode keeps every native slice: volumes are resized
+# in-plane only, training sees random contiguous runs of ``depth`` slices, and
+# validation sees the whole volume. NAC = non-attenuation-corrected PET, AC =
+# attenuation-corrected PET.
+
+
+def resize_pair_native_depth(nac, ac, size):
+    """Resize a NAC/AC pair in-plane to ``size`` x ``size`` and keep the AC depth.
+
+    The AC volume is the training target, so its slice count ``Z_ac`` is the depth
+    everything else follows. The NAC volume is resampled to the same ``Z_ac`` slices
+    (an exact identity along depth when the two already have the same slice count).
+    Returns ``(nac_r, ac_r)``, each ``(1, Z_ac, size, size)`` float32.
+    """
+    if nac is None or ac is None:
+        raise ValueError("Both NAC and AC volumes are required for NAC->AC 3D training.")
+    z_ac = int(ac.shape[0])
+    target = (z_ac, int(size), int(size))
+    ac_r = _resize_volume(ac.float(), target)
+    nac_r = _resize_volume(nac.float(), target)
+    return nac_r, ac_r
+
+
+def _ensure_min_depth(vol, depth):
+    """Stretch a (1, Z, H, W) tensor along depth when it has fewer than ``depth`` slices."""
+    z_dim = int(vol.shape[1])
+    if z_dim >= depth:
+        return vol
+    return _resize_volume(vol[0], (int(depth), int(vol.shape[2]), int(vol.shape[3])))
+
+
+def draw_slab_aug(rng):
+    """Draw flip flags (depth, rows, columns) and an axial quarter-turn count for one slab.
+
+    Shared by the NAC and AC halves of a pair so they stay aligned. Unlike
+    :func:`draw_volume_aug` there is no random crop window: a slab keeps the full
+    in-plane field of view, because attenuation depends on the whole cross-section.
+    """
+    return {
+        "flips": [bool(rng.rand() < 0.5) for _ in range(3)],  # depth, rows, columns
+        "rot_k": int(rng.randint(0, 4)),                      # quarter turns in the row-column plane
+    }
+
+
+def apply_slab_aug(slab, params):
+    """Apply :func:`draw_slab_aug` flips and rotation to a (1, D, H, W) slab. Shape is kept."""
+    v = slab
+    flip_dims = [d + 1 for d, f in enumerate(params["flips"]) if f]  # spatial dims are 1,2,3
+    if flip_dims:
+        v = torch.flip(v, dims=flip_dims)
+    if params["rot_k"]:
+        v = torch.rot90(v, params["rot_k"], dims=[2, 3])  # rows and columns are both ``size``
+    return v
+
+
+def _crop_slabs(nac_r, ac_r, batch_size, depth, rng, augment, geo_aug):
+    """Cut ``batch_size`` random depth slabs of ``depth`` slices from a resized pair.
+
+    ``nac_r`` and ``ac_r`` are ``(1, Z, size, size)`` with equal ``Z``. Each slab is a
+    contiguous run of slices starting at a random ``z0``; the same ``z0`` (and, when
+    ``augment`` is set, the same flips and rotation) is used for both halves.
+    Returns two ``(batch_size, 1, depth, size, size)`` tensors.
+    """
+    depth = int(depth)
+    nac_r = _ensure_min_depth(nac_r, depth)
+    ac_r = _ensure_min_depth(ac_r, depth)
+    z_dim = int(ac_r.shape[1])
+    nac_list, ac_list = [], []
+    for _ in range(batch_size):
+        z0 = int(rng.randint(0, z_dim - depth + 1))
+        n = nac_r[:, z0:z0 + depth]
+        a = ac_r[:, z0:z0 + depth]
+        if augment:
+            p = draw_slab_aug(rng)
+            n = apply_slab_aug(n, p)
+            a = apply_slab_aug(a, p)
+        n, a = _apply_aug_pair(geo_aug, n.contiguous(), a.contiguous())
+        nac_list.append(n)
+        ac_list.append(a)
+    return torch.stack(nac_list, dim=0), torch.stack(ac_list, dim=0)
+
+
+def sample_pair_slabs(nac, ac, batch_size, size, depth, rng, augment=False, geo_aug=None):
+    """Sample paired NAC/AC depth slabs at native depth: two ``(B, 1, depth, size, size)``.
+
+    The pair is resized in-plane once per call (see :func:`resize_pair_native_depth`).
+    A volume with fewer than ``depth`` slices is first stretched along depth to
+    ``depth``. Each slab is a random contiguous run of ``depth`` slices. ``augment``
+    adds random flips on all three axes plus a random axial quarter-turn, drawn once
+    per slab and applied identically to both halves. ``geo_aug`` (an optional built
+    MONAI transform) is layered on top with one shared draw per pair.
+    """
+    nac_r, ac_r = resize_pair_native_depth(nac, ac, size)
+    return _crop_slabs(nac_r, ac_r, batch_size, depth, rng, augment, geo_aug)
+
+
+def sample_pair_volume_native(nac, ac, size, geo_aug=None):
+    """The whole NAC/AC pair at native depth: two ``(1, 1, Z_ac, size, size)`` tensors.
+
+    Used for validation and inference in slab mode (one whole volume, no random
+    cropping). ``geo_aug`` is normally ``None`` so the metric stays stable.
+    """
+    nac_r, ac_r = resize_pair_native_depth(nac, ac, size)
+    n, a = _apply_aug_pair(geo_aug, nac_r, ac_r)
+    return n.unsqueeze(0), a.unsqueeze(0)
+
+
+def sample_pair_slabs_band(nac, ac, batch_size, size, depth, phase, val_fraction, rng,
+                           augment=False, geo_aug=None):
+    """Single-patient slab sampler: slabs come only from the train or val depth band.
+
+    Same band arithmetic as :func:`_band_crop` (the top ``val_fraction`` of the depth
+    axis is validation, the rest training), applied after the in-plane resize so both
+    halves share the AC depth. Returns two ``(B, 1, depth, size, size)`` tensors.
+    """
+    nac_r, ac_r = resize_pair_native_depth(nac, ac, size)
+    z0, z1 = _band_range(int(ac_r.shape[1]), phase, val_fraction)
+    return _crop_slabs(nac_r[:, z0:z1], ac_r[:, z0:z1], batch_size, depth, rng, augment, geo_aug)
+
+
+def sample_pair_volume_native_band(nac, ac, size, phase, val_fraction):
+    """Single-patient whole-band pair at native depth: two ``(1, 1, Z_band, size, size)``.
+
+    The validation counterpart of :func:`sample_pair_slabs_band`: the full train or
+    val depth band, no cropping, no augmentation.
+    """
+    nac_r, ac_r = resize_pair_native_depth(nac, ac, size)
+    z0, z1 = _band_range(int(ac_r.shape[1]), phase, val_fraction)
+    return (nac_r[:, z0:z1].unsqueeze(0).contiguous(),
+            ac_r[:, z0:z1].unsqueeze(0).contiguous())
+
+
+# --- Slab mode, single volumes (autoencoder) ----------------------------------------
+# The autoencoder pools whatever PET volumes a patient has -- non-attenuation-corrected
+# and attenuation-corrected alike, and an unpaired volume is fine -- so it needs the
+# single-volume twin of the paired samplers above. Same geometry (in-plane resize only,
+# every native slice kept), same augmentation draw, no pairing to keep in step.
+
+
+def resize_volume_native_depth(vol, size):
+    """Resize ONE volume in-plane to ``size`` x ``size`` and keep every native slice.
+
+    The single-volume mirror of :func:`resize_pair_native_depth`: there is no partner
+    volume to follow, so the depth is simply the volume's own slice count. Returns
+    ``(1, Z, size, size)`` float32.
+    """
+    if vol is None:
+        raise ValueError("A volume is required to resize; got None.")
+    target = (int(vol.shape[0]), int(size), int(size))
+    return _resize_volume(vol.float(), target)
+
+
+def sample_volume_slabs(volumes, batch_size, size, depth, rng, augment=False, geo_aug=None):
+    """Sample single-channel depth slabs pooled across ``volumes``: ``(B, 1, depth, size, size)``.
+
+    The slab-mode counterpart of :func:`sample_volumes_full`: one volume is drawn from
+    the pool per sample, resized in-plane only, and cut to a random contiguous run of
+    ``depth`` native slices. A volume with fewer than ``depth`` slices is first stretched
+    along depth (see :func:`_ensure_min_depth`), exactly as the paired path does.
+
+    ``augment`` adds the flips and axial quarter-turn of :func:`draw_slab_aug` (drawn
+    per slab, no random crop -- attenuation depends on the whole cross-section).
+    ``geo_aug`` is an optional built MONAI transform layered on top.
+
+    Each drawn volume is resized once per call and reused by every sample that draws it;
+    the resize is by far the most expensive part of this function.
+    """
+    vols = [v for v in volumes if v is not None]
+    if not vols:
+        raise ValueError("No volumes available to sample from.")
+    depth = int(depth)
+    resized = {}  # pool index -> the in-plane-resized, depth-checked volume
+    out = []
+    for _ in range(batch_size):
+        i = int(rng.randint(0, len(vols)))
+        v = resized.get(i)
+        if v is None:
+            v = _ensure_min_depth(resize_volume_native_depth(vols[i], size), depth)
+            resized[i] = v
+        z0 = int(rng.randint(0, int(v.shape[1]) - depth + 1))
+        slab = v[:, z0:z0 + depth]
+        if augment:
+            slab = apply_slab_aug(slab, draw_slab_aug(rng))
+        out.append(_apply_aug_single(geo_aug, slab.contiguous()))
+    return torch.stack(out, dim=0)
+
+
+def sample_volume_native(vol, size):
+    """The whole volume at native depth: ``(1, 1, Z, size, size)``.
+
+    The single-volume mirror of :func:`sample_pair_volume_native`, used for validation
+    in slab mode: no random depth position and no augmentation, so the number it feeds
+    is the same every time it is measured.
+    """
+    return resize_volume_native_depth(vol, size).unsqueeze(0)
