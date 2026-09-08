@@ -117,3 +117,77 @@ def decode_volume_slicewise(model, z):
     ic, ih, iw = img.shape[1], img.shape[2], img.shape[3]
     img = img.reshape(b, d, ic, ih, iw).permute(0, 2, 1, 3, 4).contiguous()
     return img
+
+
+def _fold_slices(vol):
+    """(B, C, D, H, W) -> (B * D, C, H, W). Slice k of sample b becomes row b * D + k."""
+    b, c, d, h, w = vol.shape
+    return vol.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)
+
+
+def _unfold_slices(flat, batch, depth):
+    """(B * D, C, H, W) -> (B, C, D, H, W). Inverse of ``_fold_slices``."""
+    c, h, w = flat.shape[1], flat.shape[2], flat.shape[3]
+    return flat.reshape(batch, depth, c, h, w).permute(0, 2, 1, 3, 4).contiguous()
+
+
+class SliceWiseAutoencoder(torch.nn.Module):
+    """Wrap a 2D AutoencoderKL so it takes and returns 5-D volumes, slice by slice.
+
+    This is the frozen "2D bottleneck" of the anisotropic 3D chain: the 2D
+    autoencoder trained on pooled NAC and AC slices (non-attenuation-corrected /
+    attenuation-corrected PET) is applied to every slice of a volume, so the
+    latent keeps the full depth, (B, C, D, h, w). The 3D flow UNet then adds
+    depth context on top of these per-slice latents.
+
+    Slices are processed in chunks of ``chunk_slices`` rows of the folded
+    B * D axis to bound memory. GroupNorm and attention in the 2D autoencoder
+    are per sample, so chunking does not change the numbers.
+
+    ``decode`` deliberately carries no ``no_grad``: loss terms that compare
+    decoded images need gradients to flow back through the frozen decoder into
+    the latent. Callers that only want features should wrap the call themselves.
+    """
+
+    def __init__(self, ae2d, chunk_slices=64):
+        super().__init__()
+        chunk_slices = int(chunk_slices)
+        if chunk_slices < 1:
+            raise ValueError("chunk_slices must be >= 1, got %d" % chunk_slices)
+        self.ae2d = ae2d
+        self.chunk_slices = chunk_slices
+
+    @property
+    def latent_channels(self):
+        return getattr(self.ae2d, "latent_channels", None)
+
+    def _chunks(self, flat):
+        for start in range(0, flat.shape[0], self.chunk_slices):
+            yield flat[start:start + self.chunk_slices]
+
+    def encode(self, x):
+        """(B, 1, D, H, W) -> (z_mu, z_sigma), each (B, C, D, h, w)."""
+        if x.ndim != 5:
+            raise ValueError("SliceWiseAutoencoder.encode expects (B, C, D, H, W), got %s" % (tuple(x.shape),))
+        batch, depth = x.shape[0], x.shape[2]
+        mus, sigmas = [], []
+        for chunk in self._chunks(_fold_slices(x)):
+            out = self.ae2d.encode(chunk)
+            if not isinstance(out, (tuple, list)) or len(out) != 2:
+                raise TypeError("the wrapped autoencoder's encode() must return (z_mu, z_sigma)")
+            mus.append(out[0])
+            sigmas.append(out[1])
+        z_mu = _unfold_slices(torch.cat(mus, dim=0), batch, depth)
+        z_sigma = _unfold_slices(torch.cat(sigmas, dim=0), batch, depth)
+        return z_mu, z_sigma
+
+    def decode(self, z):
+        """(B, C, D, h, w) -> (B, 1, D, H, W). Gradients pass through."""
+        if z.ndim != 5:
+            raise ValueError("SliceWiseAutoencoder.decode expects (B, C, D, h, w), got %s" % (tuple(z.shape),))
+        batch, depth = z.shape[0], z.shape[2]
+        parts = [self.ae2d.decode(chunk) for chunk in self._chunks(_fold_slices(z))]
+        return _unfold_slices(torch.cat(parts, dim=0), batch, depth)
+
+    def forward(self, x):
+        return self.decode(self.encode(x)[0])

@@ -43,7 +43,7 @@ def build_diffusion_3d(config):
     if num_head_channels is not None:
         kwargs["num_head_channels"] = num_head_channels
 
-    return DiffusionModelUNet(
+    model = DiffusionModelUNet(
         spatial_dims=3,
         in_channels=in_channels,
         out_channels=out_channels,
@@ -53,3 +53,13 @@ def build_diffusion_3d(config):
         norm_num_groups=norm_num_groups,
         **kwargs,
     )
+    # ``model.anisotropic: true`` selects the "same problem as 2D" chain: the UNet
+    # down/upsamples only in-plane (strides (1, 2, 2)) and runs GroupNorm and
+    # attention per slice, so a centre-inflated 2D UNet starts out as exactly the
+    # 2D UNet applied slice by slice. It is applied HERE, at build time, because
+    # checkpoints embed this config and infer.py / evaluate.py rebuild the model
+    # through ``_load_model(ckpt, build_diffusion_3d, ...)``; no extra flag needed.
+    if bool(model_cfg.get("anisotropic", False)):
+        from src.training.models.anisotropic import make_inplane_only
+        make_inplane_only(model)
+    return model

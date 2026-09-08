@@ -6,6 +6,11 @@ becomes (B, C, d, h, w) with d < D). Weights are warm-started from the 2D AE via
 centre inflation (see :func:`map_state_dict_2d_to_3d`): each 3D conv begins acting
 exactly like its 2D counterpart and learns z-mixing during a short volume
 fine-tune, recovering 3D encoding richness without a from-scratch 3D AE.
+
+With ``model.anisotropic: true`` the autoencoder keeps the depth axis instead:
+it downsamples only in-plane and normalises / attends per slice (see
+:mod:`src.training.models.anisotropic`), so the latent is (B, C, D, h, w) and a
+centre-inflated 2D autoencoder starts out as exactly the 2D one run slice by slice.
 """
 
 import torch
@@ -56,7 +61,7 @@ def build_autoencoder_3d(config):
         model_cfg.get("norm_num_groups"),
     )
 
-    return AutoencoderKL(
+    model = AutoencoderKL(
         spatial_dims=3,
         in_channels=in_channels,
         out_channels=out_channels,
@@ -66,6 +71,14 @@ def build_autoencoder_3d(config):
         num_res_blocks=num_res_blocks,
         norm_num_groups=norm_num_groups,
     )
+    # ``model.anisotropic: true``: downsample only in-plane, normalise and attend per
+    # slice, so depth is preserved and the inflated 2D autoencoder is reproduced
+    # exactly at step 0. Applied at build time because checkpoints embed this config
+    # and infer.py / evaluate.py rebuild through ``_load_model(ckpt, build_autoencoder_3d)``.
+    if bool(model_cfg.get("anisotropic", False)):
+        from src.training.models.anisotropic import make_inplane_only
+        make_inplane_only(model)
+    return model
 
 
 @torch.no_grad()
