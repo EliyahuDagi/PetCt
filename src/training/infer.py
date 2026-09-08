@@ -11,7 +11,12 @@ volume with no paired NAC and therefore write no ``nac.npy``.
 
   ae2d   : encode -> decode an AC PET slice (recon vs input).
   diff2d : encode NAC slice -> DDIM sample conditioned -> decode (pred vs AC).
-  ft3d   : same in 3D using the inflated 3D AE (outputs/ae3d); pred/gt are 3D volumes.
+  ft3d   : same in 3D; pred/gt are 3D volumes. Cube checkpoints use the inflated 3D AE
+           (outputs/ae3d) on a size^3 cube. Slab checkpoints (config slab_depth > 0)
+           run on a volume resized in-plane only, with every native slice kept, through
+           an autoencoder that keeps every slice too -- either the 2D AE applied slice
+           by slice (ae_mode 2d_slicewise) or an in-plane-only 3D AE (ae_mode 3d, built
+           with model.anisotropic); the UNet runs on overlapping depth windows.
 
 Examples:
   python -m src.training.infer --task ae2d   --data_dir DATA --patient_index 0 \
@@ -31,7 +36,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from src.training.data import load_patient_volumes
+from src.training.data import load_patient_volumes, resize_pair_native_depth
 from src.training.dataset_index import enumerate_patients
 from src.training.models.autoencoder2d import (
     ae_decode,
@@ -173,10 +178,35 @@ def run_diff2d(args, device):
 
 
 def run_ft3d(args, device):
-    # ft3d uses the inflated 3D AE (train_ae3d), not the per-slice 2D AE.
-    ae, _ = _load_model(args.ae_ckpt, build_autoencoder_3d, device, use_ema=args.use_ema)
+    # The diffusion checkpoint's config says which autoencoder and which geometry it
+    # was trained with, so it is loaded first and the AE choice follows from it.
     model, diff_config = _load_model(args.diff_ckpt, build_diffusion_3d, device, use_ema=args.use_ema)
     schedule = _schedule_from_config(diff_config, device)
+    ae_mode = str(diff_config.get("ae_mode", "3d") or "3d").lower()
+    slab_depth = int(diff_config.get("slab_depth", 0) or 0)
+    is_flow = str(diff_config.get("prediction_type", "epsilon")).lower() == "flow"
+    ae_ckpt = args.ae_ckpt or (DEFAULT_AE_SLICEWISE if ae_mode == "2d_slicewise" else DEFAULT_AE["ft3d"])
+    if ae_mode == "2d_slicewise":
+        # Slab checkpoints: the frozen 2D AE applied slice by slice (latent depth ==
+        # image depth). Imported here so the cube path does not depend on it.
+        from src.training.models.autoencoder2d import SliceWiseAutoencoder
+        ae2d, _ = _load_model(ae_ckpt, build_autoencoder_2d, device, use_ema=args.use_ema)
+        ae = SliceWiseAutoencoder(ae2d)
+    else:
+        # The 3D AE from train_ae3d: the cube one (depth compressed) for cube checkpoints,
+        # or an in-plane-only one (every slice kept) for slab checkpoints trained on it.
+        ae, _ = _load_model(ae_ckpt, build_autoencoder_3d, device, use_ema=args.use_ema)
+        if slab_depth > 0:
+            # A slab checkpoint keeps every native slice, so its autoencoder must too.
+            # Read from the BUILT model, not from a config that may not match it.
+            from src.training.models.anisotropic import is_inplane_only
+            if not is_inplane_only(ae):
+                raise ValueError(
+                    "This is a slab-mode checkpoint (slab_depth=%d), so the autoencoder must "
+                    "keep one latent slice per image slice, but %r builds a depth-compressing "
+                    "3D autoencoder. Pass an in-plane-only 3D autoencoder (trained with "
+                    "model.anisotropic: true) or the 2D autoencoder used slice by slice."
+                    % (slab_depth, ae_ckpt))
     vols = load_patient_volumes(args.data_dir, args.patient_index, device=device)
     if vols["pet_nac"] is None or vols["pet_ac"] is None:
         raise ValueError("NAC and AC PET volumes are both required for ft3d inference.")
@@ -190,8 +220,26 @@ def run_ft3d(args, device):
             "latent_scale was recorded."
         )
     scale = float(diff_config.get("latent_scale", 1.0))
-    nac_vol = _resize_volume(vols["pet_nac"], args.size)
-    ac_vol = _resize_volume(vols["pet_ac"], args.size)
+    model_fn_wrapper = None
+    if slab_depth > 0:
+        if not is_flow:
+            raise NotImplementedError(
+                "Slab-mode inference is implemented for prediction_type=flow only.")
+        # Slab mode: resize in-plane only and keep every native slice. --size overrides
+        # the in-plane size recorded at train time; the cube default (64) is never used.
+        size = int(args.size or diff_config.get("slab_inplane_size", 128))
+        nac_r, ac_r = resize_pair_native_depth(vols["pet_nac"], vols["pet_ac"], size)
+        nac_vol, ac_vol = nac_r.unsqueeze(0), ac_r.unsqueeze(0)  # (1,1,Z,size,size)
+        # The UNet was trained on short depth slabs, so the whole volume is sampled
+        # through overlapping depth windows whose velocities are blended.
+        slab_window = int(diff_config.get("slab_window") or 2 * slab_depth)
+        slab_stride = int(diff_config.get("slab_stride") or slab_depth)
+        from src.training.utils.sliding import depth_windowed_model_fn
+        model_fn_wrapper = lambda f: depth_windowed_model_fn(f, slab_window, slab_stride)
+    else:
+        size = int(args.size or DEFAULT_SIZE["ft3d"])
+        nac_vol = _resize_volume(vols["pet_nac"], size)
+        ac_vol = _resize_volume(vols["pet_ac"], size)
     nac_lat = ae3d_encode(ae, nac_vol, scale=scale)
 
     # Shared flow-vs-epsilon decision (see src/training/utils/translate.py). x0 is
@@ -201,20 +249,25 @@ def run_ft3d(args, device):
         num_steps=args.ddim_steps, spacing=args.spacing,
         guidance_scale=getattr(args, "guidance_scale", 1.0),
         clip_x0=getattr(args, "clip_x0", 4.0), tag="ft3d",
+        model_fn_wrapper=model_fn_wrapper,
     )
     pred = clamp_unit(ae3d_decode(ae, x0, scale=scale), getattr(args, "clamp_output", True))
     return pred[0, 0], ac_vol[0, 0], vols, nac_vol[0, 0]
 
 
 RUNNERS = {"ae2d": run_ae2d, "ae3d": run_ae3d, "diff2d": run_diff2d, "ft3d": run_ft3d}
+# ft3d: the cube default. Slab-mode checkpoints carry their own in-plane size
+# (slab_inplane_size), which run_ft3d uses when --size is not given.
 DEFAULT_SIZE = {"ae2d": 128, "ae3d": 64, "diff2d": 128, "ft3d": 64}
-# ae3d/ft3d consume the inflated 3D AE; ae2d/diff2d use the 2D AE.
+# ae3d/ft3d (cube) consume the inflated 3D AE; ae2d/diff2d use the 2D AE.
 DEFAULT_AE = {
     "ae2d": "outputs/ae2d/best.pt",
     "ae3d": "outputs/ae3d/best.pt",
     "diff2d": "outputs/ae2d/best.pt",
     "ft3d": "outputs/ae3d/best.pt",
 }
+# ft3d slab-mode checkpoints (ae_mode 2d_slicewise) use the 2D AE slice by slice.
+DEFAULT_AE_SLICEWISE = "outputs/ae2d_p/best.pt"
 
 
 def main():
@@ -223,9 +276,13 @@ def main():
     parser.add_argument("--data_dir", required=True, nargs="+", help="One or more dataset roots / patient folders")
     parser.add_argument("--patient_index", type=int, default=0, help="Global patient index across all roots")
     parser.add_argument("--slice", type=int, default=0, help="Slice index for 2D tasks (ignored for ft3d)")
-    parser.add_argument("--ae_ckpt", default=None, help="AE checkpoint; defaults per task (ae3d for ft3d, ae2d otherwise)")
+    parser.add_argument("--ae_ckpt", default=None,
+                        help="AE checkpoint; defaults per task (ae3d for cube ft3d, the 2D AE for "
+                             "slab-mode ft3d checkpoints, ae2d otherwise)")
     parser.add_argument("--diff_ckpt", default=None, help="Diffusion checkpoint (diff2d/ft3d)")
-    parser.add_argument("--size", type=int, default=None, help="Input size; defaults per task")
+    parser.add_argument("--size", type=int, default=None,
+                        help="Input size; defaults per task. Slab-mode ft3d checkpoints default to "
+                             "their recorded in-plane size (depth stays native).")
     parser.add_argument("--ddim_steps", type=int, default=25, help="DDIM steps; Karras spacing reaches good quality in fewer steps")
     parser.add_argument("--spacing", choices=["linear", "karras"], default="karras", help="DDIM timestep spacing")
     parser.add_argument("--clip_x0", type=float, default=4.0,
@@ -246,9 +303,11 @@ def main():
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
-    if args.size is None:
+    # ft3d resolves --size and --ae_ckpt inside run_ft3d, from the diffusion checkpoint's
+    # config (cube: 64 and the 3D AE; slab: the recorded in-plane size and the 2D AE).
+    if args.size is None and args.task != "ft3d":
         args.size = DEFAULT_SIZE[args.task]
-    if args.ae_ckpt is None:
+    if args.ae_ckpt is None and args.task != "ft3d":
         args.ae_ckpt = DEFAULT_AE[args.task]
     if args.out is None:
         args.out = os.path.join("outputs", "infer", args.task)
