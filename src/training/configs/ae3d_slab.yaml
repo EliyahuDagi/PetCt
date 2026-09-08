@@ -1,0 +1,114 @@
+# 3D autoencoder in SLAB mode: the same problem the 2D autoencoder solves (128x128
+# slices, 2:1 in-plane compression) plus depth context from the neighbouring slices.
+# NAC = non-attenuation-corrected PET, AC = attenuation-corrected PET; this stage pools
+# both and does not need them paired.
+#
+# Geometry: every volume is resized in-plane to 128x128 and keeps ALL of its native
+# slices (nothing is ever resampled along depth). The autoencoder downsamples in-plane
+# only and normalises and attends per slice, so a 128x128 slice becomes a 32x32 latent
+# with 8 channels and the latent depth equals the image depth. Training sees random
+# contiguous slabs of 16 slices; validation scores a fixed centre window of 64 slices of
+# the whole volume, so the number is stable across checkpoints and across a resume.
+#
+# Warm start: --ae2d_ckpt outputs/ae2d_p/best.pt. The channel widths and the residual
+# block count below match that 2D run, so every convolution is centre-inflated; with
+# model.anisotropic the result IS the 2D autoencoder applied slice by slice at step 0,
+# to floating-point tolerance. It can only improve from there.
+#
+# Launch:
+#   python -m src.training.train.launcher ae3d --config src/training/configs/ae3d_slab.yaml \
+#       --ae2d_ckpt outputs/ae2d_p/best.pt \
+#       --split_json outputs/ae2d_p/split.json
+#   (--split_json reuses the 2D autoencoder's OWN partition, so the only difference between
+#   the two autoencoders is 2D vs 3D. Caveat, equal for both: that partition trained on 26
+#   and validated on 9 of the flow chain's 41 test patients. scripts/_ae3d_slab.sh runs this.)
+
+seed: 42
+# Changed: its own output folder. The task key stays ae3d (checkpoint "task" field).
+output_dir: outputs/ae3d_slab
+val_fraction: 0.2
+test_fraction: 0.1
+volume_manifest: data/training/volumes.jsonl
+
+# Changed: two 16x128x128 slabs per forward pass instead of one 64^3 cube. A slab has
+# the same voxel count as a cube (16*128*128 = 64^3), so this is about twice the cube
+# run's memory. The ae3d trainer has no gradient accumulation (one backward per step),
+# unlike the flow trainer, so this is the whole effective batch.
+batch_size: 2
+num_workers: 2
+# Changed: a tenth of the cube run's rate. The start is already exact -- the model is
+# the trained 2D autoencoder run slice by slice -- so the only job left is to learn the
+# depth taps without disturbing what already works. A large rate would undo the warm
+# start in the first few hundred steps.
+learning_rate: 5.0e-5
+# The run starts as an exact copy of the 2D autoencoder, and without warmup the first
+# Adam update (a full-size sign step on every weight, including the zero depth taps)
+# destroyed that start: validation loss 0.0030 -> 0.0151 after one step (measured
+# 2026-09-06). So the rate ramps up linearly from near zero over these first 500 steps.
+# After the ramp it follows the flow trainer's schedule: a cosine decay down to 0 at the
+# last step (set lr_min_ratio, a fraction of learning_rate, to keep a floor instead).
+lr_warmup_steps: 500
+max_epochs: 100
+# Runtime-overridden from the 2D autoencoder checkpoint; kept in sync for clarity.
+latent_channels: 8
+ae2d_ckpt: outputs/ae2d_p/best.pt
+# Not used in slab mode (it is the cube size of the cube path). The in-plane size comes
+# from slab_inplane_size below and the depth stays native.
+crop_size: 64
+
+# --- Slab mode (all new) ---
+# Changed: 16 native slices per training slab (0 would be the old cube behaviour).
+slab_depth: 16
+# Changed: in-plane size every slice is resized to. Same 128 the 2D autoencoder and the
+# slab flow model use, so the three stages see identical in-plane statistics.
+slab_inplane_size: 128
+# Changed: validation scores a FIXED centre window of 64 slices of each validation
+# volume. Fixed on purpose: a random depth position would make the number wander between
+# checkpoints for reasons that have nothing to do with the weights.
+slab_window: 64
+
+# NOTE: the model block is inherited from the 2D autoencoder checkpoint at train time
+# (so the weights inflate cleanly); the values here are informational and must match
+# what ae2d_p was trained with. model.anisotropic is the exception -- it is re-applied
+# after the inherited block is copied in, and it is what makes the depth axis survive.
+model:
+  spatial_dims: 3
+  in_channels: 1
+  out_channels: 1
+  block_out_channels: [64, 128, 256]
+  num_res_blocks: 2
+  # Changed: downsample in-plane only (depth stride 1), normalise and attend per slice.
+  # This is what keeps the depth axis and makes the inflated start exact. Slab mode sets
+  # it anyway; it is written here so the intent is visible in the config.
+  anisotropic: true
+
+# The loss block below is copied from ae3d.yaml. IT MUST MATCH WHAT ae2d_p WAS TRAINED
+# WITH -- read the embedded config of outputs/ae2d_p/best.pt (a torch checkpoint dict
+# with a "config" key) and correct these values if they differ. A warm start that is
+# exact in the weights but graded by a different loss is not the same problem, and the
+# first optimizer step would pull the model away from the 2D solution.
+loss:
+  recon_l1_weight: 1.0
+  kl_weight: 1.0e-6
+# Same for the two keys below: they must match ae2d_p's perceptual settings.
+# Perceptual loss on the reconstruction vs target; a 2D backbone run slice-wise on the
+# 3D reconstruction. >0 enables it; 0 disables it (no-op). Backend pluggable.
+perceptual_weight: 0.1
+perceptual_backend: vgg
+
+# Geometric-only augmentation, applied to TRAIN slabs only.
+augment:
+  enabled: true
+  flip_prob: 0.5             # per spatial axis (depth, rows, columns)
+  rot90_prob: 0.5            # quarter turns in the axial (rows-columns) plane
+  # Changed: 0. Affine rotations resample ACROSS the depth axis and smear neighbouring
+  # slices together; slab mode exists to keep native slices intact. The trainer forces
+  # this to 0 in slab mode anyway and says so in the log.
+  affine_prob: 0.0
+  affine_rotate_deg: 7.0
+  affine_scale: 0.1
+  affine_translate: 0.02     # fraction of axis length
+  # Changed: 0, same reason as affine_prob.
+  elastic_prob: 0.0
+  elastic_sigma_range: [1.0, 2.0]
+  elastic_magnitude_range: [1.0, 2.0]

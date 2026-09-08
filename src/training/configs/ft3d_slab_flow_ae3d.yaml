@@ -1,0 +1,93 @@
+# 3D flow bridge in SLAB mode on the in-plane-only 3D AUTOENCODER (outputs/ae3d_slab):
+# identical to ft3d_slab_flow.yaml except the frozen autoencoder. NAC = non-attenuation-
+# corrected PET, AC = attenuation-corrected PET.
+#
+# Chain: every volume is resized in-plane to 128x128 and keeps ALL native slices. The
+# frozen in-plane-only 3D autoencoder (2D autoencoder centre-inflated, then fine-tuned on
+# 128x128x16 slabs so its encoder/decoder see neighbouring slices; depth never compressed)
+# gives a latent of (8, Z, 32, 32), the same shape as the slice-wise 2D one. The UNet,
+# slabs, depth windows and warm start are exactly those of ft3d_slab_flow.yaml, so the
+# only change between the two runs is the autoencoder (a controlled comparison).
+#
+# Warm start: --inflate_from outputs/diff2d_flow_perc_p/best.pt (same as the 2D-AE slab
+# run). Step 0 is NOT the 2D control any more: the latents come from a different
+# autoencoder, so the inflated 2D flow model sees a shifted latent distribution.
+#
+# Launch:
+#   python -m src.training.train.launcher ft3d --config src/training/configs/ft3d_slab_flow_ae3d.yaml #       --ae_ckpt outputs/ae3d_slab/best.pt --latent_size 128 #       --inflate_from outputs/diff2d_flow_perc_p/best.pt
+#   (--ae_ckpt, not --ae2d_ckpt: ae_mode is "3d". --latent_size is the IN-PLANE size.)
+
+seed: 42
+# Changed: its own output folder. The task key stays ft3d (checkpoint "task" field).
+output_dir: outputs/ft3d_slab_flow_ae3d
+val_fraction: 0.2
+test_fraction: 0.1
+volume_manifest: data/training/volumes.jsonl
+
+# Changed: two 16x128x128 slabs per forward pass instead of one 64^3 cube. A slab has
+# the same voxel count as a cube, so memory per step is about the same.
+batch_size: 2
+# Changed: 4 x 2 = 8 slabs per optimizer step (the cube run used 16 x 1 cubes).
+grad_accum_steps: 4
+num_workers: 2
+# Same rate as the cube flow run. The warm start is exact per slice, so no need to go lower.
+learning_rate: 5.0e-5
+max_epochs: 150
+
+latent_channels: 8
+prediction_type: flow
+latent_scale: 1.0
+# Changed: off. The VGG term samples 2D slices of the decoded slab and gave no gain on
+# the 2D model; the 3D-decoder ("lpl") backend does not exist for the slice-wise AE.
+perceptual_weight: 0.0
+
+inflate_freeze_backbone: false
+inflate_unfreeze_step: 0
+
+# --- Slab mode (all new) ---
+# Changed vs ft3d_slab_flow.yaml: the frozen IN-PLANE-ONLY 3D autoencoder (--ae_ckpt), which
+# also keeps latent depth == image depth. The trainer checks the loaded model is in-plane-only.
+ae_mode: 3d
+# Changed: 16 native slices per training slab (0 would be the old cube behaviour).
+slab_depth: 16
+# Changed: whole-volume validation/inference window of 32 slices (twice the slab, so the
+# net sees more depth context than in training but the same in-plane statistics).
+slab_window: 32
+# Changed: consecutive windows advance 16 slices, so every slice is covered by two
+# windows and the triangular blend has no seams.
+slab_stride: 16
+# Changed: in-plane size the slices are resized to (overwritten from --latent_size).
+slab_inplane_size: 128
+
+model:
+  spatial_dims: 3
+  # Changed: flow mode feeds only the interpolant, so in == out == latent channels (8).
+  in_channels: 8
+  out_channels: 8
+  # Changed: same widths as diff2d_flow_perc so the whole 2D UNet inflates.
+  num_channels: [64, 128, 256]
+  # Changed: attention on the two coarser levels, matching the 2D run.
+  attention_levels: [false, true, true]
+  # Changed: one residual block per level, matching the 2D run.
+  num_res_blocks: 1
+  # Changed: downsample in-plane only (depth stride 1); needed for the exact warm start.
+  anisotropic: true
+
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+
+augment:
+  enabled: true
+  flip_prob: 0.5
+  rot90_prob: 0.5
+  # Changed: 0. Affine rotations resample ACROSS the depth axis and smear neighbouring
+  # slices together; slab mode exists to keep native slices intact.
+  affine_prob: 0.0
+  affine_rotate_deg: 7.0
+  affine_scale: 0.1
+  affine_translate: 0.02
+  # Changed: 0, same reason as affine_prob.
+  elastic_prob: 0.0
+  elastic_sigma_range: [1.0, 2.0]
+  elastic_magnitude_range: [1.0, 2.0]
