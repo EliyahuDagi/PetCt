@@ -10,7 +10,8 @@ is intentionally flat and stable:
 Task-specific keys:
     ae2d / ae3d     -> recon_l1, kl. VAL rows additionally carry image-quality
                        metrics on the reconstruction: psnr, ssim, nrmse, mae,
-                       rel_bias.
+                       rel_bias. ae3d TRAIN rows also carry lr (the learning
+                       rate that step's update was taken at; warmup + cosine).
     diff2d / ft3d   -> loss (total). TRAIN rows also carry mse (the diffusion
                        noise MSE) and perceptual (the weighted perceptual term, 0
                        when disabled). VAL rows additionally carry l1 plus the

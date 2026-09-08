@@ -1,10 +1,25 @@
 """Train the 3D latent diffusion UNet for NAC->AC translation.
 
-A frozen 3D AutoencoderKL (inflated, from train_ae3d) encodes paired NAC/AC 3D
-crops into 3D latent volumes (B, C, d, h, w) with depth compression. The 3D UNet
-is conditioned on the NAC latent volume by channel-concatenation and trained to
-predict noise added to the AC latent volume. Optionally inflates weights from a
-trained 2D diffusion checkpoint. Emits JSONL metrics and best/last checkpoints.
+NAC = non-attenuation-corrected PET, AC = attenuation-corrected PET.
+
+Two geometries share this trainer:
+
+* Cube mode (default, ``slab_depth: 0``): a frozen 3D AutoencoderKL (inflated, from
+  train_ae3d) encodes paired NAC/AC volumes resized to a cube into 3D latents
+  (B, C, d, h, w) with depth compression. This path is unchanged.
+* Slab mode (``slab_depth > 0``): volumes are resized in-plane only and keep every
+  native slice, so the frozen autoencoder has to give one latent slice per image slice.
+  Two autoencoders do that: the 2D one applied slice by slice (``ae_mode:
+  2d_slicewise``) and an in-plane-only 3D one (``ae_mode: 3d`` on a checkpoint built
+  with ``model.anisotropic: true``, which downsamples in-plane only and keeps every
+  slice while still reading depth context). Which of the two a 3D checkpoint holds is
+  read from the built model, never from its config. Training sees random contiguous
+  depth slabs; validation runs the whole volume through overlapping depth windows.
+  Flow (``prediction_type: flow``) only.
+
+The UNet is either conditioned on the NAC latent by channel-concatenation (epsilon) or
+trained as a NAC->AC flow bridge. Optionally inflates weights from a trained 2D
+diffusion checkpoint. Emits JSONL metrics and best/last checkpoints.
 """
 
 import argparse
@@ -20,12 +35,18 @@ from src.training.data import (
     filter_paired_patients_cached,
     load_patient_volumes,
     make_patient_split3,
+    sample_pair_slabs,
+    sample_pair_slabs_band,
+    sample_pair_volume_native,
+    sample_pair_volume_native_band,
     sample_pair_volumes,
     sample_pair_volumes_full,
     write_split_json,
 )
 from src.training.dataset_index import enumerate_patients
 from src.training.utils.augment import build_aug_3d
+from src.training.models.anisotropic import is_inplane_only
+from src.training.models.autoencoder2d import build_autoencoder_2d
 from src.training.models.autoencoder3d import (
     ae3d_decode,
     ae3d_encode,
@@ -92,7 +113,70 @@ def inflate_and_load(model_3d, state_dict_2d):
     return missing
 
 
-def load_frozen_ae(ae_ckpt, device):
+def _inflation_source(state):
+    """Pick which 2D weights to inflate from a loaded diff2d checkpoint dict.
+
+    Prefers the EMA shadow (``state["ema"]["shadow"]``) when present and falls back to
+    the raw weights (``state["model"]``, or ``state`` itself for a bare state dict).
+    Same selection as ``init_weights_from`` in utils/checkpointing.py.
+
+    Returns ``(state_dict, source_name)`` with source_name in {"EMA shadow", "raw model"}.
+    """
+    ema_state = state.get("ema")
+    src_sd = ema_state.get("shadow") if isinstance(ema_state, dict) else None
+    if src_sd:
+        return src_sd, "EMA shadow"
+    return state.get("model", state), "raw model"
+
+
+def load_frozen_ae(ae_ckpt, device, ae_mode="3d"):
+    """Load the frozen autoencoder that turns volumes into latents.
+
+    ``ae_mode="2d_slicewise"``: the 2D AutoencoderKL from train_ae2d, wrapped so it
+    encodes and decodes a (B, 1, D, H, W) volume one slice at a time. The wrapper has
+    the same ``encode``/``decode`` surface, so every caller that goes through
+    ``ae3d_encode``/``ae3d_decode`` works unchanged. The latent keeps every slice.
+
+    ``ae_mode="3d"``: the 3D AutoencoderKL from train_ae3d. Two kinds arrive here and
+    both load exactly the same way, because the checkpoint's own model block is what
+    builds the network (``build_autoencoder_3d`` reads ``model.anisotropic`` from it):
+
+    * the cube autoencoder, which downsamples all three axes, so the latent depth is
+      smaller than the image depth. This is what cube mode uses.
+    * the in-plane-only autoencoder, which downsamples in-plane only and keeps every
+      slice, so the latent depth equals the image depth -- usable by slab mode, with
+      depth context the slice-wise 2D autoencoder cannot see.
+
+    Nothing here depends on which of the two it is. A caller that needs one latent
+    slice per image slice must ask the BUILT model (``ae_preserves_depth`` below), not
+    the config that came with it.
+
+    Returns ``(ae, ae_config)``; ``ae_config`` carries ``latent_channels``.
+    """
+    mode = str(ae_mode or "3d").lower()
+    if mode == "2d_slicewise":
+        if not ae_ckpt or not os.path.exists(ae_ckpt):
+            raise FileNotFoundError(
+                "2D AE checkpoint not found at %r. Slab mode needs the 2D autoencoder "
+                "(train_ae2d writes outputs/ae2d_p/best.pt); pass it with --ae2d_ckpt." % ae_ckpt
+            )
+        # Imported here so the cube path does not depend on the slab-mode model code.
+        from src.training.models.autoencoder2d import SliceWiseAutoencoder
+        state = load_checkpoint(ae_ckpt)
+        task = str(state.get("task", "") or "").lower()
+        if task and task != "ae2d":
+            raise ValueError(
+                "ae_mode 2d_slicewise needs a 2D autoencoder checkpoint, but %r was written by "
+                "the %r stage." % (ae_ckpt, task))
+        ae_config = state.get("config", {})
+        ae2d = build_autoencoder_2d(ae_config).to(device)
+        ae2d.load_state_dict(state.get("model", state))
+        ae2d.eval()
+        for p in ae2d.parameters():
+            p.requires_grad_(False)
+        return SliceWiseAutoencoder(ae2d), ae_config
+    if mode != "3d":
+        raise ValueError("ae_mode must be '3d' or '2d_slicewise'; got %r" % (ae_mode,))
     if not ae_ckpt or not os.path.exists(ae_ckpt):
         raise FileNotFoundError(
             "3D AE checkpoint not found at %r. Train ae3d first (it writes outputs/ae3d/best.pt)." % ae_ckpt
@@ -105,6 +189,30 @@ def load_frozen_ae(ae_ckpt, device):
     for p in ae.parameters():
         p.requires_grad_(False)
     return ae, ae_config
+
+
+def ae_preserves_depth(ae, ae_mode):
+    """True when the frozen autoencoder makes one latent slice per image slice.
+
+    The 2D autoencoder run slice by slice does that by construction: it never sees more
+    than one slice at a time. A 3D autoencoder does it only when it was built in-plane
+    only, and that is read from the BUILT model (``is_inplane_only`` reports the
+    in-plane surgery that set the convolution strides), not from the config the
+    checkpoint carries -- a config can be stale or edited by hand, the strides the
+    network actually runs with cannot.
+    """
+    if str(ae_mode or "3d").lower() == "2d_slicewise":
+        return True
+    return is_inplane_only(ae)
+
+
+def ae_description(ae, ae_mode):
+    """Plain name of the frozen autoencoder, for the startup log and error messages."""
+    if str(ae_mode or "3d").lower() == "2d_slicewise":
+        return "2D autoencoder applied slice by slice"
+    if is_inplane_only(ae):
+        return "in-plane-only 3D autoencoder"
+    return "depth-compressing 3D autoencoder"
 
 
 def compute_latent_scale(ae, sample_train_pair, n_batches=12, logger=None):
@@ -194,7 +302,10 @@ def main():
     parser.add_argument("--data_dir", required=True, nargs="+", help="One or more dataset roots / patient folders")
     parser.add_argument("--patient_index", type=int, default=0)
     parser.add_argument("--config", default=None)
-    parser.add_argument("--ae_ckpt", default="outputs/ae3d/best.pt", help="Frozen 3D AE checkpoint (from train_ae3d)")
+    parser.add_argument("--ae_ckpt", default="outputs/ae3d/best.pt",
+                        help="Frozen 3D AE checkpoint (from train_ae3d). Either the cube one "
+                             "(depth compressed) for cube mode, or an in-plane-only one "
+                             "(model.anisotropic: true, every slice kept) for slab mode.")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--steps_per_epoch", type=int, default=20)
     parser.add_argument("--val_every", type=int, default=10)
@@ -205,7 +316,10 @@ def main():
     parser.add_argument("--val_batches", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
-    parser.add_argument("--latent_size", type=int, default=64, help="Cube size of 3D crops fed to the AE encoder")
+    parser.add_argument("--latent_size", type=int, default=64,
+                        help="Cube mode: cube size of the 3D crops fed to the AE encoder. Slab mode "
+                             "(--slab_depth > 0): the IN-PLANE size (rows = columns) every slice is "
+                             "resized to; the depth is kept native. Recorded as slab_inplane_size.")
     parser.add_argument(
         "--perceptual_weight",
         type=float,
@@ -213,6 +327,19 @@ def main():
         help="Override the perceptual-loss weight (0 disables it). Default comes from the config.",
     )
     parser.add_argument("--inflate_from", default=None, help="Optional 2D diffusion checkpoint to inflate")
+    parser.add_argument("--slab_depth", type=int, default=None,
+                        help="Slab mode: number of native slices per training slab (0 = cube mode, "
+                             "the default). Overrides the config's slab_depth. Needs prediction_type: "
+                             "flow and an autoencoder that keeps every slice: either --ae2d_ckpt (the "
+                             "2D one applied slice by slice) or --ae_ckpt pointing at an in-plane-only "
+                             "3D one (model.anisotropic: true).")
+    parser.add_argument("--ae2d_ckpt", default=None,
+                        help="Frozen 2D AE checkpoint (from train_ae2d) applied slice by slice. "
+                             "Sets ae_mode=2d_slicewise and is used INSTEAD of --ae_ckpt.")
+    parser.add_argument("--anisotropic", action="store_true",
+                        help="Set model.anisotropic=true: the 3D UNet downsamples in-plane only "
+                             "(depth stride 1), so a 2D checkpoint inflated with --inflate_from "
+                             "acts exactly per slice at step 0.")
     parser.add_argument("--init_from", default=None,
                         help="Fine-tune init: load MODEL WEIGHTS ONLY from an existing 3D "
                              "checkpoint (prefers its EMA shadow). Unlike --resume this keeps a "
@@ -278,6 +405,22 @@ def main():
         #   0 = never unfreeze (stay depth-only for the entire run); N>0 = unfreeze at
         #   step N. Resume re-establishes the freeze from the checkpoint-embedded plan.
         "inflate_unfreeze_step": 0,
+        # --- Slab mode (see the module docstring). Every key is written to the checkpoint. ---
+        # Which frozen autoencoder makes the latents: "3d" (the AE from train_ae3d --
+        # either the cube one, which compresses depth, or an in-plane-only one, which
+        # keeps every slice) or "2d_slicewise" (the 2D AE applied slice by slice, which
+        # also keeps every slice). Slab mode accepts either depth-preserving one.
+        "ae_mode": "3d",
+        # Native slices per training slab. 0 = cube mode (whole volume resized to a
+        # latent_size^3 cube, the original behaviour, unchanged). >0 = slab mode.
+        "slab_depth": 0,
+        # Depth window for whole-volume validation/inference in slab mode (null ->
+        # 2*slab_depth) and how far consecutive windows advance (null -> slab_depth).
+        "slab_window": None,
+        "slab_stride": None,
+        # In-plane size the slices are resized to in slab mode; set from --latent_size at
+        # train time so inference/eval can rebuild the geometry from the checkpoint alone.
+        "slab_inplane_size": 128,
         # Perceptual loss on the in-graph decoded x0 estimate (2D backbone run
         # slice-wise on the 3D decode). >0 enables it; 0/disabled is a no-op.
         # Backend is pluggable ("vgg" now, "medical_sam" later).
@@ -331,6 +474,9 @@ def main():
             "num_channels": [16, 32, 48],
             "attention_levels": [False, False, True],
             "num_res_blocks": 1,
+            # Slab mode: downsample in-plane only (depth stride 1). False = the plain
+            # isotropic MONAI UNet (cube mode).
+            "anisotropic": False,
         },
     }
 
@@ -342,6 +488,50 @@ def main():
         config["learning_rate"] = args.learning_rate
     if args.perceptual_weight is not None:
         config["perceptual_weight"] = args.perceptual_weight
+
+    # --- Slab mode resolution. slab_depth == 0 keeps the cube path exactly as before;
+    # the keys are still written to the config so every checkpoint says which geometry
+    # and which autoencoder produced it (inference/eval rebuild both from the config).
+    ae_mode = str(config.get("ae_mode", "3d") or "3d").lower()
+    if args.ae2d_ckpt:
+        ae_mode = "2d_slicewise"
+    config["ae_mode"] = ae_mode
+    ae_ckpt_path = args.ae2d_ckpt if args.ae2d_ckpt else args.ae_ckpt
+    if args.slab_depth is not None:
+        config["slab_depth"] = int(args.slab_depth)
+    slab_depth = int(config.get("slab_depth", 0) or 0)
+    config["slab_depth"] = slab_depth
+    slab_mode = slab_depth > 0
+    if slab_mode:
+        # Slab mode needs an autoencoder whose latent keeps one slice per image slice.
+        # Two do: the 2D autoencoder run slice by slice ("2d_slicewise") and a 3D one
+        # built in-plane only ("3d" with model.anisotropic). Whether a "3d" checkpoint
+        # is the in-plane kind or the depth-compressing cube kind can only be told from
+        # the built model, so that half of the check runs after load_frozen_ae below.
+        # Here we reject only what is already knowable: a mode that is neither.
+        if ae_mode not in ("2d_slicewise", "3d"):
+            raise ValueError(
+                "slab_depth=%d needs an autoencoder that keeps every slice, but ae_mode is %r. "
+                "Use ae_mode '2d_slicewise' (the frozen 2D autoencoder applied slice by slice; "
+                "pass --ae2d_ckpt <2D AE best.pt>) or ae_mode '3d' pointing at an in-plane-only "
+                "3D autoencoder (one trained with model.anisotropic: true; pass --ae_ckpt)."
+                % (slab_depth, ae_mode))
+        slab_window = int(config.get("slab_window") or 2 * slab_depth)
+        slab_stride = int(config.get("slab_stride") or slab_depth)
+        if slab_stride > slab_window:
+            raise ValueError(
+                "slab_stride (%d) must not exceed slab_window (%d): consecutive depth windows "
+                "would leave slices uncovered." % (slab_stride, slab_window))
+        config["slab_window"] = slab_window
+        config["slab_stride"] = slab_stride
+        # --latent_size is the IN-PLANE size in slab mode. Record it so inference and
+        # evaluation resize the same way without needing the flag.
+        config["slab_inplane_size"] = int(args.latent_size)
+    else:
+        slab_window = None
+        slab_stride = None
+    if args.anisotropic:
+        config["model"]["anisotropic"] = True
 
     resume_path = resolve_resume_path(save_dir, args.resume)
 
@@ -356,7 +546,24 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     configure_backends(device, logger)
 
-    ae, ae_config = load_frozen_ae(args.ae_ckpt, device)
+    ae, ae_config = load_frozen_ae(ae_ckpt_path, device, ae_mode)
+    # Does this autoencoder give one latent slice per image slice? Asked of the BUILT
+    # model, not of the config it came with (see ae_preserves_depth).
+    ae_keeps_depth = ae_preserves_depth(ae, ae_mode)
+    logger.info(
+        "Autoencoder: %s from %s (ae_mode=%s); latent depth %s the image depth.",
+        ae_description(ae, ae_mode), ae_ckpt_path, ae_mode,
+        "EQUALS" if ae_keeps_depth else "is SMALLER than")
+    if slab_mode and not ae_keeps_depth:
+        raise ValueError(
+            "slab_depth=%d needs an autoencoder whose latent keeps one slice per image slice, "
+            "but %r builds a %s: its latent has fewer slices than the volume, so it cannot line "
+            "up with a slab of %d native slices. Two autoencoders are acceptable here: (1) the "
+            "2D autoencoder applied slice by slice -- pass --ae2d_ckpt <2D AE best.pt> (or set "
+            "ae_mode: 2d_slicewise); (2) an in-plane-only 3D autoencoder -- one trained with "
+            "model.anisotropic: true, which downsamples in-plane only and keeps every slice "
+            "while still reading depth context; pass it with --ae_ckpt."
+            % (slab_depth, ae_ckpt_path, ae_description(ae, ae_mode), slab_depth))
     latent_channels = int(ae_config.get("latent_channels", config.get("latent_channels", 4)))
     config["latent_channels"] = latent_channels
     prediction_type = str(config.get("prediction_type", "epsilon")).lower()
@@ -369,6 +576,27 @@ def main():
     model_cfg["in_channels"] = diffusion_in_channels(latent_channels, is_flow)
     model_cfg["out_channels"] = latent_channels
     config["model"] = model_cfg
+
+    if slab_mode:
+        if not is_flow:
+            raise NotImplementedError(
+                "Slab mode is implemented for prediction_type=flow only. The epsilon path "
+                "(noise prediction with the NAC latent concatenated) has no depth-windowed "
+                "sampler for whole-volume validation yet.")
+        logger.info(
+            "SLAB MODE: in-plane %dx%d (--latent_size), native depth kept (the target is never "
+            "resampled along depth); training slabs of %d slices; validation/inference on the "
+            "whole volume with overlapping depth windows of %d slices, stride %d, triangular "
+            "blend; ae_mode=%s (frozen %s, so latent depth == image depth; %d latent channels); "
+            "model.anisotropic=%s.",
+            args.latent_size, args.latent_size, slab_depth, slab_window, slab_stride, ae_mode,
+            ae_description(ae, ae_mode), latent_channels,
+            bool(model_cfg.get("anisotropic", False)))
+        if not model_cfg.get("anisotropic", False):
+            logger.warning(
+                "Slab mode without model.anisotropic: the UNet also downsamples depth, so a 2D "
+                "checkpoint inflated with --inflate_from is NOT exact per slice at step 0. Pass "
+                "--anisotropic (or set model.anisotropic: true) for the intended warm start.")
 
     # raw_model owns the weights (inflation / EMA / state_dict / resume); model is
     # the (optionally) compiled forward handle. They share parameters.
@@ -393,6 +621,12 @@ def main():
     perceptual_active_frac = float(config.get("perceptual_active_frac", 0.7))
     clamp_output = bool(config.get("clamp_output", True))
     perceptual = None
+    if (perceptual_weight > 0 and ae_mode == "2d_slicewise"
+            and str(config.get("perceptual_backend", "vgg") or "vgg").lower() == "lpl"):
+        raise ValueError(
+            "perceptual_backend 'lpl' reads the 3D autoencoder decoder's own features and is "
+            "not available with ae_mode 2d_slicewise (the wrapped 2D decoder runs per slice). "
+            "Use perceptual_backend: vgg or set perceptual_weight: 0.")
     if perceptual_weight > 0:
         perceptual = build_perceptual_loss(
             config.get("perceptual_backend", "vgg"),
@@ -484,9 +718,15 @@ def main():
                 "channel count differs (flow=C vs epsilon=2C), so the input conv will NOT inflate and "
                 "falls back to fresh init. Inflate flow->flow (or epsilon->epsilon) for a full warm-start.",
                 ckpt_pt, prediction_type)
-        missing = inflate_and_load(raw_model, state.get("model", state))
+        # Inflate the EMA shadow, not the raw weights: evaluation and inference load the
+        # EMA (_load_model(use_ema=True)), so it is the model whose measured quality this
+        # warm start inherits. The raw weights are one optimizer step "ahead" and noisier,
+        # so inflating them breaks the "exact 2D start" (measured: -0.08 dB at step 0).
+        src_sd, src_name = _inflation_source(state)
+        missing = inflate_and_load(raw_model, src_sd)
         inflated = True
-        logger.info("Inflated from 2D checkpoint %s, missing keys: %s", args.inflate_from, len(missing))
+        logger.info("Inflated from 2D checkpoint %s (%s), missing keys: %s",
+                    args.inflate_from, src_name, len(missing))
     elif resume_path is None and args.init_from:
         # Fine-tune init from an existing 3D checkpoint (weights only). Mutually exclusive
         # with --inflate_from in practice: the source is already 3D, so nothing to inflate.
@@ -537,6 +777,23 @@ def main():
     # Geometric-only 3D train augmentation (no-op identity unless config opts in),
     # layered on top of the existing crop/flip/rot90. The SAME geometry is applied
     # to NAC and AC (paired). Val passes geo_aug=None for a stable metric.
+    aug_cfg = config.get("augment")
+    if slab_mode and isinstance(aug_cfg, dict) and aug_cfg.get("enabled", False):
+        # Affine and elastic transforms rotate/warp ACROSS the depth axis and smear
+        # neighbouring slices into each other. Slab mode exists to keep native slices
+        # intact, so both are pinned to 0 here (flips and quarter-turns stay). An unset
+        # affine_prob would otherwise fall back to the augment module's non-zero default.
+        affine_p = float(aug_cfg.get("affine_prob") or 0.0)
+        elastic_p = float(aug_cfg.get("elastic_prob") or 0.0)
+        if affine_p > 0 or elastic_p > 0 or "affine_prob" not in aug_cfg:
+            logger.warning(
+                "Slab mode: augment.affine_prob (%s) and augment.elastic_prob (%s) forced to 0; "
+                "these transforms would resample across the depth axis.",
+                aug_cfg.get("affine_prob", "unset"), aug_cfg.get("elastic_prob", "unset"))
+        aug_cfg = dict(aug_cfg)
+        aug_cfg["affine_prob"] = 0.0
+        aug_cfg["elastic_prob"] = 0.0
+        config["augment"] = aug_cfg
     train_aug = build_aug_3d(config.get("augment"))
 
     # Diffusion requires paired NAC+AC. Enumerate across roots, keep only paired
@@ -555,11 +812,23 @@ def main():
             raise ValueError("Both NAC and AC PET volumes are required for ft3d training.")
         logger.info("Training on 1 patient (train 1 / val 1) across %d roots.", len(args.data_dir))
 
-        def sample_train_pair():
-            return sample_pair_volumes(vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, "train", args.val_fraction, rng, geo_aug=train_aug)
+        if slab_mode:
+            # Slab mode, one patient: slabs from the train depth band; validation on the
+            # whole val band at native depth (batch of one, no augmentation).
+            def sample_train_pair():
+                return sample_pair_slabs_band(
+                    vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, slab_depth,
+                    "train", args.val_fraction, rng, augment=True, geo_aug=train_aug)
 
-        def sample_val_pair():
-            return sample_pair_volumes(vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, "val", args.val_fraction, rng, geo_aug=None)
+            def sample_val_pair():
+                return sample_pair_volume_native_band(
+                    vols["pet_nac"], vols["pet_ac"], args.latent_size, "val", args.val_fraction)
+        else:
+            def sample_train_pair():
+                return sample_pair_volumes(vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, "train", args.val_fraction, rng, geo_aug=train_aug)
+
+            def sample_val_pair():
+                return sample_pair_volumes(vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, "val", args.val_fraction, rng, geo_aug=None)
     else:
         if args.split_json:
             # REUSE an existing partition instead of deriving a new one. This is required
@@ -590,12 +859,22 @@ def main():
             train_indices=train_idx, rng=rng, cache_dir=args.cache_dir, **cache_kwargs,
         ).start()
 
-        def _sample_sync(indices, augment, geo_aug=None):
-            idx = int(indices[rng.randint(0, len(indices))])
-            vols = cache.get(idx)
+        def _pair_from_vols(vols, augment, geo_aug):
+            # One helper for the prefetch and synchronous paths. Cube mode: the original
+            # whole-volume cube sampler. Slab mode: random contiguous depth slabs of
+            # slab_depth native slices, resized in-plane only.
+            if slab_mode:
+                return sample_pair_slabs(
+                    vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, slab_depth, rng,
+                    augment=augment, geo_aug=geo_aug)
             return sample_pair_volumes_full(
                 vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, rng, augment=augment, geo_aug=geo_aug
             )
+
+        def _sample_sync(indices, augment, geo_aug=None):
+            idx = int(indices[rng.randint(0, len(indices))])
+            vols = cache.get(idx)
+            return _pair_from_vols(vols, augment, geo_aug)
 
         # Train augments (random crop/flip/rotation + optional MONAI geo) so the small
         # paired pool yields diverse 3D examples; val stays clean for a stable metric.
@@ -603,12 +882,34 @@ def main():
             if args.prefetch <= 0:
                 return _sample_sync(train_idx, True, geo_aug=train_aug)
             _, vols = cache.next_train()
-            return sample_pair_volumes_full(
-                vols["pet_nac"], vols["pet_ac"], batch_size, args.latent_size, rng, augment=True, geo_aug=train_aug
-            )
+            return _pair_from_vols(vols, True, train_aug)
 
-        def sample_val_pair():
-            return _sample_sync(val_idx, False, geo_aug=None)
+        if slab_mode:
+            # Slab mode validates the SAME fixed patients at every validation, in the same
+            # order. The old code drew a fresh random subset of val_idx (from the TRAINING
+            # rng) on every validation call. With --val_batches 8 out of 82 val patients,
+            # 4 of which are broken NAC/AC pairs (one has a single-slice AC volume: loss
+            # ~160, PSNR ~8 dB), consecutive validations read e.g. PSNR 26.9 then 25.2 on
+            # weights that were actually better, and best.pt (chosen by val l1) was picked
+            # by luck of the draw. The fixed list depends only on (seed, val_idx), so a
+            # --resume run sees exactly the same patients, and validation no longer
+            # consumes the training rng.
+            val_cursor = _FixedValCursor(_fixed_val_indices(val_idx, args.val_batches, seed))
+            logger.info(
+                "Slab-mode validation: fixed set of %d validation patients (indices %s).",
+                len(val_cursor.indices), val_cursor.indices)
+
+            def sample_val_pair():
+                # Whole volume at native depth, batch of one, no augmentation. Walks the
+                # fixed list in order; _validate calls sample_val_pair.reset() per pass.
+                vols = cache.get(val_cursor.next_index())
+                return sample_pair_volume_native(
+                    vols["pet_nac"], vols["pet_ac"], args.latent_size, geo_aug=None)
+
+            sample_val_pair.reset = val_cursor.reset
+        else:
+            def sample_val_pair():
+                return _sample_sync(val_idx, False, geo_aug=None)
 
     # Latent normalization: scale RAW AE latents to ~unit std so the DDIM sampler's
     # N(0,1) start matches the latent distribution. A non-null config value pins the
@@ -757,7 +1058,8 @@ def main():
         metrics_writer.log("train", global_step, metrics, epoch)
 
         if args.val_every > 0 and global_step % args.val_every == 0:
-            val_metrics = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma, latent_scale, is_flow, clamp_output)
+            val_metrics = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma, latent_scale, is_flow, clamp_output,
+                                    slab_window=slab_window, slab_stride=slab_stride)
             logger.info("VAL step=%s loss=%.6f l1=%.6f", global_step, val_metrics["loss"], val_metrics["l1"])
             metrics_writer.log("val", global_step, val_metrics, epoch)
             # Flow selects on the honest-rollout L1, not the (shortcut-prone) velocity loss.
@@ -766,7 +1068,8 @@ def main():
             best_val = min(best_val, sel)
             save_training_checkpoint(save_dir, _checkpoint_state(raw_model, optimizer, rng, config, global_step + 1, epoch, sel, best_val, ema), is_best)
 
-    final_val = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma, latent_scale, is_flow, clamp_output)
+    final_val = _validate(model, raw_model, ema, ae, schedule, sample_val_pair, args.val_batches, snr_gamma, latent_scale, is_flow, clamp_output,
+                          slab_window=slab_window, slab_stride=slab_stride)
     metrics_writer.log("val", total_steps, final_val, int(args.epochs))
     sel = _selection_metric(final_val, is_flow)
     is_best = sel < best_val
@@ -778,9 +1081,56 @@ def main():
     logger.info("Training finished. best_val_loss=%.6f", best_val)
 
 
+def _fixed_val_indices(val_idx, n_batches, seed):
+    """Fixed, ordered list of validation patient indices for slab-mode validation.
+
+    A permutation of ``val_idx`` drawn from a DEDICATED ``RandomState(seed)`` (never the
+    training rng), truncated to ``max(1, n_batches)`` entries (all of ``val_idx`` when it
+    is shorter). The list depends only on ``(val_idx, seed)`` -- nothing that moves with
+    training progress -- so a ``--resume`` run derives exactly the same list as a fresh one.
+    """
+    val_idx = [int(i) for i in val_idx]
+    if not val_idx:
+        raise ValueError("Slab-mode validation needs at least one validation patient.")
+    val_rng = np.random.RandomState(seed)
+    order = val_rng.permutation(len(val_idx))
+    n = min(len(val_idx), max(1, int(n_batches)))
+    return [val_idx[int(i)] for i in order[:n]]
+
+
+class _FixedValCursor:
+    """Walks a fixed list of validation indices in order; ``reset()`` restarts at entry 0.
+
+    ``_validate`` calls ``reset()`` once at the start of every pass (through the
+    ``sample_val_pair.reset`` hook), so validation call k of a pass always sees patient k.
+    """
+
+    def __init__(self, indices):
+        self.indices = list(indices)
+        self.k = 0
+
+    def next_index(self):
+        idx = self.indices[self.k % len(self.indices)]
+        self.k += 1
+        return idx
+
+    def reset(self):
+        self.k = 0
+
+
 @torch.no_grad()
 def _validate(model, raw_model, ema, ae, schedule, sample_val_pair, n_batches, snr_gamma=None,
-              latent_scale=1.0, is_flow=False, clamp_output=True):
+              latent_scale=1.0, is_flow=False, clamp_output=True, slab_window=None, slab_stride=None):
+    """Validation pass. ``slab_window``/``slab_stride`` (both None in cube mode) switch on
+    the slab-mode path: the velocity loss is measured on one deterministic depth window at
+    the centre of the volume, and the rollout runs the UNet on overlapping depth windows
+    whose velocities are blended, exactly as inference does. Flow only."""
+    slab = slab_window is not None
+    if slab and not is_flow:
+        raise NotImplementedError("Slab-mode validation is implemented for prediction_type=flow only.")
+    if slab:
+        # Imported here so the cube path does not depend on the slab-mode model code.
+        from src.training.utils.sliding import depth_windowed_model_fn
     # Evaluate under the EMA weights when available -- consistently higher quality.
     # The EMA swap targets raw_model (shared params); forward still runs via model.
     ctx = ema.average_parameters(raw_model) if ema is not None else _null_context(raw_model)
@@ -788,21 +1138,42 @@ def _validate(model, raw_model, ema, ae, schedule, sample_val_pair, n_batches, s
         model.eval()
         accum = {"loss": 0.0, "l1": 0.0}
         n = max(1, n_batches)
+        # Slab mode: restart the fixed validation list at patient 0 so every pass scores
+        # the same patients in the same order. Cube-mode samplers have no reset hook.
+        reset = getattr(sample_val_pair, "reset", None)
+        if reset is not None:
+            reset()
         for _ in range(n):
             nac_vol, ac_vol = sample_val_pair()
             # Same scaled latent space as training (NAC + AC scaled identically).
             ac_lat = ae3d_encode(ae, ac_vol, scale=latent_scale)
             nac_lat = ae3d_encode(ae, nac_vol, scale=latent_scale)
             if is_flow:
-                # Deliberately the UNSHAPED loss (uniform tau, no (1-tau) weighting): the
-                # reported val `loss` must stay comparable across A/B arms that differ in
-                # exactly those knobs. Model selection uses the rollout `l1` regardless.
-                loss, _, _, _, _ = flow_loss(model, schedule, ac_lat, nac_lat)
+                # No concat -- matches flow_loss (in_channels = C); NAC enters only as x_init.
+                base_model_fn = lambda x, t: model(to_input_memory_format(x), t)
+                if slab:
+                    # (a) Velocity loss on ONE deterministic window at the centre of the depth
+                    # axis, no longer than the training window. Whole volumes would not fit
+                    # and would tie the loss to the slice count.
+                    z_dim = int(ac_lat.shape[2])
+                    w = min(z_dim, int(slab_window))
+                    z0 = (z_dim - w) // 2
+                    loss, _, _, _, _ = flow_loss(
+                        model, schedule,
+                        ac_lat[:, :, z0:z0 + w].contiguous(),
+                        nac_lat[:, :, z0:z0 + w].contiguous())
+                    # (b) Whole-volume rollout through overlapping depth windows (blended),
+                    # the same way inference runs; metrics are then on the whole volume.
+                    flow_model_fn = depth_windowed_model_fn(base_model_fn, int(slab_window), int(slab_stride))
+                else:
+                    # Deliberately the UNSHAPED loss (uniform tau, no (1-tau) weighting): the
+                    # reported val `loss` must stay comparable across A/B arms that differ in
+                    # exactly those knobs. Model selection uses the rollout `l1` regardless.
+                    loss, _, _, _, _ = flow_loss(model, schedule, ac_lat, nac_lat)
+                    flow_model_fn = base_model_fn
                 # HONEST generation metric: a real short rollout FROM the NAC latent
                 # (not the old one-step proxy, which leaked the real AC via x_t and
                 # masked the conditioning collapse). Only NAC information enters here.
-                # No concat -- matches flow_loss (in_channels = C); NAC enters only as x_init.
-                flow_model_fn = lambda x, t: model(to_input_memory_format(x), t)
                 ac_pred_lat = schedule.flow_sample(flow_model_fn, nac_lat, num_steps=8, spacing="linear")
                 recon = clamp_unit(ae3d_decode(ae, ac_pred_lat, scale=latent_scale), clamp_output)
             else:
