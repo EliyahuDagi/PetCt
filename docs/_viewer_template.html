@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NAC to AC PET viewer</title>
+<style>
+  :root {
+    --bg: #f7f7f8; --panel: #ffffff; --ink: #16181d; --muted: #5d636e;
+    --line: #dfe1e6; --accent: #2f6feb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161a; --panel: #1c1f25; --ink: #e9ebef; --muted: #a2a9b5;
+      --line: #2c313a; --accent: #6fa0ff;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14161a; --panel: #1c1f25; --ink: #e9ebef; --muted: #a2a9b5;
+    --line: #2c313a; --accent: #6fa0ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { background: var(--bg); color: var(--ink); padding-block: 18px;
+         padding-left: 16px; padding-right: 16px;
+         font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+               Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 1400px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 16px; max-width: 80ch; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px; margin-bottom: 14px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+  .tab { border: 1px solid var(--line); background: transparent; color: var(--ink);
+         border-radius: 8px; padding: 8px 12px; cursor: pointer; text-align: left;
+         font: inherit; }
+  .tab.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .tab b { display: block; font-size: 13px; }
+  .tab span { display: block; color: var(--muted); font-size: 12px;
+              font-variant-numeric: tabular-nums; }
+  .row { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
+  .row > label { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  select, input[type=range], button { font: inherit; }
+  select { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+           border-radius: 6px; padding: 4px 6px; }
+  button.ghost { border: 1px solid var(--line); background: transparent; color: var(--ink);
+                 border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  .sliceline { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+  .sliceline input[type=range] { flex: 1; min-width: 120px; }
+  .num { font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; }
+  .panels { display: grid; gap: 12px;
+            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+  .panel h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+  .panel h3 em { color: var(--muted); font-style: normal; font-weight: 400; }
+  canvas { width: 100%; height: auto; display: block; background: #000;
+           border: 1px solid var(--line); border-radius: 6px; image-rendering: pixelated; }
+  .readout { margin-top: 8px; color: var(--muted); font-variant-numeric: tabular-nums;
+             min-height: 1.5em; }
+  .sheetwrap { overflow-x: auto; }
+  .sheet { display: flex; flex-wrap: wrap; gap: 3px; }
+  .sheet canvas { width: 84px; cursor: pointer; }
+  .sheet .cell { position: relative; }
+  .sheet .cell i { position: absolute; left: 2px; top: 1px; font-style: normal;
+                   font-size: 9px; color: #fff; text-shadow: 0 0 3px #000;
+                   pointer-events: none; }
+  .notes { color: var(--muted); font-size: 13px; }
+  .notes li { margin-bottom: 5px; }
+  .notes b { color: var(--ink); }
+  .hide { display: none !important; }
+  table.m { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  table.m td, table.m th { border-bottom: 1px solid var(--line);
+                           padding: 3px 12px 3px 0; text-align: right; }
+  table.m th { color: var(--muted); font-weight: 500; }
+  table.m th:first-child, table.m td:first-child { text-align: left; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; font-size: 12px;
+            color: var(--muted); }
+  .legend i { display: inline-block; width: 26px; height: 10px; border-radius: 2px;
+              vertical-align: -1px; margin-right: 5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Non-corrected PET to corrected PET &mdash; every slice</h1>
+<p class="sub">Predictions from the frozen-autoencoder plus flow-bridge chain, on held-out
+patients the model never trained on. The input, the prediction and the truth here are the
+exact arrays the project report's numbers were computed from.</p>
+
+<div class="card">
+  <div class="tabs" id="tabs"></div>
+  <div id="pmeta" class="notes" style="margin-top:10px"></div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <label>View
+      <select id="mode">
+        <option value="compare">Compare side by side</option>
+        <option value="sheet">All slices at once</option>
+      </select>
+    </label>
+    <label>Plane
+      <select id="plane">
+        <option value="ax">Axial (native slices)</option>
+        <option value="co">Coronal (front)</option>
+        <option value="sa">Sagittal (side)</option>
+      </select>
+    </label>
+    <label>Colour
+      <select id="cmap">
+        <option value="grey">Grey</option>
+        <option value="invgrey">Inverted grey</option>
+        <option value="hot">Hot</option>
+      </select>
+    </label>
+    <label>Brightest shown
+      <input type="range" id="wmax" min="10" max="255" value="255">
+      <span class="num" id="wmaxv">1.00</span>
+    </label>
+    <label id="stretchwrap" class="hide">Depth stretch
+      <input type="range" id="stretch" min="30" max="300" value="100">
+      <span class="num" id="stretchv">1.0&times;</span>
+    </label>
+    <label id="sheetvolwrap" class="hide">Volume
+      <select id="sheetvol">
+        <option value="pred">Prediction</option>
+        <option value="gt">True corrected</option>
+        <option value="nac">Non-corrected input</option>
+        <option value="diff">Difference</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="showdiff" checked> Difference panel</label>
+  </div>
+  <div class="sliceline" id="sliceline">
+    <button class="ghost" id="prev">&larr;</button>
+    <input type="range" id="slice" min="0" max="0" value="0">
+    <button class="ghost" id="next">&rarr;</button>
+    <button class="ghost" id="play">Play</button>
+    <span class="num" id="slicev">&mdash;</span>
+  </div>
+</div>
+
+<div class="card" id="comparecard">
+  <div class="panels" id="panels"></div>
+  <div class="readout" id="readout">Move the pointer over any image to read the values at
+    that voxel.</div>
+  <div class="legend" id="difflegend">
+    <span><i style="background:linear-gradient(90deg,#2b3ff5,#787878)"></i>prediction too dim</span>
+    <span><i style="background:#787878"></i>agrees</span>
+    <span><i style="background:linear-gradient(90deg,#787878,#f5382b)"></i>prediction too bright</span>
+  </div>
+</div>
+
+<div class="card hide" id="sheetcard">
+  <div class="notes" id="sheethead"></div>
+  <div class="sheetwrap"><div class="sheet" id="sheet"></div></div>
+</div>
+
+<div class="card notes">
+<b>What you are looking at</b>
+<ul>
+<li><b>Non-corrected input</b> &mdash; what the scanner measures without a CT scan. Deep
+  organs read too dim and there is a bright rim at the body surface, because signal from
+  deep inside the body is absorbed on its way out.</li>
+<li><b>Prediction</b> &mdash; this model's estimate of the corrected image, computed from
+  the non-corrected input alone. No CT scan is used at any point.</li>
+<li><b>True corrected</b> &mdash; the clinical image produced the standard way, using the
+  patient's CT scan. This is the target. None of these patients were trained on.</li>
+<li><b>Difference</b> &mdash; prediction minus truth: blue where the prediction is too dim,
+  red where it is too bright, flat grey where the two agree.</li>
+</ul>
+<b>Honest caveats about this viewer</b>
+<ul>
+<li>Every volume is 128&times;128 in-plane with all native slices kept. That is the grid the
+  model runs on and the grid the report's numbers come from, and it is coarser in-plane than
+  the original scan.</li>
+<li>Intensities are normalised per patient with a 99th-percentile clip, so 1.0 means that
+  patient's bright level, not an absolute uptake value. Peak lesion intensity cannot be
+  judged from these images.</li>
+<li>Pixel values are stored here as 256 levels, for display size. No number in the report
+  is computed from this file.</li>
+<li>The cached volumes do not carry slice spacing, so the coronal and sagittal views are
+  drawn one row per slice. Use <em>depth stretch</em> if you know the real ratio &mdash; it
+  changes the display only.</li>
+</ul>
+</div>
+</div>
+
+<script>
+const PATIENTS = __DATA__;
+const VOLNAMES = {nac: "Non-corrected input", pred: "Prediction (no CT used)",
+                  gt: "True corrected (CT-based)", diff: "Difference (prediction minus truth)"};
+const state = {p: 0, mode: "compare", plane: "ax", cmap: "grey", wmax: 255, stretch: 1.0,
+               slice: 0, showdiff: true, sheetvol: "pred", playing: null, vols: {}};
+const $ = (id) => document.getElementById(id);
+
+/* Decode one png atlas into a flat Uint8Array volume. Decoding once, rather than keeping
+   the image and blitting tiles, is what lets the viewer also cut the volume the other two
+   ways: coronal and sagittal need arbitrary voxel access, not tile copies. */
+function decodeAtlas(dataUrl, meta) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement("canvas");
+      c.width = img.width; c.height = img.height;
+      const g = c.getContext("2d", {willReadFrequently: true});
+      g.drawImage(img, 0, 0);
+      const px = g.getImageData(0, 0, c.width, c.height).data;
+      const z = meta.z, h = meta.h, w = meta.w, cols = meta.cols;
+      const out = new Uint8Array(z * h * w);
+      for (let i = 0; i < z; i++) {
+        const tr = Math.floor(i / cols), tc = i % cols;
+        const y0 = tr * h, x0 = tc * w, base = i * h * w;
+        for (let y = 0; y < h; y++) {
+          let src = ((y0 + y) * c.width + x0) * 4;
+          let dst = base + y * w;
+          for (let x = 0; x < w; x++) { out[dst + x] = px[src]; src += 4; }
+        }
+      }
+      resolve(out);
+    };
+    img.onerror = () => reject(new Error("atlas failed to decode"));
+    img.src = dataUrl;
+  });
+}
+
+async function loadPatient(i) {
+  if (state.vols[i]) return state.vols[i];
+  const m = PATIENTS[i];
+  const parts = await Promise.all(["nac", "pred", "gt"].map((k) => decodeAtlas(m.imgs[k], m)));
+  state.vols[i] = {nac: parts[0], pred: parts[1], gt: parts[2]};
+  return state.vols[i];
+}
+
+function planeDims(m, plane) {
+  if (plane === "ax") return {n: m.z, w: m.w, h: m.h};
+  if (plane === "co") return {n: m.h, w: m.w, h: m.z};
+  return {n: m.w, w: m.h, h: m.z};
+}
+function sampleIndex(m, plane, k, col, row) {
+  if (plane === "ax") return k * m.h * m.w + row * m.w + col;
+  if (plane === "co") return row * m.h * m.w + k * m.w + col;
+  return row * m.h * m.w + col * m.w + k;
+}
+
+function colorFn(cmap) {
+  if (cmap === "invgrey") return (v) => [255 - v, 255 - v, 255 - v];
+  if (cmap === "hot") return (v) => {
+    const t = v / 255;
+    return [Math.min(255, Math.round(255 * Math.min(1, t * 3))),
+            Math.min(255, Math.round(255 * Math.max(0, Math.min(1, t * 3 - 1)))),
+            Math.min(255, Math.round(255 * Math.max(0, Math.min(1, t * 3 - 2))))];
+  };
+  return (v) => [v, v, v];
+}
+
+function drawSlice(canvas, vol, m, plane, k, opts) {
+  const d = planeDims(m, plane);
+  const off = document.createElement("canvas");
+  off.width = d.w; off.height = d.h;
+  const g = off.getContext("2d");
+  const im = g.createImageData(d.w, d.h);
+  const px = im.data;
+  if (opts.diff) {
+    const a = vol.pred, b = vol.gt, span = Math.max(1, opts.diffSpan);
+    for (let row = 0; row < d.h; row++) for (let col = 0; col < d.w; col++) {
+      const si = sampleIndex(m, plane, k, col, row);
+      let t = (a[si] - b[si]) / span;
+      t = t < -1 ? -1 : (t > 1 ? 1 : t);
+      const di = (row * d.w + col) * 4;
+      const mag = Math.round(Math.abs(t) * 255);
+      if (t < 0) {
+        px[di] = 120 - Math.round(mag * 0.45);
+        px[di + 1] = 120 - Math.round(mag * 0.20);
+        px[di + 2] = 120 + Math.round(mag * 0.50);
+      } else {
+        px[di] = 120 + Math.round(mag * 0.50);
+        px[di + 1] = 120 - Math.round(mag * 0.30);
+        px[di + 2] = 120 - Math.round(mag * 0.45);
+      }
+      px[di + 3] = 255;
+    }
+  } else {
+    const src = vol[opts.which], cf = colorFn(opts.cmap), wmax = opts.wmax;
+    for (let row = 0; row < d.h; row++) for (let col = 0; col < d.w; col++) {
+      const si = sampleIndex(m, plane, k, col, row);
+      let v = src[si] * 255 / wmax;
+      if (v > 255) v = 255;
+      const c = cf(Math.round(v));
+      const di = (row * d.w + col) * 4;
+      px[di] = c[0]; px[di + 1] = c[1]; px[di + 2] = c[2]; px[di + 3] = 255;
+    }
+  }
+  g.putImageData(im, 0, 0);
+
+  /* Depth stretch only touches the two views whose vertical axis IS depth. */
+  const vs = (plane === "ax") ? 1 : state.stretch;
+  canvas.width = d.w;
+  canvas.height = Math.max(1, Math.round(d.h * vs));
+  const dg = canvas.getContext("2d");
+  dg.imageSmoothingEnabled = false;
+  dg.clearRect(0, 0, canvas.width, canvas.height);
+  dg.drawImage(off, 0, 0, d.w, d.h, 0, 0, canvas.width, canvas.height);
+  canvas.dataset.dw = d.w;
+  canvas.dataset.dh = d.h;
+}
+
+function panelKeys() {
+  return ["nac", "pred", "gt"].concat(state.showdiff ? ["diff"] : []);
+}
+
+function buildPanels() {
+  const host = $("panels");
+  host.innerHTML = "";
+  panelKeys().forEach((k) => {
+    const d = document.createElement("div");
+    d.className = "panel";
+    const extra = (k === "pred") ? " <em>&mdash; what the model produced</em>"
+                : (k === "gt") ? " <em>&mdash; the target</em>" : "";
+    const h = document.createElement("h3");
+    h.innerHTML = VOLNAMES[k] + extra;
+    const cv = document.createElement("canvas");
+    cv.id = "cv_" + k;
+    cv.addEventListener("mousemove", (e) => report(e, cv));
+    cv.addEventListener("mouseleave", () => {
+      $("readout").textContent =
+        "Move the pointer over any image to read the values at that voxel.";
+    });
+    d.appendChild(h); d.appendChild(cv);
+    host.appendChild(d);
+  });
+  $("difflegend").classList.toggle("hide", !state.showdiff);
+}
+
+function report(e, cv) {
+  const m = PATIENTS[state.p], v = state.vols[state.p];
+  if (!v) return;
+  const r = cv.getBoundingClientRect();
+  const dw = +cv.dataset.dw, dh = +cv.dataset.dh;
+  const col = Math.floor((e.clientX - r.left) / r.width * dw);
+  const row = Math.floor((e.clientY - r.top) / r.height * dh);
+  if (col < 0 || row < 0 || col >= dw || row >= dh) return;
+  const si = sampleIndex(m, state.plane, state.slice, col, row);
+  const f = (x) => x.toFixed(3);
+  const nac = v.nac[si] / 255, pred = v.pred[si] / 255, gt = v.gt[si] / 255;
+  $("readout").innerHTML = "at this voxel &nbsp; input <b>" + f(nac)
+    + "</b> &nbsp; prediction <b>" + f(pred) + "</b> &nbsp; truth <b>" + f(gt)
+    + "</b> &nbsp; error <b>" + (pred - gt >= 0 ? "+" : "") + f(pred - gt) + "</b>"
+    + " &nbsp;&nbsp; <span style='opacity:.75'>(as a fraction of this patient's bright level)</span>";
+}
+
+function renderCompare() {
+  const m = PATIENTS[state.p], v = state.vols[state.p];
+  panelKeys().forEach((k) => {
+    const cv = $("cv_" + k);
+    if (!cv) return;
+    drawSlice(cv, v, m, state.plane, state.slice,
+              {which: k, diff: k === "diff", wmax: state.wmax, cmap: state.cmap,
+               diffSpan: state.wmax});
+  });
+  $("slicev").textContent = "slice " + (state.slice + 1) + " of "
+                          + planeDims(m, state.plane).n;
+}
+
+/* The contact sheet is the literal answer to "show me all the slices": every slice of the
+   chosen volume, in order, at thumbnail size. Click one to open it side by side. */
+function renderSheet() {
+  const m = PATIENTS[state.p], v = state.vols[state.p];
+  const d = planeDims(m, state.plane);
+  const k = state.sheetvol;
+  $("sheethead").innerHTML = "<b>" + VOLNAMES[k] + "</b> &mdash; all " + d.n
+    + " slices of this patient, in order. Click any slice to open it in the side-by-side view.";
+  const host = $("sheet");
+  host.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < d.n; i++) {
+    const cell = document.createElement("div");
+    cell.className = "cell";
+    const cv = document.createElement("canvas");
+    drawSlice(cv, v, m, state.plane, i,
+              {which: k, diff: k === "diff", wmax: state.wmax, cmap: state.cmap,
+               diffSpan: state.wmax});
+    cv.title = "slice " + (i + 1) + " of " + d.n;
+    const at = i;
+    cv.addEventListener("click", () => {
+      state.slice = at;
+      $("slice").value = at;
+      $("mode").value = "compare";
+      state.mode = "compare";
+      syncMode();
+      render();
+    });
+    const tag = document.createElement("i");
+    tag.textContent = String(i + 1);
+    cell.appendChild(cv); cell.appendChild(tag);
+    frag.appendChild(cell);
+  }
+  host.appendChild(frag);
+}
+
+function render() {
+  if (!state.vols[state.p]) return;
+  if (state.mode === "compare") renderCompare(); else renderSheet();
+}
+
+function syncMode() {
+  const sheet = state.mode === "sheet";
+  $("sheetcard").classList.toggle("hide", !sheet);
+  $("comparecard").classList.toggle("hide", sheet);
+  $("sheetvolwrap").classList.toggle("hide", !sheet);
+  $("sliceline").classList.toggle("hide", sheet);
+  $("stretchwrap").classList.toggle("hide", state.plane === "ax");
+}
+
+function patientMeta() {
+  const m = PATIENTS[state.p];
+  $("pmeta").innerHTML =
+    "<table class='m'><tr><th>patient</th><th>slices</th><th>PSNR</th><th>SSIM</th>"
+    + "<th>variance explained</th><th>slope</th><th>hot band</th></tr><tr>"
+    + "<td>" + m.label + " <span style='opacity:.65'>(" + m.collection + ")</span></td>"
+    + "<td>" + m.z + "</td><td>" + m.psnr.toFixed(2) + " dB</td>"
+    + "<td>" + m.ssim.toFixed(4) + "</td><td>" + m.voxel_r2.toFixed(3) + "</td>"
+    + "<td>" + m.slope.toFixed(3) + "</td><td>" + (m.hot * 100).toFixed(1) + "%</td></tr></table>";
+}
+
+async function selectPatient(i) {
+  state.p = i;
+  const tabs = document.querySelectorAll(".tab");
+  for (let j = 0; j < tabs.length; j++) tabs[j].classList.toggle("on", j === i);
+  patientMeta();
+  $("readout").textContent = "decoding " + PATIENTS[i].z + " slices...";
+  await loadPatient(i);
+  const d = planeDims(PATIENTS[i], state.plane);
+  state.slice = Math.min(state.slice, d.n - 1);
+  $("slice").max = d.n - 1;
+  $("slice").value = state.slice;
+  buildPanels();
+  render();
+  $("readout").textContent =
+    "Move the pointer over any image to read the values at that voxel.";
+}
+
+function setPlane(p) {
+  state.plane = p;
+  const d = planeDims(PATIENTS[state.p], p);
+  state.slice = Math.min(state.slice, d.n - 1);
+  $("slice").max = d.n - 1;
+  $("slice").value = state.slice;
+  syncMode();
+  render();
+}
+
+function step(dz) {
+  const d = planeDims(PATIENTS[state.p], state.plane);
+  state.slice = (state.slice + dz + d.n) % d.n;
+  $("slice").value = state.slice;
+  render();
+}
+
+PATIENTS.forEach((m, i) => {
+  const b = document.createElement("button");
+  b.className = "tab" + (i === 0 ? " on" : "");
+  b.innerHTML = "<b>" + m.title + "</b><span>" + m.label + " &middot; " + m.z
+              + " slices &middot; " + m.psnr.toFixed(1) + " dB</span>";
+  b.addEventListener("click", () => selectPatient(i));
+  $("tabs").appendChild(b);
+});
+$("mode").addEventListener("change", (e) => {
+  state.mode = e.target.value; syncMode(); render();
+});
+$("plane").addEventListener("change", (e) => setPlane(e.target.value));
+$("cmap").addEventListener("change", (e) => { state.cmap = e.target.value; render(); });
+$("sheetvol").addEventListener("change", (e) => { state.sheetvol = e.target.value; render(); });
+$("showdiff").addEventListener("change", (e) => {
+  state.showdiff = e.target.checked; buildPanels(); render();
+});
+$("wmax").addEventListener("input", (e) => {
+  state.wmax = +e.target.value;
+  $("wmaxv").textContent = (state.wmax / 255).toFixed(2);
+  render();
+});
+$("stretch").addEventListener("input", (e) => {
+  state.stretch = +e.target.value / 100;
+  $("stretchv").textContent = state.stretch.toFixed(1) + "×";
+  render();
+});
+$("slice").addEventListener("input", (e) => { state.slice = +e.target.value; render(); });
+$("prev").addEventListener("click", () => step(-1));
+$("next").addEventListener("click", () => step(1));
+$("play").addEventListener("click", () => {
+  if (state.playing) {
+    clearInterval(state.playing); state.playing = null; $("play").textContent = "Play";
+  } else {
+    state.playing = setInterval(() => step(1), 90); $("play").textContent = "Stop";
+  }
+});
+window.addEventListener("keydown", (e) => {
+  if (state.mode !== "compare") return;
+  if (e.key === "ArrowLeft") { step(-1); e.preventDefault(); }
+  if (e.key === "ArrowRight") { step(1); e.preventDefault(); }
+});
+syncMode();
+selectPatient(0);
+</script>
+</body>
+</html>
