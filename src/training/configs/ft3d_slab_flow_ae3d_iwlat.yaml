@@ -1,0 +1,166 @@
+# THE FLATNESS ARM: the finished slab chain, fine-tuned with the latent flow loss WEIGHTED
+# BY TRUE UPTAKE. Byte-for-byte ft3d_slab_flow_ae3d.yaml except output_dir and the arm
+# block at the bottom. NAC = non-attenuation-corrected PET, AC = attenuation-corrected.
+#
+# What it attacks. The finished chain predicts pred ~= 0.893*gt + 0.036 and under-reads the
+# hot band (gt p90-p98) by 7.5%. That flattening is not a bug to fix in the code: squared
+# error is minimised by the average of the plausible answers, and since the attenuation map
+# lives in a CT the model never sees, that average is less extreme than any single answer.
+# So the objective itself has to change. This one changes WHERE the objective is measured:
+# every latent position's velocity error is multiplied by how much uptake the ground-truth
+# AC volume holds there,
+#
+#     w = 0.1 + 0.9 * pool(clamp(ac / q, 0, 1)),   q = 99th percentile of the AC foreground
+#
+# pooled onto the latent grid and divided by its own mean, so the loss magnitude (and hence
+# the effective step size) is unchanged -- only the balance moves. Measured share of the
+# gradient across air / cold / mid / hot tissue: 80.6/10.8/6.2/2.4 plain -> 53.1/16.5/18.4/12.1
+# here. Hot tissue gets five times the say it had.
+#
+# Measured on the earlier 64x64x64 chain: it moved the calibration numbers on 38-39 of 41
+# patients at no cost in sharpness (memory/latent-pet-value-weighting.md).
+#
+# Two things checked before launching this on slabs:
+#   * The normalizer q is computed on whatever volume the loss is handed, and in slab mode
+#     that is a 16-slice crop, not a whole body. If a cold crop had its own low q, its faint
+#     tissue would be promoted to full weight and "hot" would silently come to mean "the
+#     brightest thing in this crop". Measured (scripts/_diag_iw_slab_scale.py, 144 random
+#     crops of 6 test patients): 88% of crops have q exactly 1.0, because normalize_volume
+#     already clips at the whole-volume 99th percentile and the saturated voxels are spread
+#     widely enough that almost every crop contains some. The 12% below 0.9 shift a weight
+#     by at most 0.06. So the weight does mean absolute brightness. No fix needed.
+#   * The weight map is built from the ground truth only, never from the prediction, so it
+#     cannot be gamed by the model.
+#
+# WARNING -- this weight rises with brightness, so it can be satisfied by pushing values up,
+# i.e. by inventing uptake that is not there. False lesions are the dangerous direction in
+# this domain. Judge this arm on hallucination too (visual triplets, the unclamped
+# over-shoot), not only on the slope reaching 1.0.
+#
+# It is trained from the finished chain, NOT from scratch, and scripts/_slab_flow_iwlat.sh
+# runs a MATCHED plain-loss control of the same length from the same checkpoint -- because
+# more training alone moves this model (+0.213 dB from the last 15000 steps), so an arm
+# without a control measures training time, not weighting.
+#
+# Chain: every volume is resized in-plane to 128x128 and keeps ALL native slices. The
+# frozen in-plane-only 3D autoencoder (2D autoencoder centre-inflated, then fine-tuned on
+# 128x128x16 slabs so its encoder/decoder see neighbouring slices; depth never compressed)
+# gives a latent of (8, Z, 32, 32), the same shape as the slice-wise 2D one. The UNet,
+# slabs, depth windows and warm start are exactly those of ft3d_slab_flow.yaml, so the
+# only change between the two runs is the autoencoder (a controlled comparison).
+#
+# Warm start: --init_from outputs/ft3d_slab_flow_ae3d_cont/last.pt -- the finished chain's
+# averaged weights, with a fresh optimizer, a fresh 500-step ramp and a fresh cosine decay,
+# and the step counter back at 0. Step 0 of this run IS the finished chain, so anything the
+# scores gain from here is either the weighting or the extra training, and the matched
+# control separates the two.
+#
+# Launch (both arms, weighted then control, inside WSL):
+#   bash scripts/_slab_flow_iwlat.sh iw
+#   bash scripts/_slab_flow_iwlat.sh ctl
+
+seed: 42
+# Changed: its own output folder. The task key stays ft3d (checkpoint "task" field).
+output_dir: outputs/ft3d_slab_flow_ae3d_iwlat
+val_fraction: 0.2
+test_fraction: 0.1
+volume_manifest: data/training/volumes.jsonl
+
+# Changed: two 16x128x128 slabs per forward pass instead of one 64^3 cube. A slab has
+# the same voxel count as a cube, so memory per step is about the same.
+batch_size: 2
+# Changed: 4 x 2 = 8 slabs per optimizer step (the cube run used 16 x 1 cubes).
+grad_accum_steps: 4
+num_workers: 2
+# Same rate as the cube flow run. The warm start is exact per slice, so no need to go lower.
+learning_rate: 5.0e-5
+max_epochs: 150
+
+latent_channels: 8
+prediction_type: flow
+latent_scale: 1.0
+# Changed: off. The VGG term samples 2D slices of the decoded slab and gave no gain on
+# the 2D model; the 3D-decoder ("lpl") backend does not exist for the slice-wise AE.
+perceptual_weight: 0.0
+
+inflate_freeze_backbone: false
+inflate_unfreeze_step: 0
+
+# --- Slab mode (all new) ---
+# Changed vs ft3d_slab_flow.yaml: the frozen IN-PLANE-ONLY 3D autoencoder (--ae_ckpt), which
+# also keeps latent depth == image depth. The trainer checks the loaded model is in-plane-only.
+ae_mode: 3d
+# Changed: 16 native slices per training slab (0 would be the old cube behaviour).
+slab_depth: 16
+# Changed: whole-volume validation/inference window of 32 slices (twice the slab, so the
+# net sees more depth context than in training but the same in-plane statistics).
+slab_window: 32
+# Changed: consecutive windows advance 16 slices, so every slice is covered by two
+# windows and the triangular blend has no seams.
+slab_stride: 16
+# Changed: in-plane size the slices are resized to (overwritten from --latent_size).
+slab_inplane_size: 128
+
+model:
+  spatial_dims: 3
+  # Changed: flow mode feeds only the interpolant, so in == out == latent channels (8).
+  in_channels: 8
+  out_channels: 8
+  # Changed: same widths as diff2d_flow_perc so the whole 2D UNet inflates.
+  num_channels: [64, 128, 256]
+  # Changed: attention on the two coarser levels, matching the 2D run.
+  attention_levels: [false, true, true]
+  # Changed: one residual block per level, matching the 2D run.
+  num_res_blocks: 1
+  # Changed: downsample in-plane only (depth stride 1); needed for the exact warm start.
+  anisotropic: true
+
+loss:
+  noise_mse_weight: 1.0
+  recon_l1_weight: 1.0
+
+augment:
+  enabled: true
+  flip_prob: 0.5
+  rot90_prob: 0.5
+  # Changed: 0. Affine rotations resample ACROSS the depth axis and smear neighbouring
+  # slices together; slab mode exists to keep native slices intact.
+  affine_prob: 0.0
+  affine_rotate_deg: 7.0
+  affine_scale: 0.1
+  affine_translate: 0.02
+  # Changed: 0, same reason as affine_prob.
+  elastic_prob: 0.0
+  elastic_sigma_range: [1.0, 2.0]
+  elastic_magnitude_range: [1.0, 2.0]
+
+# --- The arm itself (everything above is the finished chain's own config) ---
+# No decoded-image term: the weighting is a mask on the velocity error the model already
+# computes, so it costs one pooling of the ground truth per step instead of a full decode.
+quant_loss: none
+quant_weight: 0.0
+# "intensity" = the weight ramps with the ground-truth PET value ("occupancy" would gate on
+# anatomy regardless of brightness, "none" is off). This subsumes background down-weighting
+# -- do not also enable the occupancy map.
+latent_weight: intensity
+# The floor: air still counts, at a tenth of the weight of the hottest tissue. Not 0 --
+# the model must still learn that empty space stays empty.
+bg_weight: 0.1
+# Whose brightness sets the weight. "ac" = the target, which is what the metrics measure.
+iw_source: ac
+# 1.0 = the weight is linear in uptake. Above 1 concentrates harder on the hottest tissue.
+iw_gamma: 1.0
+# The normalizer is the 99th percentile of the foreground, not the maximum: one bladder or
+# decoder spike must not divide every other weight down to nothing.
+iw_percentile: 99.0
+# Cap on ac/q before the ramp: at 1.0 everything at or above the bright level shares the
+# top weight, so no single voxel can dominate.
+iw_clip: 1.0
+# Average-pool the map onto the latent grid: a latent cell covers a 1x4x4 image block, so
+# the weight is a block average. "max" would keep a small hot lesion from being averaged
+# away by the cold block around it -- the more aggressive choice, not this one.
+iw_pool: avg
+# Unchanged from the baseline: uniform time sampling, no time-dependent loss shaping. The
+# RFPP (1-tau) shaping was measured to be clearly worse (memory/rfpp-arm-result.md).
+flow_tau_dist: uniform
+flow_loss_weighting: none
