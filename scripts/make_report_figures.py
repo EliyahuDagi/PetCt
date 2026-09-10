@@ -1,4 +1,4 @@
-"""Generate the figures for docs/PROJECT_REPORT.md into docs/figures/.
+"""Generate the figures for docs/PROJECT_REPORT_DETAIL.md into docs/figures/.
 
 Run from the repository root with the Windows python (matplotlib + numpy present).
 """
