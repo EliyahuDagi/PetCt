@@ -213,3 +213,16 @@ debug/
 .github/
 outputs/
 .claude/
+
+# Session scratch: one-off patch scripts, run logs, diagnostic dumps
+scratchpad/
+
+# Generated report/viewer pages: rebuild with scripts/build_report_html.py and
+# scripts/make_viewer_data.py + scripts/make_viewer_html.py (they embed the images
+# as data urls, so they are tens of megabytes)
+docs/PROJECT_REPORT.html
+docs/nac_to_ac_viewer.html
+docs/viewer_data/
+
+# Packaged copy of those generated pages, for handing to someone else
+handover/
