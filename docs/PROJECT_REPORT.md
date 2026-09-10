@@ -9,7 +9,7 @@ alternatives compare**
 | Repository | `PetCt`, branch `dev` |
 | Report date | 2026-09-10 |
 | Best model | `outputs/ft3d_slab_flow_ae3d_cont/last.pt` on `outputs/ae3d_slab/best.pt` |
-| See the output | **[nac_to_ac_viewer.html](nac_to_ac_viewer.html)** — three held-out patients, every slice, input / prediction / truth side by side. One self-contained file; open it by double-clicking. |
+| See the output | **[nac_to_ac_viewer.html](nac_to_ac_viewer.html)** — six held-out patients, every slice, input / prediction / truth side by side. One self-contained file; open it by double-clicking. |
 
 ---
 
@@ -274,16 +274,22 @@ The numbers cannot show what the prediction looks like, so the pictures are a se
 deliverable rather than a figure here:
 
 > **[nac_to_ac_viewer.html](nac_to_ac_viewer.html)** — one self-contained file, about
-> 12 MB, no server and no network needed. It carries the **full predicted volumes** for
-> three held-out patients and shows the non-corrected input, the prediction, the truth and
+> 23 MB, no server and no network needed. It carries the **full predicted volumes** for
+> six held-out patients and shows the non-corrected input, the prediction, the truth and
 > their difference. Every slice is browsable — scrub through them, play them as a loop, or
 > see the whole scan at once as a contact sheet — in all three planes.
 
-The three patients are picked by rank, so the file cannot flatter the model: the **best**
+Three of the six are picked by rank, so the file cannot flatter the model: the **best**
 (`AMC-026`, 31.1 dB, slope 0.946, hot band −4.5%), a **typical** one (`31128984`, 27.0 dB,
 the median of the 41, slope 0.846, hot band −10.1%), and the **worst** (an ACRIN 6668
 patient, 20.4 dB, slope 0.637, hot band −32.0%, variance explained 0.02). Looking at the
 worst one is the fastest way to understand what the averages hide.
+
+The other three are ordinary cases at three different cancer sites, so the method can be
+seen away from any one part of the body: **lung** (`AMC-018`, 26.3 dB, slope 0.948, hot
+band −1.6%), **bladder** (`31485548`, 28.0 dB, slope 0.916, hot band −6.4%) and **uterine**
+(`C3L-00962`, 27.5 dB, slope 0.954, hot band −5.2%). All three sit within about a decibel
+of the 26.9 dB test mean, and they come from three separate collections.
 
 What to look for: the input's bright body-surface rim and dim interior, both gone in the
 prediction; liver, heart, kidneys and bladder restored to roughly the right brightness; and
@@ -462,3 +468,52 @@ compares it at 20000.
 
 **3. Something clinical.** Per-organ uptake bias against segmentation masks, and a
 normalisation that does not clip the peak, so lesion intensity becomes measurable at all.
+
+---
+
+## 11. The data, and how it was split
+
+Ten folders of PET/CT studies: eight public collections from the Cancer Imaging Archive,
+plus two local sets that did not come from it (`Bladder 13.11.25` and `PET_CT_NORMAL_2`).
+Patients are counted, never scans. A patient is one folder, and each one falls in exactly
+one of train, validation or test.
+
+The two stages need different things from a patient, so there are two pools. The
+autoencoder only has to compress a PET volume, so any usable volume counts, corrected or
+not. The flow bridge has to be shown a non-corrected volume **and** its corrected twin from
+the same patient, and that is a smaller set.
+
+| | patients | train | validation | test |
+| --- | --- | --- | --- | --- |
+| Any usable PET volume — the autoencoder | 628 | 439 | 126 | 63 |
+| A matched non-corrected + corrected pair — the flow bridge, and every number in this report | 410 | 287 | 82 | 41 |
+
+Where they come from. The second column counts patients with a matched pair; the third is
+the larger autoencoder pool, shown only where it differs.
+
+| collection | paired | any volume |
+| --- | --- | --- |
+| ACRIN 6668 | 194 | 345 |
+| NSCLC_Radiogenomics | 112 | 128 |
+| Bladder 13.11.25 (local) | 66 | |
+| TCGA-LUAD | 18 | |
+| CPTAC-LUAD | 8 | 9 |
+| CPTAC-LSCC | 6 | |
+| CPTAC-UCEC | 3 | |
+| CPTAC-PDA | 2 | |
+| TCGA-THCA | 1 | |
+| PET_CT_NORMAL_2 (local) | 0 | 50 |
+
+Three things about the split.
+
+**It is 70/20/10 by patient, drawn once with seed 42, then written to a file.** Every run
+since reads that file (`--split_json`) rather than drawing its own. Drawing it again is not
+reproducible even from the same seed, so without the file two arms would end up scored on
+different patients and could not be compared.
+
+**Validation picks the checkpoint. The 41 test patients are used once, at the end.** They
+are the 41 behind every number in §4 and §7, and behind the viewer.
+
+**Read §8 before quoting the absolute decibels.** The frozen 2D autoencoder predates the
+split file and has seen 35 of the 41 test patients, and about 5% of the paired patients are
+mismatched pairs — none of them in the test set.

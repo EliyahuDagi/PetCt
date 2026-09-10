@@ -18,7 +18,9 @@ import json
 import os
 
 TITLES = {"median": "Typical patient", "best": "Best patient",
-          "worst": "Worst patient", "p25": "Lower quarter"}
+          "worst": "Worst patient", "p25": "Lower quarter",
+          "lung": "Lung case", "bladder": "Bladder case",
+          "uterine": "Uterine case"}
 
 
 def main():
@@ -48,7 +50,8 @@ def main():
         })
 
     # Keep the tabs in a fixed, meaningful order rather than whatever the packer emitted.
-    rank = {"best": 0, "median": 1, "p25": 2, "worst": 3}
+    rank = {"best": 0, "median": 1, "lung": 2, "bladder": 3, "uterine": 4,
+            "p25": 5, "worst": 6}
     payload.sort(key=lambda p: rank.get(p["tag"], 9))
 
     with open(args.template, "r", encoding="utf-8") as fh:

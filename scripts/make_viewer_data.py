@@ -36,6 +36,11 @@ from src.training.data import load_patient_by_path, resize_pair_native_depth  # 
 
 TILE_COLS = 16
 
+# Three ordinary cases, one per cancer site, so the viewer shows the method holding up
+# away from one part of the body. Named rather than ranked: the point is the site, and
+# all three sit within about a decibel of the test mean anyway.
+SITES = {"lung": "AMC-018", "bladder": "31485548", "uterine": "C3L-00962"}
+
 
 def atlas_png(vol_u8, cols=TILE_COLS):
     """Lay a (Z,H,W) uint8 volume out as one png. Returns (bytes, cols, rows)."""
@@ -62,7 +67,7 @@ def main():
     ap.add_argument("--dump", default="outputs/eval/dump_ae3d_cont_final")
     ap.add_argument("--out", default="docs/viewer_data")
     ap.add_argument("--size", type=int, default=128)
-    ap.add_argument("--patients", default="median,best,worst",
+    ap.add_argument("--patients", default="median,best,worst,lung,bladder,uterine",
                     help="which of the ranked test patients to pack")
     args = ap.parse_args()
 
@@ -73,6 +78,12 @@ def main():
     order = np.argsort(psnr)
     picks = {"worst": int(order[0]), "median": int(order[len(order) // 2]),
              "best": int(order[-1]), "p25": int(order[len(order) // 4])}
+    by_name = {os.path.basename(e["patient"].rstrip("/")): i for i, e in enumerate(pp)}
+    for tag, name in SITES.items():
+        if name not in by_name:
+            raise SystemExit("%s (%s) is not a scored patient in %s"
+                             % (name, tag, args.eval_json))
+        picks[tag] = by_name[name]
 
     dumps = sorted(f for f in os.listdir(args.dump) if f.endswith("_pred.npy"))
     manifest = []

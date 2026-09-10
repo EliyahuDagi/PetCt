@@ -1,6 +1,10 @@
 """Convert docs/PROJECT_REPORT.md into one self-contained HTML page (figures inlined as data URIs).
 
 Run from the repository root:  python scripts/build_report_html.py docs/PROJECT_REPORT.html
+Add --standalone to wrap the output in a full <html> document. The plain output is a body
+fragment, which is what a host supplying its own <head> wants; a file meant to be opened by
+double-clicking needs the wrapper, or the browser reads it in quirks mode and guesses the
+encoding, turning every minus sign in the report into mojibake.
 Handles the Markdown subset the report uses: ATX headings, paragraphs, pipe tables, fenced code,
 images with an italic "*Figure N.*" caption paragraph, flat bullet / numbered lists, horizontal
 rules, and inline **bold**, *italic*, `code`, [links](url).
@@ -13,7 +17,9 @@ import sys
 
 ROOT = os.getcwd()
 MD_PATH = os.path.join(ROOT, "docs", "PROJECT_REPORT.md")
-OUT = sys.argv[1] if len(sys.argv) > 1 else "report.html"
+STANDALONE = "--standalone" in sys.argv[1:]
+_args = [a for a in sys.argv[1:] if a != "--standalone"]
+OUT = _args[0] if _args else "report.html"
 
 
 def esc(s):
@@ -336,5 +342,25 @@ doc = """<title>CT-Free PET Correction</title>
 </div>
 """ % (CSS, "\n".join(nav_html), "\n".join(nav_html), head_part, rest)
 
+
+# A body fragment by default. --standalone closes it into a real document so the file can be
+# opened straight from disk: the charset is the part that matters, not the doctype.
+HTML_OPEN = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+"""
+BODY_OPEN = """</head>
+<body>
+<div class="page">"""
+HTML_CLOSE = """</body>
+</html>
+"""
+
+if STANDALONE:
+    doc = HTML_OPEN + doc.replace('<div class="page">', BODY_OPEN, 1) + HTML_CLOSE
+
 open(OUT, "w", encoding="utf-8").write(doc)
-print("wrote", OUT, "bytes", os.path.getsize(OUT), "figures", fig_count, "nav entries", len(nav))
+print("wrote", OUT, "bytes", os.path.getsize(OUT), "figures", fig_count,
+      "nav entries", len(nav), "standalone" if STANDALONE else "fragment")
