@@ -52,12 +52,26 @@ the volume is resized in-plane only (to the recorded ``slab_inplane_size`` when
 slice, and the UNet runs on overlapping depth windows. The fair 2D control for that
 is ``--task diff2d --volumetric``: every native slice is translated by the 2D model
 and the metrics are computed once on the whole stacked volume.
+
+``--save_pred_dir DIR`` (off by default) additionally writes, for every patient
+actually evaluated, the prediction volume and the ground-truth AC volume it was
+scored against as float32 ``.npy`` files named ``<ordinal>_<folder>_pred.npy`` and
+``<ordinal>_<folder>_gt.npy``. They are the exact arrays the metrics were computed
+on -- after the resize and after the [0,1] clamp -- so any later numpy-only analysis
+of the files reproduces the numbers in the JSON. Mind the disk: in slab mode a
+128x128 volume with ~300 native slices is ~20 MB, so a pair is ~40 MB and the 41
+test patients are ~1.6 GB -- combine with ``--max_patients`` to dump only a few.
+The dump exists because none of the metrics in
+``utils/image_metrics.py`` can see INVENTED uptake: they all measure error where the
+ground truth is already bright, so a model that puts a hot spot in cold tissue still
+scores well. ``scripts/_diag_false_hot.py`` reads such a directory and counts that.
 """
 
 import argparse
 import json
 import math
 import os
+import re
 import warnings
 from pathlib import Path
 
@@ -177,6 +191,36 @@ def _subsample(candidates, max_patients):
     return [candidates[i] for i in sorted(set(idx))]
 
 
+def _slug(name):
+    """Folder name -> filename-safe token (dataset folders contain spaces and dots)."""
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", str(name)).strip("_") or "patient"
+
+
+def _save_pred_pair(save_dir, index, patient, pred, gt):
+    """Write one evaluated patient's prediction and its ground truth as float32 ``.npy``.
+
+    Only reached when ``--save_pred_dir`` is set, so the default eval path is untouched.
+
+    The two tensors handed in are the ones the metrics were computed on -- already
+    resized and already clamped to [0,1] -- so the files reproduce the reported row
+    exactly. Saving anything earlier in the chain would silently disagree with the JSON.
+
+    Names are ``<ordinal>_<folder>_pred.npy`` / ``..._gt.npy``, the ordinal counting
+    evaluated patients from 000 so a directory listing is in eval order. Singleton
+    batch/channel axes are dropped, leaving a plain (Z, H, W) volume, which is what a
+    numpy-only reader wants; ``pred`` and ``gt`` share a shape so they drop the same axes.
+    """
+    out = Path(save_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    stem = "%03d_%s" % (int(index), _slug(Path(str(patient)).name))
+    for tag, t in (("pred", pred), ("gt", gt)):
+        arr = t.detach().to(device="cpu", dtype=torch.float32).numpy()
+        flat = arr.squeeze()
+        # A one-slice dump would squeeze down to a 2-D image; keep at least 2 dims.
+        np.save(out / ("%s_%s.npy" % (stem, tag)), flat if flat.ndim >= 2 else arr)
+    return stem
+
+
 def _slice_indices(z, num_slices):
     """Evenly spaced slice indices across the depth (inclusive of interior)."""
     if num_slices >= z:
@@ -199,6 +243,9 @@ def _eval_diff2d(args, device, candidates):
             "latent_scale was recorded."
         )
     scale = float(diff_config.get("latent_scale", 1.0))
+    # Read with getattr, like the volumetric flag below: the diagnostic scripts under
+    # scripts/ build their own args namespace and predate this option.
+    save_dir = getattr(args, "save_pred_dir", None)
 
     per_patient = []
     for pi, patient in enumerate(candidates):
@@ -209,7 +256,14 @@ def _eval_diff2d(args, device, candidates):
             continue
         if getattr(args, "volumetric", False):
             # Fair control for slab-mode ft3d: every native slice, one whole-volume score.
-            m = _diff2d_volumetric(ae, model, schedule, diff_config, scale, vols, args)
+            # The dump goes through a callback because the scored volumes only exist
+            # inside _diff2d_volumetric; None (the default) leaves that path unchanged.
+            sink = None
+            if save_dir:
+                sink = lambda pv, gv: _save_pred_pair(  # noqa: E731
+                    save_dir, len(per_patient), patient, pv, gv)
+            m = _diff2d_volumetric(ae, model, schedule, diff_config, scale, vols, args,
+                                   on_volumes=sink)
             m["patient"] = str(patient)
             per_patient.append(m)
             print(f"[diff2d/volumetric] {len(per_patient)} eval'd (cand {pi+1}) "
@@ -217,6 +271,9 @@ def _eval_diff2d(args, device, candidates):
             continue
         z = vols["pet_nac"].shape[0]
         slice_metrics = []
+        # Only allocated when a dump was asked for; the reported row is the mean over
+        # these slices, so the stack of them IS what the row was computed on.
+        kept = [] if save_dir else None
         for s in _slice_indices(z, args.num_slices):
             nac_img = _slice_2d(vols["pet_nac"], s, args.size)
             ac_img = _slice_2d(vols["pet_ac"], s, args.size)
@@ -231,6 +288,8 @@ def _eval_diff2d(args, device, candidates):
             )
             pred = clamp_unit(ae_decode(ae, x0, scale=scale), args.clamp_output)
             slice_metrics.append(image_quality_metrics(pred, ac_img))
+            if kept is not None:
+                kept.append((pred.cpu(), ac_img.cpu()))
         if slice_metrics:
             # Per-slice mean, filtering non-finite (voxel_r2 / slope can be NaN on
             # flat slices); NaN only if every slice was non-finite for that key.
@@ -241,6 +300,12 @@ def _eval_diff2d(args, device, candidates):
             agg["n_slices"] = len(slice_metrics)
             # See the ft3d branch: identifies the patient so runs can be compared PAIRED.
             agg["patient"] = str(patient)
+            if kept:
+                # One file pair per patient: the sampled slices stacked along the first
+                # axis, in the order they were scored.
+                _save_pred_pair(save_dir, len(per_patient), patient,
+                                torch.cat([p for p, _ in kept], dim=0),
+                                torch.cat([g for _, g in kept], dim=0))
             per_patient.append(agg)
             print(f"[diff2d] {len(per_patient)} eval'd (cand {pi+1}) "
                   f"ssim={agg['ssim']:.4f} psnr={agg['psnr']:.2f} nrmse={agg['nrmse']:.4f}")
@@ -248,7 +313,8 @@ def _eval_diff2d(args, device, candidates):
 
 
 @torch.no_grad()
-def _diff2d_volumetric(ae, model, schedule, diff_config, scale, vols, args, chunk=64):
+def _diff2d_volumetric(ae, model, schedule, diff_config, scale, vols, args, chunk=64,
+                       on_volumes=None):
     """Score a 2D model on a WHOLE volume: every native slice, one metric on the 3D stack.
 
     Fair control for slab-mode ft3d: the pair is resized in-plane to ``args.size`` with
@@ -256,6 +322,10 @@ def _diff2d_volumetric(ae, model, schedule, diff_config, scale, vols, args, chun
     translated by the 2D model in chunks of ``chunk`` slices folded into the batch
     axis, and the metrics are computed once on the stacked ``(1, 1, Z, size, size)``
     prediction against the whole AC volume.
+
+    ``on_volumes``, when given, is called as ``on_volumes(pred, gt)`` with those two
+    scored volumes just before the metrics -- the hook ``--save_pred_dir`` uses to dump
+    them. ``None`` (the default) means nothing else happens here.
     """
     nac_r, ac_r = resize_pair_native_depth(vols["pet_nac"], vols["pet_ac"], args.size)  # (1,Z,S,S)
     nac_slices = nac_r.permute(1, 0, 2, 3).contiguous()  # (Z,1,S,S): depth folded into the batch
@@ -269,7 +339,10 @@ def _diff2d_volumetric(ae, model, schedule, diff_config, scale, vols, args, chun
         )
         preds.append(clamp_unit(ae_decode(ae, x0, scale=scale), args.clamp_output))
     pred_vol = torch.cat(preds, dim=0).permute(1, 0, 2, 3).unsqueeze(0)  # (1,1,Z,S,S)
-    return image_quality_metrics(pred_vol, ac_r.unsqueeze(0))
+    gt_vol = ac_r.unsqueeze(0)
+    if on_volumes is not None:
+        on_volumes(pred_vol, gt_vol)
+    return image_quality_metrics(pred_vol, gt_vol)
 
 
 @torch.no_grad()
@@ -327,6 +400,9 @@ def _eval_ft3d(args, device, candidates):
               f"{slab_window} slices, stride {slab_stride}")
     else:
         size = int(args.size or DEFAULT_SIZE["ft3d"])
+    # Read with getattr: the diagnostic scripts under scripts/ build their own args
+    # namespace and predate this option.
+    save_dir = getattr(args, "save_pred_dir", None)
 
     per_patient = []
     for pi, patient in enumerate(candidates):
@@ -361,6 +437,8 @@ def _eval_ft3d(args, device, candidates):
         # test -- see scripts/_cmp_eval_paired.py. Non-numeric, and _aggregate iterates
         # METRIC_KEYS only, so this cannot leak into the summary.
         m["patient"] = str(patient)
+        if save_dir:
+            _save_pred_pair(save_dir, len(per_patient), patient, pred, ac_vol)
         per_patient.append(m)
         print(f"[ft3d] {len(per_patient)} eval'd (cand {pi+1}) "
               f"ssim={m['ssim']:.4f} psnr={m['psnr']:.2f} nrmse={m['nrmse']:.4f}")
@@ -439,6 +517,16 @@ def main():
     parser.add_argument("--use_ema", dest="use_ema", action="store_true", default=True, help="Use EMA weights if present (default)")
     parser.add_argument("--no_ema", dest="use_ema", action="store_false")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--save_pred_dir", default=None,
+                        help="Also dump, per evaluated patient, the prediction and the "
+                             "ground-truth AC volume it was scored against, as float32 "
+                             ".npy files '<ordinal>_<folder>_pred.npy' / '..._gt.npy' in "
+                             "this directory. They are the exact arrays the metrics used "
+                             "(after resize and after the [0,1] clamp). Off by default. "
+                             "Combine with --max_patients to dump only a few. Read them "
+                             "with scripts/_diag_false_hot.py, which counts uptake the "
+                             "model invented where the ground truth is cold -- something "
+                             "no metric in the JSON can see.")
     parser.add_argument("--out", default=None, help="Output JSON path (default outputs/eval/<task>/metrics.json)")
     args = parser.parse_args()
 
@@ -526,6 +614,10 @@ def main():
         "summary": summary,
         "per_patient": per_patient,
     }
+    # Recorded only when a dump was requested, so a run without the flag writes the same
+    # JSON keys it always did.
+    if args.save_pred_dir:
+        result["save_pred_dir"] = str(args.save_pred_dir)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
@@ -536,6 +628,9 @@ def main():
         if k in summary:
             print(f"  {k:9s} {summary[k]['mean']:.4f} +/- {summary[k]['std']:.4f}  (n={summary[k]['n']})")
     print(f"\nWrote {out}")
+    if args.save_pred_dir:
+        print(f"Dumped {len(per_patient)} pred/gt pairs to {args.save_pred_dir} "
+              f"(read them with scripts/_diag_false_hot.py)")
 
 
 if __name__ == "__main__":

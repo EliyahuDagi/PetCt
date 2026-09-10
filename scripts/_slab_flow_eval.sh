@@ -20,6 +20,12 @@ AE=${AE:-outputs/ae2d_p/best.pt}
 SPLIT=outputs/ft3d_flow_p/split.json
 # Results folder; the 2D control JSON is shared, so point OUT at the folder that has it.
 OUT=${OUT:-outputs/eval/ft3d_slab_flow}
+# DUMP=<dir> also writes each scored patient's prediction and ground truth as .npy, for
+# scripts/_diag_false_hot.py to count invented uptake with. Costs ~40 MB per patient, so
+# pair it with MAXPAT=<n> when only a look is wanted -- the split order is fixed, so the
+# same MAXPAT gives the same patients for every arm and the dumps stay comparable.
+DUMP=${DUMP:-}
+MAXPAT=${MAXPAT:-0}
 mkdir -p "$OUT"
 
 ROOTS=(
@@ -51,9 +57,16 @@ if [ "$WHICH" = slab ] || [ "$WHICH" = both ]; then
     --data_dir "${ROOTS[@]}" --mode test \
     --val_fraction 0.2 --test_fraction 0.1 --seed 42 --split_json "$SPLIT" \
     --diff_ckpt "$CKPT" --ae_ckpt "$AE" \
-    --size 128 --ddim_steps "$STEPS" --spacing linear --guidance_scale 1.0 --max_patients 0 --device cuda \
+    --size 128 --ddim_steps "$STEPS" --spacing linear --guidance_scale 1.0 --max_patients "$MAXPAT" --device cuda \
+    ${DUMP:+--save_pred_dir "$DUMP"} \
     --out "$OUT/slab_${TAG}_s$STEPS.json" > "$OUT/slab_${TAG}_s$STEPS.log" 2>&1
   echo ">>> STAGE_END slab rc=$? $(date '+%Y-%m-%d %H:%M:%S')"
-  "$PY" scripts/_cmp_eval_paired.py "$OUT/control2d_vol_s$STEPS.json" "$OUT/slab_${TAG}_s$STEPS.json" \
-    --label-a control2d --label-b "slab_$TAG" | tee "$OUT/paired_${TAG}_s$STEPS.txt"
+  # A capped run scores a different patient set from the shared 2D control, so pairing the
+  # two would silently compare different cohorts. Skip it there.
+  if [ "$MAXPAT" = "0" ]; then
+    "$PY" scripts/_cmp_eval_paired.py "$OUT/control2d_vol_s$STEPS.json" "$OUT/slab_${TAG}_s$STEPS.json" \
+      --label-a control2d --label-b "slab_$TAG" | tee "$OUT/paired_${TAG}_s$STEPS.txt"
+  else
+    echo "MAXPAT=$MAXPAT: capped run, so no pairing against the 41-patient 2D control."
+  fi
 fi
